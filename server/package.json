@@ -3,15 +3,19 @@
   "version": "1.0.0",
   "description": "Server for WebGPU volunteer computing",
   "main": "server.js",
+  "type": "module",
   "scripts": {
     "start": "node server.js",
     "dev": "nodemon server.js",
-    "generate-certs": "bash generate-certs.sh"
+    "generate-certs": "bash generate-certs.sh",
+    "headless": "node headless-client.js http://localhost:3000 --instances 2"
   },
   "dependencies": {
     "express": "^4.18.2",
     "socket.io": "^4.7.2",
-    "uuid": "^9.0.1"
+    "uuid": "^9.0.1",
+    "puppeteer": "^22.10.0",
+    "minimist": "^1.2.8"
   },
   "devDependencies": {
     "nodemon": "^3.0.1"
