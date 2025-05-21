@@ -1,0 +1,15 @@
+version: '3'
+
+services:
+  webgpu-volunteer-server:
+    build: ./server
+    ports:
+      - "0.0.0.0:3000:3000"  # Bind to all network interfaces
+    volumes:
+      - ./server:/app
+      - /app/node_modules
+      - ./server/certificates:/app/certificates  # Mount certificates directory
+    environment:
+      - NODE_ENV=development
+      - HOST=0.0.0.0  # Listen on all interfaces
+    restart: unless-stopped

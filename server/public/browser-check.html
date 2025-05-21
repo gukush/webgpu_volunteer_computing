@@ -1,0 +1,339 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Browser Capabilities Checker</title>
+    <style>
+        body {
+            font-family: system-ui, sans-serif;
+            max-width: 800px;
+            margin: 0 auto;
+            padding: 20px;
+        }
+        .card {
+            background: #fff;
+            border-radius: 8px;
+            box-shadow: 0 2px 6px rgba(0,0,0,0.1);
+            padding: 20px;
+            margin-bottom: 20px;
+        }
+        .status {
+            padding: 8px 12px;
+            border-radius: 4px;
+            margin: 5px 0;
+            display: flex;
+            justify-content: space-between;
+        }
+        .success { background-color: #d4edda; color: #155724; }
+        .error { background-color: #f8d7da; color: #721c24; }
+        .warning { background-color: #fff3cd; color: #856404; }
+        .info { background-color: #d1ecf1; color: #0c5460; }
+        pre {
+            background: #f5f5f5;
+            padding: 10px;
+            border-radius: 5px;
+            overflow: auto;
+        }
+        button {
+            padding: 8px 16px;
+            background: #4a90e2;
+            color: white;
+            border: none;
+            border-radius: 4px;
+            cursor: pointer;
+        }
+        button:hover {
+            background: #3a80d2;
+        }
+    </style>
+</head>
+<body>
+    <h1>Browser Capabilities Checker</h1>
+    
+    <div class="card">
+        <h2>System Information</h2>
+        <div id="system-info"></div>
+    </div>
+    
+    <div class="card">
+        <h2>WebGPU Support</h2>
+        <button id="test-webgpu">Test WebGPU</button>
+        <div id="webgpu-results"></div>
+    </div>
+    
+    <div class="card">
+        <h2>Graphics Features</h2>
+        <div id="graphics-features"></div>
+    </div>
+    
+    <div class="card">
+        <h2>Privacy & Security Settings</h2>
+        <div id="privacy-settings"></div>
+    </div>
+    
+    <script>
+        // System information
+        function checkSystemInfo() {
+            const systemInfo = document.getElementById('system-info');
+            
+            const info = {
+                userAgent: navigator.userAgent,
+                platform: navigator.platform,
+                vendor: navigator.vendor,
+                language: navigator.language,
+                hardwareConcurrency: navigator.hardwareConcurrency,
+                deviceMemory: navigator.deviceMemory,
+                cookieEnabled: navigator.cookieEnabled,
+                doNotTrack: navigator.doNotTrack,
+                online: navigator.onLine,
+                pdfViewerEnabled: navigator.pdfViewerEnabled,
+                screenResolution: `${window.screen.width}x${window.screen.height}`,
+                colorDepth: window.screen.colorDepth,
+                pixelRatio: window.devicePixelRatio
+            };
+            
+            let html = '';
+            for (const [key, value] of Object.entries(info)) {
+                if (value !== undefined) {
+                    html += `<div class="status info"><span>${key}:</span> <span>${value}</span></div>`;
+                }
+            }
+            
+            systemInfo.innerHTML = html;
+        }
+        
+        // WebGPU Support
+        async function testWebGPU() {
+            const resultsDiv = document.getElementById('webgpu-results');
+            resultsDiv.innerHTML = '<div class="status info">Testing WebGPU...</div>';
+            
+            let html = '';
+            
+            // Step 1: Check navigator.gpu
+            if (!navigator.gpu) {
+                html += `<div class="status error">navigator.gpu is not available</div>`;
+                resultsDiv.innerHTML = html;
+                return;
+            }
+            
+            html += `<div class="status success">navigator.gpu is available</div>`;
+            
+            // Step 2: Request adapter with timing
+            html += `<div class="status info">Requesting adapter...</div>`;
+            
+            try {
+                const startTime = performance.now();
+                const adapter = await navigator.gpu.requestAdapter();
+                const endTime = performance.now();
+                
+                if (!adapter) {
+                    html += `<div class="status error">Could not get WebGPU adapter (null returned)</div>`;
+                    resultsDiv.innerHTML = html;
+                    return;
+                }
+                
+                html += `<div class="status success">WebGPU adapter acquired (${(endTime - startTime).toFixed(2)}ms)</div>`;
+                
+                // Try to get adapter info
+                try {
+                    const adapterInfo = await adapter.requestAdapterInfo();
+                    html += `<div class="status success">
+                        <span>Adapter Info:</span>
+                        <span>
+                            ${adapterInfo.vendor || 'Unknown vendor'} 
+                            ${adapterInfo.architecture || ''} 
+                            ${adapterInfo.device || ''}
+                        </span>
+                    </div>`;
+                    
+                    html += `<pre>${JSON.stringify(adapterInfo, null, 2)}</pre>`;
+                } catch (err) {
+                    html += `<div class="status warning">Could not get adapter info: ${err.message}</div>`;
+                }
+                
+                // Check adapter features and limits
+                html += `<div class="status info"><span>Supported Features:</span><span>${adapter.features.size} features</span></div>`;
+                
+                for (const feature of adapter.features) {
+                    html += `<div class="status success"><span>Feature:</span><span>${feature}</span></div>`;
+                }
+                
+                // Step 3: Request device
+                try {
+                    const deviceStart = performance.now();
+                    const device = await adapter.requestDevice();
+                    const deviceEnd = performance.now();
+                    
+                    html += `<div class="status success">WebGPU device acquired (${(deviceEnd - deviceStart).toFixed(2)}ms)</div>`;
+                    
+                    // Test a simple operation
+                    try {
+                        const buffer = device.createBuffer({
+                            size: 4,
+                            usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC
+                        });
+                        
+                        html += `<div class="status success">Test buffer created successfully</div>`;
+                        
+                        // Try a simple computation
+                        try {
+                            const code = `
+                                @compute @workgroup_size(1)
+                                fn main() {
+                                    // Just a simple shader that does nothing
+                                }
+                            `;
+                            
+                            const shaderModule = device.createShaderModule({
+                                code: code
+                            });
+                            
+                            html += `<div class="status success">Test shader module created successfully</div>`;
+                        } catch (err) {
+                            html += `<div class="status warning">Test shader creation failed: ${err.message}</div>`;
+                        }
+                    } catch (err) {
+                        html += `<div class="status warning">Test buffer creation failed: ${err.message}</div>`;
+                    }
+                } catch (err) {
+                    html += `<div class="status error">Error requesting WebGPU device: ${err.message}</div>`;
+                    html += `<pre>${err.stack}</pre>`;
+                }
+            } catch (err) {
+                html += `<div class="status error">Error requesting WebGPU adapter: ${err.message}</div>`;
+                html += `<pre>${err.stack}</pre>`;
+            }
+            
+            resultsDiv.innerHTML = html;
+        }
+        
+        // Graphics Features
+        function checkGraphicsFeatures() {
+            const featuresDiv = document.getElementById('graphics-features');
+            let html = '';
+            
+            // WebGL support
+            try {
+                const canvas = document.createElement('canvas');
+                const gl = canvas.getContext('webgl') || canvas.getContext('experimental-webgl');
+                
+                if (gl) {
+                    const debugInfo = gl.getExtension('WEBGL_debug_renderer_info');
+                    const vendor = debugInfo ? gl.getParameter(debugInfo.UNMASKED_VENDOR_WEBGL) : gl.getParameter(gl.VENDOR);
+                    const renderer = debugInfo ? gl.getParameter(debugInfo.UNMASKED_RENDERER_WEBGL) : gl.getParameter(gl.RENDERER);
+                    
+                    html += `<div class="status success"><span>WebGL:</span><span>Supported</span></div>`;
+                    html += `<div class="status info"><span>WebGL Vendor:</span><span>${vendor}</span></div>`;
+                    html += `<div class="status info"><span>WebGL Renderer:</span><span>${renderer}</span></div>`;
+                } else {
+                    html += `<div class="status error"><span>WebGL:</span><span>Not Supported</span></div>`;
+                }
+            } catch (e) {
+                html += `<div class="status error"><span>WebGL:</span><span>Error: ${e.message}</span></div>`;
+            }
+            
+            // WebGL2 support
+            try {
+                const canvas = document.createElement('canvas');
+                const gl2 = canvas.getContext('webgl2');
+                
+                if (gl2) {
+                    html += `<div class="status success"><span>WebGL2:</span><span>Supported</span></div>`;
+                } else {
+                    html += `<div class="status warning"><span>WebGL2:</span><span>Not Supported</span></div>`;
+                }
+            } catch (e) {
+                html += `<div class="status error"><span>WebGL2:</span><span>Error: ${e.message}</span></div>`;
+            }
+            
+            // Canvas support
+            try {
+                const canvas = document.createElement('canvas');
+                const ctx = canvas.getContext('2d');
+                
+                if (ctx) {
+                    html += `<div class="status success"><span>Canvas 2D:</span><span>Supported</span></div>`;
+                } else {
+                    html += `<div class="status warning"><span>Canvas 2D:</span><span>Not Supported</span></div>`;
+                }
+            } catch (e) {
+                html += `<div class="status error"><span>Canvas 2D:</span><span>Error: ${e.message}</span></div>`;
+            }
+            
+            // WebCodecs support
+            if ('VideoEncoder' in window) {
+                html += `<div class="status success"><span>WebCodecs:</span><span>Supported</span></div>`;
+            } else {
+                html += `<div class="status info"><span>WebCodecs:</span><span>Not Supported</span></div>`;
+            }
+            
+            // WebXR support
+            if ('xr' in navigator) {
+                html += `<div class="status success"><span>WebXR:</span><span>Supported</span></div>`;
+            } else {
+                html += `<div class="status info"><span>WebXR:</span><span>Not Supported</span></div>`;
+            }
+            
+            featuresDiv.innerHTML = html;
+        }
+        
+        // Privacy & Security Settings
+        function checkPrivacySettings() {
+            const privacyDiv = document.getElementById('privacy-settings');
+            let html = '';
+            
+            // Check if running in a secure context
+            if (window.isSecureContext) {
+                html += `<div class="status success"><span>Secure Context:</span><span>Yes</span></div>`;
+            } else {
+                html += `<div class="status warning"><span>Secure Context:</span><span>No (some APIs may be restricted)</span></div>`;
+            }
+            
+            // Cross-Origin Isolation status
+            if (window.crossOriginIsolated) {
+                html += `<div class="status success"><span>Cross-Origin Isolated:</span><span>Yes</span></div>`;
+            } else {
+                html += `<div class="status info"><span>Cross-Origin Isolated:</span><span>No</span></div>`;
+            }
+            
+            // Check iframe embedding
+            if (window !== window.top) {
+                html += `<div class="status warning"><span>Iframe Embedded:</span><span>Yes (may limit capabilities)</span></div>`;
+            } else {
+                html += `<div class="status success"><span>Iframe Embedded:</span><span>No</span></div>`;
+            }
+            
+            // Check permissions
+            const permissions = [
+                { name: 'camera', friendly: 'Camera' },
+                { name: 'microphone', friendly: 'Microphone' },
+                { name: 'geolocation', friendly: 'Geolocation' },
+                { name: 'notifications', friendly: 'Notifications' },
+                { name: 'midi', friendly: 'MIDI' },
+                { name: 'clipboard-read', friendly: 'Clipboard Read' },
+                { name: 'clipboard-write', friendly: 'Clipboard Write' }
+            ];
+            
+            if ('permissions' in navigator) {
+                html += `<div class="status info"><span>Permissions API:</span><span>Available</span></div>`;
+                
+                // We don't actually check permissions since that would trigger prompts
+            } else {
+                html += `<div class="status info"><span>Permissions API:</span><span>Not Available</span></div>`;
+            }
+            
+            privacyDiv.innerHTML = html;
+        }
+        
+        // Run checks
+        document.addEventListener('DOMContentLoaded', () => {
+            checkSystemInfo();
+            checkGraphicsFeatures();
+            checkPrivacySettings();
+            
+            document.getElementById('test-webgpu').addEventListener('click', testWebGPU);
+        });
+    </script>
+</body>
+</html>
