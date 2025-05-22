@@ -1,35 +1,30 @@
 // client.js
 
-// State management
+// State management (no changes here)
+// ... state object ...
 const state = {
-    webgpuSupported: false,
-    device: null,
-    adapter: null,
-    adapterInfo: null, // Will store { vendor, architecture, device, description }
-    connected: false,
-    clientId: null,
-    isComputing: false, // For matrix tasks primarily
-    currentTask: null, // For matrix tasks primarily
-    completedTasks: 0, // For matrix tasks primarily
-    statistics: {
-        processingTime: 0 // For matrix tasks primarily
-    }
+    webgpuSupported: false, device: null, adapter: null, adapterInfo: null,
+    connected: false, clientId: null, isComputing: false, currentTask: null,
+    completedTasks: 0, statistics: { processingTime: 0 }
 };
 
+
+// elements object (no changes needed here)
+// ... elements object ...
 const elements = {
     webgpuStatus: document.getElementById('webgpu-status'),
     gpuInfo: document.getElementById('gpu-info'),
     computationStatus: document.getElementById('computation-status'),
     clientStatus: document.getElementById('client-status'),
-    taskStatus: document.getElementById('task-status'), // For matrix tasks
+    taskStatus: document.getElementById('task-status'),
     joinComputation: document.getElementById('join-computation'),
     leaveComputation: document.getElementById('leave-computation'),
-    startComputation: document.getElementById('start-computation'), // Matrix computation
+    startComputation: document.getElementById('start-computation'),
     toggleAdmin: document.getElementById('toggle-admin'),
     adminPanel: document.getElementById('admin-panel'),
     matrixSize: document.getElementById('matrix-size'),
     chunkSize: document.getElementById('chunk-size'),
-    taskLog: document.getElementById('task-log'), // General client log
+    taskLog: document.getElementById('task-log'),
     adminLogMatrix: document.getElementById('admin-log-matrix'),
     adminLogWgsl: document.getElementById('admin-log-wgsl'),
     clientGrid: document.getElementById('client-grid'),
@@ -37,10 +32,8 @@ const elements = {
     totalTasks: document.getElementById('total-tasks'),
     completedTasks: document.getElementById('completed-tasks'),
     elapsedTime: document.getElementById('elapsed-time'),
-    myTasks: document.getElementById('my-tasks'), // For matrix tasks
-    processingTime: document.getElementById('processing-time'), // For matrix tasks
-
-    // WGSL Admin UI
+    myTasks: document.getElementById('my-tasks'),
+    processingTime: document.getElementById('processing-time'),
     wgslLabel: document.getElementById('wgsl-label'),
     wgslEntryPoint: document.getElementById('wgsl-entry-point'),
     wgslSrc: document.getElementById('wgsl-src'),
@@ -51,41 +44,42 @@ const elements = {
     wgslOutputSize: document.getElementById('wgsl-output-size'),
     wgslInputData: document.getElementById('wgsl-input-data'),
     pushWgslWorkloadButton: document.getElementById('push-wgsl-workload'),
-    activeWgslWorkloadsGrid: document.getElementById('active-wgsl-workloads-grid')
+    activeWgslWorkloadsGrid: document.getElementById('active-wgsl-workloads-grid'),
+    startQueuedWgslButton: document.getElementById('startQueuedWgslButton')
 };
 
-// Headless mode detection
+// Headless mode detection & socket connection (no changes)
+// ... PARAMS, IS_HEADLESS, WORKER_ID, socket ...
 const PARAMS = new URLSearchParams(location.search);
 const IS_HEADLESS = PARAMS.get('mode') === 'headless';
 const WORKER_ID = PARAMS.get('workerId') || 'N/A';
+const socket = io({ query: IS_HEADLESS ? { mode: 'headless', workerId: WORKER_ID } : {} });
 
-
-// Connect to Socket.io server
-const socket = io({
-    query: IS_HEADLESS ? { mode: 'headless', workerId: WORKER_ID } : {}
-});
-
+// initWebGPU, multiplyMatricesGPU, multiplyMatricesCPU, processMatrixTask,
+// joinComputation, leaveComputation, requestMatrixTask, startMatrixComputation,
+// logTaskActivity, logAdminActivity, updateClientDisplay, updateStatsDisplay
+// (These functions remain unchanged from your previous version)
 async function initWebGPU() {
     try {
         if (!window.isSecureContext) {
             elements.webgpuStatus.innerHTML = `<div>WebGPU requires a secure context (HTTPS or localhost).</div>`;
             elements.webgpuStatus.className = 'status error';
-            elements.joinComputation.disabled = false; return false;
+            if (elements.joinComputation) elements.joinComputation.disabled = false; return false;
         }
         if (!navigator.gpu) {
             elements.webgpuStatus.textContent = 'WebGPU is not supported - CPU computation fallback.';
             elements.webgpuStatus.className = 'status warning';
-            elements.joinComputation.disabled = false; return false;
+            if (elements.joinComputation) elements.joinComputation.disabled = false; return false;
         }
 
         logTaskActivity("Initializing WebGPU...");
         let selectedAdapter = null;
-        const rawAdapters = []; // Store GPUAdapter objects directly
+        const rawAdapters = [];
 
-        // Request all available adapters
         try { const highPerfAdapter = await navigator.gpu.requestAdapter({ powerPreference: 'high-performance' }); if (highPerfAdapter) rawAdapters.push(highPerfAdapter); } catch (e) { console.warn("No high-perf adapter:", e.message); }
-        try { const lowPowerAdapter = await navigator.gpu.requestAdapter({ powerPreference: 'low-power' }); if (lowPowerAdapter && !rawAdapters.includes(lowPowerAdapter)) rawAdapters.push(lowPowerAdapter); } catch (e) { console.warn("No low-power adapter:", e.message); }
-        try { const defaultAdapter = await navigator.gpu.requestAdapter(); if (defaultAdapter && !rawAdapters.includes(defaultAdapter)) rawAdapters.push(defaultAdapter); } catch (e) { console.warn("No default adapter found or request failed:", e.message); }
+        try { const lowPowerAdapter = await navigator.gpu.requestAdapter({ powerPreference: 'low-power' }); if (lowPowerAdapter && !rawAdapters.find(a => a === lowPowerAdapter)) rawAdapters.push(lowPowerAdapter); } catch (e) { console.warn("No low-power adapter:", e.message); }
+        try { const defaultAdapter = await navigator.gpu.requestAdapter(); if (defaultAdapter && !rawAdapters.find(a => a === defaultAdapter)) rawAdapters.push(defaultAdapter); } catch (e) { console.warn("No default adapter found or request failed:", e.message); }
+
 
         if (rawAdapters.length === 0) throw new Error("No WebGPU adapters found.");
 
@@ -94,18 +88,13 @@ async function initWebGPU() {
             let info = { vendor: 'Unknown', architecture: 'Unknown', device: 'Unknown', description: 'Info not available' };
             try {
                 if (adapter && typeof adapter.requestAdapterInfo === 'function') {
-                    // Only call if the function exists
                     const detailedInfo = await adapter.requestAdapterInfo();
-                    // Ensure we have some defaults even if detailedInfo is sparse
                     info.vendor = detailedInfo.vendor || info.vendor;
                     info.architecture = detailedInfo.architecture || info.architecture;
                     info.device = detailedInfo.device || info.device;
                     info.description = detailedInfo.description || info.description;
                 } else {
                     console.warn("adapter.requestAdapterInfo() is not available on this adapter. Using default info.");
-                    // Use GPUDevice.name as a fallback if requestAdapterInfo is missing (not standard, but some older implementations might have it)
-                    // More typically, we just won't have detailed info.
-                    // For now, we rely on the default 'Unknown' values set above.
                 }
             } catch (e) {
                 console.warn(`Error fetching adapter info: ${e.message}. Using default info.`);
@@ -114,34 +103,34 @@ async function initWebGPU() {
             adaptersWithInfo.push({ adapter, info });
         }
 
-        // Prefer discrete GPU (NVIDIA/AMD), then by type preference (type isn't directly on adapter, but via info if available)
-        const discreteVendors = ['nvidia', 'amd', 'advanced micro devices'];
+        const discreteVendors = ['nvidia', 'amd', 'advanced micro devices', 'apple'];
         let foundAdapterEntry = adaptersWithInfo.find(a =>
             discreteVendors.some(v =>
-                a.info.vendor?.toLowerCase().includes(v) ||
-                a.info.description?.toLowerCase().includes(v)
+                (a.info.vendor?.toLowerCase().includes(v) ||
+                 a.info.description?.toLowerCase().includes(v)) &&
+                !a.info.description?.toLowerCase().includes('swiftshader') &&
+                !a.info.description?.toLowerCase().includes('microsoft basic render driver')
             )
         );
 
         if (!foundAdapterEntry && adaptersWithInfo.length > 0) {
-            // Fallback to the first adapter if no discrete GPU identified or if info was sparse
-            // A better heuristic might be needed if powerPreference was not enough.
-            // For now, just take the first one that was successfully requested.
-            foundAdapterEntry = adaptersWithInfo[0];
+            foundAdapterEntry = adaptersWithInfo.find(a =>
+                !a.info.description?.toLowerCase().includes('swiftshader') &&
+                !a.info.description?.toLowerCase().includes('microsoft basic render driver')
+            ) || adaptersWithInfo[0];
         }
+
 
         if (!foundAdapterEntry || !foundAdapterEntry.adapter) {
             throw new Error("No suitable WebGPU adapter found after attempting to get info.");
         }
 
         state.adapter = foundAdapterEntry.adapter;
-        state.adapterInfo = foundAdapterEntry.info; // This now contains the (potentially partial) info
+        state.adapterInfo = foundAdapterEntry.info;
 
-        // Crucially, attempt to get the device. This is the key for WebGPU functionality.
         state.device = await state.adapter.requestDevice();
-        state.webgpuSupported = true; // If requestDevice succeeds, we can use WebGPU
+        state.webgpuSupported = true;
 
-        // Update UI with potentially N/A or limited info
         let vendorDisplay = state.adapterInfo.vendor !== 'Unknown' && state.adapterInfo.vendor !== 'N/A' ? state.adapterInfo.vendor : "GPU";
         let archDisplay = state.adapterInfo.architecture !== 'Unknown' && state.adapterInfo.architecture !== 'N/A' ? state.adapterInfo.architecture : "";
 
@@ -153,12 +142,12 @@ async function initWebGPU() {
         if (state.adapterInfo.description && state.adapterInfo.description !== 'Info not available' && !state.adapterInfo.description.startsWith('Error fetching info')) {
             gpuInfoHTML += `<br><strong>Desc:</strong> ${state.adapterInfo.description}`;
         } else if (state.adapterInfo.description !== 'Info not available') {
-             gpuInfoHTML += `<br><strong>Desc:</strong> (${state.adapterInfo.description})`; // Show the error or "not available"
+             gpuInfoHTML += `<br><strong>Desc (Debug):</strong> (${state.adapterInfo.description})`;
         }
         elements.gpuInfo.innerHTML = gpuInfoHTML;
         elements.gpuInfo.className = 'status success';
 
-        elements.joinComputation.disabled = false;
+        if(elements.joinComputation) elements.joinComputation.disabled = false;
         logTaskActivity(`WebGPU initialized. Adapter: ${vendorDisplay} ${archDisplay}. Detail: ${state.adapterInfo.description}`);
         return true;
 
@@ -168,25 +157,16 @@ async function initWebGPU() {
         elements.webgpuStatus.className = 'status warning';
         elements.gpuInfo.innerHTML = `WebGPU initialization failed.`;
         elements.gpuInfo.className = 'status error';
-        state.webgpuSupported = false; // Explicitly set on error
+        state.webgpuSupported = false;
         state.adapter = null;
         state.device = null;
-        state.adapterInfo = { vendor: 'N/A', architecture: 'N/A', device: 'N/A', description: error.message }; // Store error in description
-        elements.joinComputation.disabled = false; // Allow CPU fallback join
+        state.adapterInfo = { vendor: 'N/A', architecture: 'N/A', device: 'N/A', description: error.message };
+        if(elements.joinComputation) elements.joinComputation.disabled = false;
         return false;
     }
 }
 
-// ... (rest of your client.js file: multiplyMatricesGPU, multiplyMatricesCPU, etc.)
-// Ensure that functions like joinComputation correctly use state.adapterInfo,
-// which will now gracefully contain 'N/A' or error messages if full info wasn't available.
-// The joinComputation function already does:
-// socket.emit('client:join', { gpuInfo: state.adapterInfo || { vendor: 'CPU Fallback', device: 'CPU Computation' } });
-// This will correctly send the (potentially limited) state.adapterInfo.
-
-// Matrix multiplication using WebGPU (existing)
 async function multiplyMatricesGPU(matrixA, matrixB, size, startRow, endRow) {
-    // Ensure state.device is checked before use, though initWebGPU should prevent this if not supported
     if (!state.device) throw new Error("WebGPU device not available for GPU computation.");
     logTaskActivity(`GPU: Matrix task rows ${startRow}-${endRow}`);
     const startTime = performance.now();
@@ -247,7 +227,7 @@ async function multiplyMatricesGPU(matrixA, matrixB, size, startRow, endRow) {
         const result = new Array(rowsToCalculate);
         for (let i = 0; i < rowsToCalculate; i++) { result[i] = new Array(size); for (let j = 0; j < size; j++) result[i][j] = resultArray[i * size + j]; }
         readBuffer.unmap();
-        aBuffer.destroy(); bBuffer.destroy(); resultBuffer.destroy(); readBuffer.destroy(); uniformBuffer.destroy(); // Cleanup
+        aBuffer.destroy(); bBuffer.destroy(); resultBuffer.destroy(); readBuffer.destroy(); uniformBuffer.destroy();
 
         const processingTime = performance.now() - startTime;
         logTaskActivity(`GPU: Matrix task completed in ${processingTime.toFixed(0)}ms`);
@@ -255,7 +235,6 @@ async function multiplyMatricesGPU(matrixA, matrixB, size, startRow, endRow) {
     } catch (error) { logTaskActivity(`GPU: Matrix task ERROR: ${error.message}`, 'error'); throw error; }
 }
 
-// CPU fallback for matrix multiplication (existing)
 async function multiplyMatricesCPU(matrixA, matrixB, size, startRow, endRow) {
     logTaskActivity(`CPU: Matrix task rows ${startRow}-${endRow}`);
     const startTime = performance.now();
@@ -271,7 +250,6 @@ async function multiplyMatricesCPU(matrixA, matrixB, size, startRow, endRow) {
     } catch (error) { logTaskActivity(`CPU: Matrix task ERROR: ${error.message}`, 'error'); throw error; }
 }
 
-// Process a matrix task (existing)
 async function processMatrixTask(task) {
     state.currentTask = task;
     elements.taskStatus.textContent = `Matrix task ${task.id} (rows ${task.startRow}-${task.endRow})`;
@@ -290,40 +268,36 @@ async function processMatrixTask(task) {
         return { taskId: task.id, result: result.result, processingTime: result.processingTime };
     } catch (error) {
         elements.taskStatus.textContent = `Matrix task error: ${error.message}`; elements.taskStatus.className = 'status error';
-        // Emit error to server for this task if needed
         socket.emit('task:error', { taskId: task.id, message: error.message, type: 'matrixMultiply' });
-        throw error; // Rethrow to be caught by task:assign handler
+        throw error;
     }
 }
 
-// Join the computation (existing)
 function joinComputation() {
-    elements.joinComputation.disabled = true; elements.leaveComputation.disabled = false;
-    const mode = (state.webgpuSupported && state.device) ? 'WebGPU' : 'CPU'; // This logic remains correct
+    if(elements.joinComputation) elements.joinComputation.disabled = true;
+    if(elements.leaveComputation) elements.leaveComputation.disabled = false;
+    const mode = (state.webgpuSupported && state.device) ? 'WebGPU' : 'CPU';
     logTaskActivity(`Joining computation network (${mode})...`);
-    // state.adapterInfo will have default values if requestAdapterInfo failed
     socket.emit('client:join', { gpuInfo: state.adapterInfo || { vendor: 'CPU Fallback', device: 'CPU Computation', description: 'No adapter info' } });
-    state.isComputing = true; // For matrix tasks
+    state.isComputing = true;
     elements.computationStatus.textContent = `Joined computation network (${mode}), waiting for tasks`;
     elements.computationStatus.className = 'status info';
 }
 
-// Leave the computation (existing)
 function leaveComputation() {
-    elements.joinComputation.disabled = false; elements.leaveComputation.disabled = true;
-    state.isComputing = false; state.currentTask = null; // For matrix tasks
+    if(elements.joinComputation) elements.joinComputation.disabled = false;
+    if(elements.leaveComputation) elements.leaveComputation.disabled = true;
+    state.isComputing = false; state.currentTask = null;
     logTaskActivity('Left computation network');
     elements.taskStatus.textContent = 'No matrix task assigned'; elements.taskStatus.className = 'status info';
     elements.computationStatus.textContent = 'Not participating in computation'; elements.computationStatus.className = 'status warning';
-    socket.emit('client:leave'); // Inform server
+    socket.emit('client:leave');
 }
 
-// Request a matrix task from the server (existing)
 function requestMatrixTask() {
     if (state.isComputing && !state.currentTask) { socket.emit('task:request'); }
 }
 
-// Start a new matrix computation (admin - existing)
 function startMatrixComputation() {
     const matrixSize = parseInt(elements.matrixSize.value);
     const chunkSize = parseInt(elements.chunkSize.value);
@@ -331,9 +305,8 @@ function startMatrixComputation() {
     logAdminActivity(`Starting new matrix computation: ${matrixSize}x${matrixSize} with chunk size ${chunkSize}`, 'matrix');
 }
 
-// Add a log entry to the task log (existing)
 function logTaskActivity(message, type = 'info') {
-    if (IS_HEADLESS) { // For headless, log to console and optionally update title
+    if (IS_HEADLESS) {
         console.log(`[Worker ${WORKER_ID} Log]: ${message}`);
         if (type === 'error') console.error(`[Worker ${WORKER_ID} ErrorLog]: ${message}`);
         document.title = `Worker ${WORKER_ID} | ${message.substring(0,50)}`;
@@ -344,16 +317,19 @@ function logTaskActivity(message, type = 'info') {
     elements.taskLog.appendChild(logItem); elements.taskLog.scrollTop = elements.taskLog.scrollHeight;
 }
 
-// Add a log entry to the admin log (existing, adapted for different logs)
 function logAdminActivity(message, panelType = 'matrix', type = 'info') {
     if (IS_HEADLESS) { console.log(`[Admin Log]: ${message}`); return; }
     const logContainer = panelType === 'wgsl' ? elements.adminLogWgsl : elements.adminLogMatrix;
     const logItem = document.createElement('div'); logItem.className = type;
     logItem.textContent = `[${new Date().toLocaleTimeString()}] ${message}`;
-    logContainer.appendChild(logItem); logContainer.scrollTop = logContainer.scrollHeight;
+    if(logContainer) {
+        logContainer.appendChild(logItem);
+        logContainer.scrollTop = logContainer.scrollHeight;
+    } else {
+        console.warn(`Admin log container for ${panelType} not found.`);
+    }
 }
 
-// Update client display (existing)
 function updateClientDisplay(clients) {
     if (IS_HEADLESS || !elements.clientGrid) return;
     elements.clientGrid.innerHTML = '';
@@ -361,14 +337,13 @@ function updateClientDisplay(clients) {
     clients.forEach(client => {
         const isCurrentClient = client.id === state.clientId;
         const timeSinceActive = Date.now() - client.lastActive;
-        const isActive = client.connected && timeSinceActive < 60000; // 60 seconds threshold
+        const isActive = client.connected && timeSinceActive < 60000;
         const clientEl = document.createElement('div');
         clientEl.className = `client-card ${!isActive ? 'client-inactive' : ''} ${client.usingCpu ? 'client-cpu' : 'client-gpu'} ${client.isPuppeteer ? 'client-puppeteer' : ''}`;
         let clientHTML = `<div>${isCurrentClient ? '<strong>You</strong>' : 'Client'} ${client.isPuppeteer ? '(Puppeteer)' : ''}</div>
                           <div><small>${client.id.substring(0, 8)}...</small></div>`;
         if (client.gpuInfo) {
-             // Adjust access to gpuInfo properties carefully, as they might be 'N/A' or 'Unknown'
-            let displayVendor = 'GPU'; // Default
+            let displayVendor = 'GPU';
             if (client.gpuInfo.isCpuComputation) {
                 displayVendor = 'CPU';
             } else if (client.gpuInfo.vendor && client.gpuInfo.vendor !== 'N/A' && client.gpuInfo.vendor !== 'Unknown') {
@@ -377,13 +352,12 @@ function updateClientDisplay(clients) {
             clientHTML += `<div><small>${displayVendor}</small></div>`;
         }
         clientHTML += `<div>Tasks: ${client.completedTasks || 0}</div>`;
-        clientHTML += `<div><small>${isActive ? 'Active' : 'Inactive'}</small></div>`;
+        clientHTML += `<div><small>${isActive ? 'Active' : 'Inactive ('+ Math.round(timeSinceActive/1000) + 's ago)'}</small></div>`;
         clientEl.innerHTML = clientHTML;
         elements.clientGrid.appendChild(clientEl);
     });
 }
 
-// Update stats display (existing)
 function updateStatsDisplay(stats) {
     if (IS_HEADLESS || !elements.activeClients) return;
     elements.activeClients.textContent = stats.activeClients || 0;
@@ -395,25 +369,29 @@ function updateStatsDisplay(stats) {
 
 // --- Custom WGSL Workload Handling ---
 socket.on('workload:new', async meta => {
-    if (!state.device) { // Check state.device which is set if WebGPU init was successful
-        logTaskActivity(`Received custom workload "${meta.label}" but WebGPU device not ready. Skipping.`, 'warning');
+    if (meta.status !== 'pending') {
+        logTaskActivity(`Received custom workload "${meta.label}" with status "${meta.status}". Will not process unless 'pending'.`, meta.status === 'queued' ? 'info' : 'warning');
+        return;
+    }
+
+    if (!state.device) {
+        logTaskActivity(`Received custom workload "${meta.label}" (status: pending) but WebGPU device not ready. Skipping.`, 'warning');
         socket.emit('workload:error', { id: meta.id, message: 'WebGPU device not available on client.' });
         return;
     }
-    logTaskActivity(`Received custom workload "${meta.label}" (ID: ${meta.id.substring(0,6)}). Processing...`);
-    let shader, pipeline, inputBuf, outBuf, readBuf, commandEncoder; // Declare here for finally block
+
+    logTaskActivity(`Processing custom workload "${meta.label}" (ID: ${meta.id.substring(0,6)}, Status: ${meta.status})...`);
+    let shader, pipeline, inputBuf, outBuf, readBuf, commandEncoder;
 
     try {
         const startTime = performance.now();
-        // (1) Compile shader
         shader = state.device.createShaderModule({ code: meta.wgsl });
-        const compilationInfo = await shader.getCompilationInfo(); // Use a different variable name 'compilationInfo'
+        const compilationInfo = await shader.getCompilationInfo();
         if (compilationInfo.messages.some(m => m.type === 'error')) {
             const errorMessages = compilationInfo.messages.filter(m => m.type === 'error').map(m => m.message).join('\n');
             throw new Error(`Shader compilation failed: ${errorMessages}`);
         }
 
-        // (2) Create pipeline (simple "storage-in-storage-out" for now)
         if (meta.bindLayout !== "storage-in-storage-out") {
             throw new Error(`Unsupported bindLayout: ${meta.bindLayout}. Only 'storage-in-storage-out' is currently implemented.`);
         }
@@ -422,7 +400,6 @@ socket.on('workload:new', async meta => {
             compute: { module: shader, entryPoint: meta.entry || 'main' }
         });
 
-        // (3) Input -> GPU (if provided)
         if (meta.input) {
             const inputDataBytes = Uint8Array.from(atob(meta.input), c => c.charCodeAt(0));
             inputBuf = state.device.createBuffer({
@@ -434,19 +411,17 @@ socket.on('workload:new', async meta => {
             inputBuf.unmap();
         }
 
-        // (4) Output buffer
         outBuf = state.device.createBuffer({
             size: meta.outputSize,
             usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC
         });
 
-        // (5) Bind group, dispatch, readback
         const entries = [];
         if (inputBuf) {
             entries.push({ binding: 0, resource: { buffer: inputBuf } });
             entries.push({ binding: 1, resource: { buffer: outBuf } });
         } else {
-            const placeholderInputSize = meta.outputSize;
+            const placeholderInputSize = 16;
             inputBuf = state.device.createBuffer({ size: placeholderInputSize, usage: GPUBufferUsage.STORAGE });
             entries.push({ binding: 0, resource: { buffer: inputBuf } });
             entries.push({ binding: 1, resource: { buffer: outBuf } });
@@ -494,17 +469,20 @@ socket.on('workload:new', async meta => {
     }
 });
 
+// MODIFIED to add Completion Time
 function updateActiveWgslWorkloadsDisplay(workloadsFromServer) {
     if (IS_HEADLESS || !elements.activeWgslWorkloadsGrid) return;
     elements.activeWgslWorkloadsGrid.innerHTML = '';
     if (!workloadsFromServer || workloadsFromServer.length === 0) {
-        elements.activeWgslWorkloadsGrid.innerHTML = '<p>No custom WGSL workloads currently active.</p>';
+        elements.activeWgslWorkloadsGrid.innerHTML = '<p>No custom WGSL workloads currently.</p>';
         return;
     }
     workloadsFromServer.forEach(wl => {
         const card = document.createElement('div');
-        card.className = 'wgsl-card';
-        card.innerHTML = `
+        card.className = `wgsl-card status-${wl.status || 'unknown'}`;
+        card.id = `wgsl-card-${wl.id}`;
+
+        let cardHTML = `
             <h4>${wl.label} <small>(${wl.id.substring(0,6)})</small></h4>
             <p>Status: <strong>${wl.status || 'N/A'}</strong></p>
             <p>Dispatch: ${wl.workgroupCount.join('x')} groups</p>
@@ -512,18 +490,64 @@ function updateActiveWgslWorkloadsDisplay(workloadsFromServer) {
             ${wl.wgsl ? `<p>Shader: <pre>${wl.wgsl.substring(0,100)}${wl.wgsl.length > 100 ? '...' : ''}</pre></p>` : ''}
             ${wl.results ? `<p>Submissions: ${wl.results.length}</p>` : ''}
             ${wl.finalResult ? `<p>Final Result (first 10 bytes): <pre>${JSON.stringify(wl.finalResult.slice(0,10))}...</pre></p>` : ''}
-        `;
+            ${wl.createdAt ? `<p><small>Created: ${new Date(wl.createdAt).toLocaleString()}</small></p>` : ''}
+            ${wl.startedAt && wl.status !== 'queued' ? `<p><small>Started: ${new Date(wl.startedAt).toLocaleString()}</small></p>` : ''}`;
+
+        // --- ADDED Completion Time Display ---
+        if (wl.status === 'complete' && wl.completedAt) {
+            const startTimeForCalc = wl.startedAt || wl.createdAt; // Use startedAt if available, else createdAt
+            if (startTimeForCalc) {
+                const durationMs = wl.completedAt - startTimeForCalc;
+                const durationSeconds = durationMs / 1000;
+                let durationFormatted;
+                if (durationSeconds < 0) { // Should not happen with correct timestamps
+                    durationFormatted = "Invalid timestamps";
+                } else if (durationSeconds < 60) {
+                    durationFormatted = `${durationSeconds.toFixed(1)}s`;
+                } else if (durationSeconds < 3600) {
+                    const minutes = Math.floor(durationSeconds / 60);
+                    const seconds = (durationSeconds % 60).toFixed(1);
+                    durationFormatted = `${minutes}m ${seconds}s`;
+                } else {
+                    const hours = Math.floor(durationSeconds / 3600);
+                    const minutes = Math.floor((durationSeconds % 3600) / 60);
+                    const seconds = (durationSeconds % 60).toFixed(1);
+                    durationFormatted = `${hours}h ${minutes}m ${seconds}s`;
+                }
+                cardHTML += `<p>Completion Time: <strong>${durationFormatted}</strong></p>`;
+                 if (wl.completedAt) {
+                    cardHTML += `<p><small>Completed: ${new Date(wl.completedAt).toLocaleString()}</small></p>`;
+                }
+            }
+        }
+        // --- END Completion Time Display ---
+
+        cardHTML += `<div class="wgsl-card-actions">`;
+        cardHTML += `<button class="remove-wgsl-button danger" data-workload-id="${wl.id}" title="Remove Workload">Remove (X)</button>`;
+        cardHTML += `</div>`;
+
+        card.innerHTML = cardHTML;
         elements.activeWgslWorkloadsGrid.appendChild(card);
+
+        const removeButton = card.querySelector('.remove-wgsl-button');
+        if (removeButton) {
+            removeButton.addEventListener('click', function() {
+                const workloadId = this.getAttribute('data-workload-id');
+                if (confirm(`Are you sure you want to remove workload "${wl.label}" (ID: ${workloadId.substring(0,6)})? This action cannot be undone.`)) {
+                    logAdminActivity(`Requesting removal of WGSL workload ID: ${workloadId}`, 'wgsl');
+                    socket.emit('admin:removeCustomWorkload', { workloadId });
+                }
+            });
+        }
     });
 }
 
-
-// Socket.io event handlers (existing + new)
+// Socket.io event handlers
 socket.on('connect', () => {
     state.connected = true;
     elements.clientStatus.textContent = 'Connected to server'; elements.clientStatus.className = 'status success';
     logTaskActivity('Connected to computation server');
-    if (elements.joinComputation) elements.joinComputation.disabled = false;
+    if (elements.joinComputation) elements.joinComputation.disabled = !(state.webgpuSupported || window.isSecureContext);
 });
 
 socket.on('disconnect', () => {
@@ -538,10 +562,9 @@ socket.on('disconnect', () => {
 socket.on('register', (data) => {
     state.clientId = data.clientId;
     elements.clientStatus.textContent = `Connected as: ${data.clientId.substring(0, 8)}... ${IS_HEADLESS ? '(Headless Worker '+WORKER_ID+')' : ''}`;
-    if (elements.joinComputation) elements.joinComputation.disabled = false;
 });
 
-socket.on('state:update', (data) => { // For matrix computation status
+socket.on('state:update', (data) => {
     if (IS_HEADLESS) return;
     if (data.isRunning) {
         elements.computationStatus.textContent = 'Matrix computation in progress'; elements.computationStatus.className = 'status info';
@@ -553,7 +576,7 @@ socket.on('state:update', (data) => { // For matrix computation status
 
 socket.on('clients:update', (data) => { updateClientDisplay(data.clients); });
 
-socket.on('task:assign', async (task) => { // For matrix tasks
+socket.on('task:assign', async (task) => {
     if (!state.isComputing && !IS_HEADLESS) return;
     if (task.type && task.type !== 'matrixMultiply') {
         logTaskActivity(`Received task of unknown type: ${task.type}. Ignoring.`, 'warning');
@@ -564,46 +587,67 @@ socket.on('task:assign', async (task) => { // For matrix tasks
         socket.emit('task:complete', result); state.currentTask = null; requestMatrixTask();
     } catch (error) {
         logTaskActivity(`Error processing matrix task: ${error.message}`, 'error');
-        state.currentTask = null; setTimeout(requestMatrixTask, 2000);
+        state.currentTask = null; setTimeout(requestMatrixTask, 2000 + Math.random() * 3000);
     }
 });
 
-socket.on('task:wait', (data) => { // For matrix tasks
+socket.on('task:wait', (data) => {
     if (data && data.type && data.type !== 'matrixMultiply') return;
     elements.taskStatus.textContent = 'Waiting for available matrix tasks'; elements.taskStatus.className = 'status warning';
     logTaskActivity('No matrix tasks available, waiting...'); state.currentTask = null;
-    setTimeout(requestMatrixTask, 5000 + Math.random() * 5000);
+    if (state.isComputing) {
+        setTimeout(requestMatrixTask, 5000 + Math.random() * 5000);
+    }
 });
 
-socket.on('computation:complete', (data) => { // For matrix computation
+socket.on('computation:complete', (data) => {
     if (data && data.type && data.type !== 'matrixMultiply') return;
     elements.computationStatus.textContent = `Matrix computation completed in ${data.totalTime.toFixed(1)}s`;
     elements.computationStatus.className = 'status success';
     logTaskActivity(`Matrix computation completed in ${data.totalTime.toFixed(1)}s`); state.currentTask = null;
 });
 
-socket.on('task:error', (data) => { // For matrix tasks
+socket.on('task:error', (data) => {
     if (data && data.type && data.type !== 'matrixMultiply') return;
     logTaskActivity(`Server error for matrix task ${data.taskId}: ${data.message}`, 'error');
 });
 
-socket.on('task:submitted', (data) => { // For matrix tasks
+socket.on('task:submitted', (data) => {
     if (data && data.type && data.type !== 'matrixMultiply') return;
     logTaskActivity(`Matrix task ${data.taskId} submitted. Awaiting verification.`);
 });
-socket.on('task:verified', (data) => { // For matrix tasks
+socket.on('task:verified', (data) => {
     if (data && data.type && data.type !== 'matrixMultiply') return;
     logTaskActivity(`Your submission for matrix task ${data.taskId} was verified!`, 'success');
 });
 
-socket.on('workloads:active_list', (workloads) => {
-    if (IS_HEADLESS || !elements.activeWgslWorkloadsGrid) return;
-    updateActiveWgslWorkloadsDisplay(workloads);
+socket.on('workloads:list_update', (allWorkloads) => {
+    if (IS_HEADLESS) return;
+    logAdminActivity('Received updated list of all custom WGSL workloads.', 'wgsl', 'info');
+    updateActiveWgslWorkloadsDisplay(allWorkloads);
 });
+
 socket.on('workload:complete', (data) => {
     logTaskActivity(`Server confirmed custom workload "${data.label || data.id.substring(0,6)}" is complete!`, 'success');
 });
 
+socket.on('workload:removed', (data) => {
+    if (IS_HEADLESS) return;
+    logAdminActivity(`Workload "${data.label || data.id.substring(0,6)}" was removed by server.`, 'wgsl', 'info');
+    const cardToRemove = document.getElementById(`wgsl-card-${data.id}`);
+    if (cardToRemove) {
+        cardToRemove.remove();
+    }
+    if (elements.activeWgslWorkloadsGrid && elements.activeWgslWorkloadsGrid.children.length === 0) {
+        elements.activeWgslWorkloadsGrid.innerHTML = '<p>No custom WGSL workloads currently.</p>';
+    }
+});
+
+socket.on('admin:feedback', (data) => {
+    if (data && data.message) {
+        logAdminActivity(`Server: ${data.message}`, 'wgsl', data.success ? 'success' : 'error');
+    }
+});
 
 // Event listeners
 if (!IS_HEADLESS) {
@@ -620,9 +664,7 @@ if (!IS_HEADLESS) {
             wgsl: elements.wgslSrc.value,
             entry: elements.wgslEntryPoint.value || 'main',
             workgroupCount: [
-                +elements.wgslGroupsX.value,
-                +elements.wgslGroupsY.value,
-                +elements.wgslGroupsZ.value
+                +elements.wgslGroupsX.value, +elements.wgslGroupsY.value, +elements.wgslGroupsZ.value
             ],
             bindLayout: elements.wgslBindLayout.value,
             outputSize: +elements.wgslOutputSize.value,
@@ -630,30 +672,34 @@ if (!IS_HEADLESS) {
         };
 
         if (!payload.wgsl || !payload.workgroupCount.every(c => c > 0) || !payload.outputSize) {
-            logAdminActivity('WGSL Upload: Missing WGSL source, valid workgroup counts, or output size.', 'wgsl', 'error');
-            return;
+            logAdminActivity('WGSL Upload: Missing WGSL source, valid workgroup counts, or output size.', 'wgsl', 'error'); return;
         }
 
         logAdminActivity(`Pushing WGSL workload: "${payload.label}"...`, 'wgsl');
         try {
             const res = await fetch('/api/workloads', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify(payload)
+                method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload)
             });
             const json = await res.json();
             if (res.ok && json.ok) {
-                logAdminActivity(`WGSL Workload ${json.id} (${payload.label}) queued successfully.`, 'wgsl', 'success');
+                logAdminActivity(`WGSL Workload ${json.id} (${payload.label}) ${json.message || 'queued successfully.'}`, 'wgsl', 'success');
             } else {
                 logAdminActivity(`WGSL Upload Error: ${json.error || 'Unknown server error'} (Status: ${res.status})`, 'wgsl', 'error');
             }
         } catch (err) {
-            logAdminActivity(`WGSL Upload Fetch Error: ${err.message}`, 'wgsl', 'error');
-            console.error("WGSL Push error:", err);
+            logAdminActivity(`WGSL Upload Fetch Error: ${err.message}`, 'wgsl', 'error'); console.error("WGSL Push error:", err);
         }
     });
-}
 
+    if (elements.startQueuedWgslButton) {
+        elements.startQueuedWgslButton.addEventListener('click', () => {
+            logAdminActivity('Requesting server to start all queued WGSL workloads...', 'wgsl');
+            socket.emit('admin:startQueuedCustomWorkloads');
+        });
+    } else {
+        console.warn("Admin button 'startQueuedWgslButton' not found.");
+    }
+}
 
 // Initialize the application
 async function init() {
@@ -666,26 +712,17 @@ async function init() {
     await initWebGPU();
 
     if (IS_HEADLESS) {
-        // Check state.webgpuSupported and state.device which are set by the modified initWebGPU
-        if (state.webgpuSupported && state.device && elements.joinComputation && !elements.joinComputation.disabled) {
+        if (elements.joinComputation && !elements.joinComputation.disabled) {
             logTaskActivity("Headless mode: Auto-joining computation...");
             joinComputation();
-        } else if ((!state.webgpuSupported || !state.device) && elements.joinComputation && !elements.joinComputation.disabled) {
-            logTaskActivity("Headless mode: WebGPU not fully available, attempting to join for CPU tasks if applicable...");
-            joinComputation(); // Join for CPU tasks only if WebGPU init failed but join is still possible
         } else {
-            logTaskActivity("Headless mode: Cannot auto-join. WebGPU init might have failed, or join button is disabled, or no device acquired.", 'warning');
+             logTaskActivity("Headless mode: Cannot auto-join. WebGPU init might have failed, or join button is disabled.", 'warning');
         }
     } else {
         const urlParams = new URLSearchParams(window.location.search);
         if (urlParams.has('admin')) {
-            elements.adminPanel.style.display = 'block';
+            if(elements.adminPanel) elements.adminPanel.style.display = 'block';
         }
-        setTimeout(() => {
-            if (elements.joinComputation && elements.joinComputation.disabled && (!navigator.gpu || !window.isSecureContext)) {
-                elements.joinComputation.disabled = false;
-            }
-        }, 2000);
     }
 }
 

@@ -1,14 +1,13 @@
-import express from 'express'; // Changed to import
+import express from 'express';
 import fs from 'fs';
 import path from 'path';
-import { v4 as uuidv4 } from 'uuid'; // Changed to import
-import http from 'http'; // Changed to import
-import https from 'https'; // Changed to import
-import { Server as SocketIOServer } from 'socket.io'; // Changed to import
+import { v4 as uuidv4 } from 'uuid';
+import http from 'http';
+import https from 'https';
+import { Server as SocketIOServer } from 'socket.io';
 
 const app = express();
 
-// Read SSL certificates
 let server;
 let useHttps = false;
 const PORT = process.env.PORT || 3000;
@@ -40,33 +39,56 @@ app.use((req, res, next) => {
 });
 
 app.use(express.static(path.join(path.resolve(), 'public')));
-app.use(express.json({ limit: '10mb' })); // Increased limit for WGSL source
+app.use(express.json({ limit: '10mb' }));
 
-// State management for matrix multiplication (existing)
 const matrixState = {
-  isRunning: false,
-  problem: null,
-  tasks: [],
-  activeTasks: new Map(),
-  completedTasks: new Map(),
-  clients: new Map(), // clientId -> clientObject { id, socket, connected, joinedAt, lastActive, completedTasks, gpuInfo, isPuppeteer }
-  startTime: null,
-  endTime: null,
-  stats: {
-    totalClients: 0,
-    activeClients: 0,
-    completedTasks: 0,
-    totalTasks: 0
-  }
+  isRunning: false, problem: null, tasks: [], activeTasks: new Map(),
+  completedTasks: new Map(), clients: new Map(), startTime: null, endTime: null,
+  stats: { totalClients: 0, activeClients: 0, completedTasks: 0, totalTasks: 0 }
 };
 const matrixResultBuffer = new Map();
 const MATRIX_MIN_VERIFICATIONS = 2;
-const MATRIX_TASK_TIMEOUT = 3 * 60 * 1000;
+const MATRIX_TASK_TIMEOUT = 3 * 60 * 1000; // 3 minutes
 
-// --- Custom WGSL Workload Management ---
-const customWorkloads = new Map(); // Stores WorkloadMeta and results
-const CUSTOM_WGSL_REQUIRED_VOTES = 1; // How many clients must return identical result for custom WGSL. Adjust as needed.
+const customWorkloads = new Map();
+const CUSTOM_WGSL_REQUIRED_VOTES = 1;
 const CUSTOM_TASKS_FILE = 'custom_tasks.json';
+
+// --- Persistence for Custom Workloads ---
+function saveCustomWorkloads() {
+  const workloadsArray = Array.from(customWorkloads.values());
+  fs.writeFile(CUSTOM_TASKS_FILE, JSON.stringify(workloadsArray, null, 2), (err) => {
+    if (err) console.error('Error saving custom workloads:', err);
+    else console.log(`Custom workloads saved to ${CUSTOM_TASKS_FILE}`);
+  });
+}
+
+function loadCustomWorkloads() {
+  try {
+    if (fs.existsSync(CUSTOM_TASKS_FILE)) {
+      const data = fs.readFileSync(CUSTOM_TASKS_FILE, 'utf8');
+      const workloadsArray = JSON.parse(data);
+      workloadsArray.forEach(workload => {
+        if (workload.status === undefined) {
+            if (workload.finalResult) {
+                workload.status = 'complete';
+            } else if (workload.results && workload.results.length > 0) {
+                workload.status = 'processing';
+            } else {
+                workload.status = 'pending';
+            }
+        }
+        customWorkloads.set(workload.id, workload);
+      });
+      console.log(`Loaded ${customWorkloads.size} custom workloads from ${CUSTOM_TASKS_FILE}`);
+    }
+  } catch (err) { console.error('Error loading custom workloads:', err); }
+}
+
+function broadcastCustomWorkloadList() {
+    io.emit('workloads:list_update', Array.from(customWorkloads.values()));
+}
+
 
 app.post('/api/workloads', (req, res) => {
   const { label, wgsl, entry = 'main', workgroupCount, bindLayout = "storage-in-storage-out", input, outputSize } = req.body;
@@ -80,128 +102,70 @@ app.post('/api/workloads', (req, res) => {
   if (typeof outputSize !== 'number' || outputSize <= 0) {
     return res.status(400).json({ error: 'outputSize must be a positive number.' });
   }
-  if (wgsl.length > 100 * 1024) { // 100KB limit for WGSL source
+  if (wgsl.length > 100 * 1024) { // 100KB limit
       return res.status(400).json({ error: 'WGSL source code too large (max 100KB).' });
   }
-  // TODO: Add more validation:
-  // - Verify WGSL contains only @compute entry points.
-  // - Run wgsl-analyzer or Dawn tint for static analysis.
 
   const id = uuidv4();
   const meta = {
-    id,
-    label: label || `Custom Workload ${id.substring(0,6)}`,
-    wgsl,
-    entry,
-    workgroupCount,
-    bindLayout,
-    input, // Optional: base64 encoded binary blob
-    outputSize, // Bytes each client must copy back
-    status: 'pending', // pending, processing, complete, error
-    results: [], // To store { socketId, result (Array<number>), submissionTime }
-    processingTimes: [], // To store { clientId, timeMs } for successful contributions
-    createdAt: Date.now()
+    id, label: label || `Custom Workload ${id.substring(0,6)}`, wgsl, entry,
+    workgroupCount, bindLayout, input, outputSize,
+    status: 'queued', // Initial status is 'queued'
+    results: [], processingTimes: [], createdAt: Date.now()
   };
   customWorkloads.set(id, meta);
-  saveCustomWorkloads(); // Persist after adding
-  io.emit('workload:new', meta); // Broadcast to every client
-  console.log(`📡 Pushed custom WGSL workload ${id} (${meta.label}) to ${io.engine.clientsCount} clients`);
-  res.json({ ok: true, id, message: `Workload "${meta.label}" queued.` });
+  saveCustomWorkloads();
+
+  io.emit('workload:new', meta); // Broadcast so UIs/clients are aware (clients must filter by status)
+  broadcastCustomWorkloadList(); // Send updated full list
+
+  console.log(`📡 Queued custom WGSL workload ${id} (${meta.label}). Needs admin to start.`);
+  res.json({ ok: true, id, message: `Workload "${meta.label}" queued. Needs admin start.` });
 });
 
-// --- Persistence for Custom Workloads ---
-function saveCustomWorkloads() {
-  const workloadsArray = Array.from(customWorkloads.values());
-  fs.writeFile(CUSTOM_TASKS_FILE, JSON.stringify(workloadsArray, null, 2), (err) => {
-    if (err) {
-      console.error('Error saving custom workloads:', err);
-    } else {
-      console.log(`Custom workloads saved to ${CUSTOM_TASKS_FILE}`);
-    }
-  });
-}
 
-function loadCustomWorkloads() {
-  try {
-    if (fs.existsSync(CUSTOM_TASKS_FILE)) {
-      const data = fs.readFileSync(CUSTOM_TASKS_FILE, 'utf8');
-      const workloadsArray = JSON.parse(data);
-      workloadsArray.forEach(workload => customWorkloads.set(workload.id, workload));
-      console.log(`Loaded ${customWorkloads.size} custom workloads from ${CUSTOM_TASKS_FILE}`);
-    }
-  } catch (err) { console.error('Error loading custom workloads:', err); }
-}
-
-// Generate random matrix of given size (existing)
 function generateRandomMatrix(size) {
   const matrix = [];
-  for (let i = 0; i < size; i++) {
-    const row = [];
-    for (let j = 0; j < size; j++) {
-      row.push(Math.random() * 2 - 1);
-    }
-    matrix.push(row);
-  }
+  for (let i = 0; i < size; i++) { const row = []; for (let j = 0; j < size; j++) row.push(Math.random() * 2 - 1); matrix.push(row); }
   return matrix;
 }
 
-// Prepare matrix multiplication problem (existing)
 function prepareMatrixMultiplication(size, chunkSize) {
   console.log(`Preparing matrix multiplication problem: ${size}x${size} with chunk size ${chunkSize}`);
-  matrixState.activeTasks.clear();
-  matrixState.completedTasks.clear();
-  matrixResultBuffer.clear();
-  matrixState.problem = null;
-  matrixState.tasks = [];
-  matrixState.stats.completedTasks = 0;
-  matrixState.stats.totalTasks = 0;
-  matrixState.startTime = null;
-  matrixState.endTime = null;
-  matrixState.isRunning = false;
+  matrixState.activeTasks.clear(); matrixState.completedTasks.clear(); matrixResultBuffer.clear();
+  matrixState.problem = null; matrixState.tasks = []; matrixState.stats.completedTasks = 0;
+  matrixState.stats.totalTasks = 0; matrixState.startTime = null; matrixState.endTime = null; matrixState.isRunning = false;
 
-  const matrixA = generateRandomMatrix(size);
-  const matrixB = generateRandomMatrix(size);
-
+  const matrixA = generateRandomMatrix(size); const matrixB = generateRandomMatrix(size);
   matrixState.problem = { type: 'matrixMultiply', matrixA, matrixB, size, chunkSize };
   const numChunks = Math.ceil(size / chunkSize);
   for (let i = 0; i < numChunks; i++) {
-    const startRow = i * chunkSize;
-    const endRow = Math.min((i + 1) * chunkSize, size);
+    const startRow = i * chunkSize; const endRow = Math.min((i + 1) * chunkSize, size);
     matrixState.tasks.push({ id: `task-${i}`, startRow, endRow, status: 'pending' });
   }
-  matrixState.stats.totalTasks = matrixState.tasks.length;
-  matrixState.startTime = Date.now();
-  matrixState.isRunning = true;
-  console.log(`Created ${matrixState.tasks.length} matrix tasks`);
+  matrixState.stats.totalTasks = matrixState.tasks.length; matrixState.startTime = Date.now();
+  matrixState.isRunning = true; console.log(`Created ${matrixState.tasks.length} matrix tasks`);
   return matrixState.problem;
 }
 
-// Assign a matrix task to a client (existing)
 function assignMatrixTask(clientId) {
   const taskDefinition = matrixState.tasks.find(task => task.status === 'pending' && !matrixState.completedTasks.has(task.id));
   if (!taskDefinition) return null;
-
   taskDefinition.status = 'active';
   matrixState.activeTasks.set(taskDefinition.id, { id: taskDefinition.id, assignedTo: clientId, startTime: Date.now() });
   console.log(`Assigning matrix task ${taskDefinition.id} to client ${clientId}`);
   return {
-    id: taskDefinition.id,
-    startRow: taskDefinition.startRow,
-    endRow: taskDefinition.endRow,
-    matrixA: matrixState.problem.matrixA,
-    matrixB: matrixState.problem.matrixB,
-    size: matrixState.problem.size,
-    type: 'matrixMultiply' // Explicitly add type for client differentiation
+    id: taskDefinition.id, startRow: taskDefinition.startRow, endRow: taskDefinition.endRow,
+    matrixA: matrixState.problem.matrixA, matrixB: matrixState.problem.matrixB,
+    size: matrixState.problem.size, type: 'matrixMultiply'
   };
 }
 
-// Process a matrix task result (existing, adapted)
 function processMatrixTaskResult(taskId, verifiedResultData, contributingClientIds = []) {
   const taskDefinition = matrixState.tasks.find(t => t.id === taskId);
   if (!taskDefinition || taskDefinition.status === 'completed') return false;
 
-  taskDefinition.status = 'completed';
-  taskDefinition.result = verifiedResultData;
+  taskDefinition.status = 'completed'; taskDefinition.result = verifiedResultData;
   matrixState.activeTasks.delete(taskId);
 
   const submissions = matrixResultBuffer.get(taskId) || [];
@@ -230,28 +194,20 @@ function processMatrixTaskResult(taskId, verifiedResultData, contributingClientI
 
 function finalizeMatrixComputation() {
     console.log('All matrix tasks completed, finalizing computation.');
-    matrixState.endTime = Date.now();
-    matrixState.isRunning = false;
+    matrixState.endTime = Date.now(); matrixState.isRunning = false;
     const totalTime = (matrixState.endTime - matrixState.startTime) / 1000;
     console.log(`Matrix computation completed in ${totalTime.toFixed(2)} seconds`);
-
     const results = [];
     matrixState.completedTasks.forEach(task => {
         results.push({ id: task.id, startRow: task.startRow, endRow: task.endRow, processingTime: task.processingTime, client: task.assignedTo });
     });
     results.sort((a,b) => parseInt(a.id.split('-')[1]) - parseInt(b.id.split('-')[1]));
-
     io.emit('computation:complete', { totalTime, results, stats: matrixState.stats, type: 'matrixMultiply' });
 }
 
-// Handle client disconnection (existing, adapted)
 function handleClientDisconnect(clientId) {
   const client = matrixState.clients.get(clientId);
-  if (client && client.isPuppeteer) {
-      console.log(`Puppeteer client ${clientId} disconnected.`);
-      // Specific logic for puppeteer clients if needed, e.g. don't try to reassign its tasks if pool manages it.
-  }
-
+  if (client && client.isPuppeteer) { console.log(`Puppeteer client ${clientId} disconnected.`); }
   for (const [taskId, activeTaskInstance] of matrixState.activeTasks.entries()) {
     if (activeTaskInstance.assignedTo === clientId) {
       console.log(`Matrix task ${taskId} was assigned to disconnected client ${clientId}. Reverting to pending.`);
@@ -264,7 +220,6 @@ function handleClientDisconnect(clientId) {
   matrixState.stats.activeClients = matrixState.clients.size;
 }
 
-// Check for timed-out matrix tasks (existing)
 function checkMatrixTaskTimeouts() {
   const now = Date.now();
   for (const [taskId, activeTaskInstance] of matrixState.activeTasks.entries()) {
@@ -276,26 +231,26 @@ function checkMatrixTaskTimeouts() {
     }
   }
 }
-setInterval(checkMatrixTaskTimeouts, 30000);
+setInterval(checkMatrixTaskTimeouts, 30000); // Check every 30 seconds
 
 io.on('connection', (socket) => {
-  const clientId = uuidv4();
+  const clientId = uuidv4(); // This clientId is unique per connection
   console.log(`New client connected: ${clientId}`);
-  const isPuppeteerWorker = socket.handshake.query.mode === 'headless'; // Basic check
+  const isPuppeteerWorker = socket.handshake.query.mode === 'headless';
 
   matrixState.clients.set(clientId, {
     id: clientId, socket: socket, connected: true, joinedAt: Date.now(),
-    lastActive: Date.now(), completedTasks: 0, gpuInfo: null,
-    isPuppeteer: isPuppeteerWorker // Mark if puppeteer
+    lastActive: Date.now(), completedTasks: 0, gpuInfo: null, isPuppeteer: isPuppeteerWorker
+    // Add an 'isAdmin' flag here if you have an admin login system
+    // isAdmin: false // example
   });
-  matrixState.stats.totalClients++;
-  matrixState.stats.activeClients = matrixState.clients.size;
+  matrixState.stats.totalClients++; matrixState.stats.activeClients = matrixState.clients.size;
 
   socket.emit('register', { clientId });
   socket.emit('state:update', { isRunning: matrixState.isRunning, stats: matrixState.stats, problem: matrixState.problem ? { type: matrixState.problem.type, size: matrixState.problem.size, chunkSize: matrixState.problem.chunkSize } : null });
   broadcastClientList();
+  broadcastCustomWorkloadList(); // Send full list of WGSL tasks to new client
 
-  // Send existing active custom workloads to new client
   customWorkloads.forEach(workload => {
     if (workload.status === 'pending' || workload.status === 'processing') {
         socket.emit('workload:new', workload);
@@ -310,14 +265,14 @@ io.on('connection', (socket) => {
       console.log(`Client ${clientId} joined. GPU: ${client.gpuInfo.vendor || 'N/A'} ${client.gpuInfo.device || 'N/A'}${client.isPuppeteer ? ' (Puppeteer)' : ''}`);
       client.lastActive = Date.now();
       broadcastClientList();
-      if (matrixState.isRunning) { // For matrix tasks
+      if (matrixState.isRunning) {
         const task = assignMatrixTask(clientId);
         if (task) socket.emit('task:assign', task); else socket.emit('task:wait', {type: 'matrixMultiply'});
       }
     }
   });
 
-  socket.on('task:request', () => { // For matrix tasks
+  socket.on('task:request', () => {
     const client = matrixState.clients.get(clientId);
     if (client) {
       client.lastActive = Date.now();
@@ -330,7 +285,7 @@ io.on('connection', (socket) => {
     }
   });
 
-  socket.on('task:complete', (data) => { // For matrix tasks
+  socket.on('task:complete', (data) => {
     const client = matrixState.clients.get(clientId);
     if (!client || !client.connected) return;
     client.lastActive = Date.now();
@@ -351,11 +306,10 @@ io.on('connection', (socket) => {
 
     if (!matrixResultBuffer.has(taskId)) matrixResultBuffer.set(taskId, []);
     const entries = matrixResultBuffer.get(taskId);
-    if (entries.some(entry => entry.clientId === clientId)) { // Prevent duplicate submissions for same task
-        if (matrixState.isRunning) { // Still try to assign a new task
+    if (entries.some(entry => entry.clientId === clientId)) {
+        if (matrixState.isRunning) {
             const newTask = assignMatrixTask(clientId); if (newTask) socket.emit('task:assign', newTask); else socket.emit('task:wait', {type: 'matrixMultiply'});
-        }
-        return;
+        } return;
     }
     entries.push({ clientId, result: receivedResult, processingTime, submissionTime: Date.now() });
 
@@ -387,31 +341,25 @@ io.on('connection', (socket) => {
     }
   });
 
-  // --- Custom WGSL Workload Socket Handlers ---
   socket.on('workload:done', ({ id, result, processingTime }) => {
     const workload = customWorkloads.get(id);
     if (!workload) {
       console.warn(`Client ${clientId} submitted result for unknown custom workload ${id}`);
-      socket.emit('workload:error', { id, message: 'Unknown workload ID.' });
-      return;
+      socket.emit('workload:error', { id, message: 'Unknown workload ID.' }); return;
     }
-    if (workload.status === 'complete') {
-      console.log(`Custom workload ${id} already complete. Ignoring submission from ${clientId}.`);
-      return;
+    if (workload.status === 'complete' || workload.status === 'queued') {
+      console.log(`Custom workload ${id} is ${workload.status}. Ignoring submission from ${clientId}.`); return;
     }
 
     console.log(`Client ${clientId} submitted result for custom workload ${id} (${workload.label}). Result length: ${result?.length}`);
     workload.results.push({ socketId: clientId, clientReportedId: socket.id, result, submissionTime: Date.now(), processingTime });
 
-    // Simple verification: check if enough identical results are in.
     const resultCounts = workload.results.reduce((acc, resEntry) => {
-        const resultKey = JSON.stringify(resEntry.result); // Results are expected to be Array<number>
-        acc[resultKey] = (acc[resultKey] || 0) + 1;
-        return acc;
+        const resultKey = JSON.stringify(resEntry.result);
+        acc[resultKey] = (acc[resultKey] || 0) + 1; return acc;
     }, {});
 
-    let verifiedResultKey = null;
-    let contributingSubmissions = [];
+    let verifiedResultKey = null; let contributingSubmissions = [];
     for (const [key, count] of Object.entries(resultCounts)) {
         if (count >= CUSTOM_WGSL_REQUIRED_VOTES) {
             verifiedResultKey = key;
@@ -421,26 +369,25 @@ io.on('connection', (socket) => {
     }
 
     if (verifiedResultKey) {
-        if (workload.status !== 'complete') { // Ensure we only process completion once
-            workload.status = 'complete';
-            workload.finalResult = JSON.parse(verifiedResultKey); // Store the verified result
+        if (workload.status !== 'complete') {
+            workload.status = 'complete'; workload.finalResult = JSON.parse(verifiedResultKey);
             workload.completedAt = Date.now();
-
-            // Store processing times of clients who contributed to the verified result
+            workload.processingTimes = workload.processingTimes || [];
             contributingSubmissions.forEach(sub => {
                 if (sub.processingTime !== undefined) {
-                    workload.processingTimes = workload.processingTimes || [];
                     workload.processingTimes.push({ clientId: sub.socketId, timeMs: sub.processingTime });
                 }
             });
-            saveCustomWorkloads(); // Persist changes
-            console.log(`✅ Custom WGSL Workload ${id} (${workload.label}) finished and verified. Avg time (approx): ${workload.processingTimes?.reduce((sum, pt) => sum + pt.timeMs, 0) / (workload.processingTimes?.length || 1) } ms`);
-            io.emit('workload:complete', { id, label: workload.label, finalResult: workload.finalResult /* consider size limits */ });
+            saveCustomWorkloads();
+            const avgTime = workload.processingTimes?.reduce((sum, pt) => sum + pt.timeMs, 0) / (workload.processingTimes?.length || 1);
+            console.log(`✅ Custom WGSL Workload ${id} (${workload.label}) finished and verified. Avg time (approx): ${avgTime.toFixed(0)} ms`);
+            io.emit('workload:complete', { id, label: workload.label, finalResult: workload.finalResult });
+            broadcastCustomWorkloadList();
         }
-        // Optional: Clean up large results from memory if not needed after broadcasting completion.
-        // customWorkloads.get(id).results = []; // Or store summary
     } else {
         workload.status = 'processing';
+        saveCustomWorkloads();
+        broadcastCustomWorkloadList();
         console.log(`Workload ${id} (${workload.label}) has ${workload.results.length} submissions. Waiting for ${CUSTOM_WGSL_REQUIRED_VOTES} identical results.`);
     }
   });
@@ -448,17 +395,13 @@ io.on('connection', (socket) => {
   socket.on('workload:error', ({ id, message }) => {
     const workload = customWorkloads.get(id);
     console.warn(`Client ${clientId} reported error for custom workload ${id}: ${message}`);
-    if (workload && workload.status !== 'complete') {
-      // Decide on error handling: e.g., mark workload as errored after N client errors
-      // workload.status = 'error';
-      // workload.errors = workload.errors || [];
-      // workload.errors.push({ socketId: clientId, message });
-      // io.emit('workload:update', { id, status: 'error', errors: workload.errors.length });
+    if (workload && workload.status !== 'complete' && workload.status !== 'error') {
+      // Future: error handling logic
     }
   });
 
-
   socket.on('admin:start', (data) => { // For matrix tasks
+    // Add admin check here if needed
     if (matrixState.isRunning && matrixState.stats.completedTasks < matrixState.stats.totalTasks) {
       socket.emit('error', { message: 'Matrix computation is already running.' }); return;
     }
@@ -467,21 +410,83 @@ io.on('connection', (socket) => {
       socket.emit('error', { message: 'Invalid matrixSize or chunkSize.' }); return;
     }
     prepareMatrixMultiplication(matrixSize, chunkSize);
-    broadcastStatus();
-    assignTasksToAvailableClients();
+    broadcastStatus(); assignTasksToAvailableClients();
   });
+
+  socket.on('admin:startQueuedCustomWorkloads', () => {
+    const adminClient = matrixState.clients.get(clientId);
+    // Basic Admin Check (improve with roles/permissions for production)
+    if (!adminClient) { // Example: or if (!adminClient.isAdmin)
+         console.warn(`Unauthorized client ${clientId} attempted to start queued workloads.`);
+         socket.emit('admin:feedback', { success: false, message: "Unauthorized action."});
+         return;
+    }
+    console.log(`Admin request from ${clientId} to start queued custom workloads.`);
+    let startedCount = 0;
+    customWorkloads.forEach(workload => {
+      if (workload.status === 'queued') {
+        workload.status = 'pending';
+        workload.startedAt = Date.now();
+        io.emit('workload:new', workload);
+        console.log(`Custom workload ${workload.id} (${workload.label}) status changed to 'pending' and broadcasted.`);
+        startedCount++;
+      }
+    });
+
+    if (startedCount > 0) {
+      saveCustomWorkloads();
+      broadcastCustomWorkloadList();
+      socket.emit('admin:feedback', { success: true, message: `${startedCount} custom workload(s) transitioned to 'pending' and broadcasted.` });
+    } else {
+      socket.emit('admin:feedback', { success: false, message: 'No custom workloads found in "queued" state.' });
+    }
+  });
+
+  // --- NEW: Handler for removing a custom WGSL workload ---
+  socket.on('admin:removeCustomWorkload', ({ workloadId }) => {
+    const adminClient = matrixState.clients.get(clientId);
+    // Basic Admin Check (improve with roles/permissions for production)
+    if (!adminClient ) { // Example: or if (!adminClient.isAdmin)
+        console.warn(`Unauthorized client ${clientId} attempted to remove workload ${workloadId}.`);
+        socket.emit('admin:feedback', { success: false, message: "Unauthorized action to remove workload." });
+        return;
+    }
+
+    if (!workloadId) {
+        console.warn(`Admin ${clientId} attempted to remove workload without providing an ID.`);
+        socket.emit('admin:feedback', { success: false, message: "Workload ID is required for removal." });
+        return;
+    }
+
+    const workloadToRemove = customWorkloads.get(workloadId);
+
+    if (workloadToRemove) {
+        const removedLabel = workloadToRemove.label;
+        customWorkloads.delete(workloadId);
+        saveCustomWorkloads(); // Persist the change
+
+        console.log(`Admin ${clientId} removed custom WGSL workload ${workloadId} ("${removedLabel}").`);
+
+        io.emit('workload:removed', { id: workloadId, label: removedLabel });
+        broadcastCustomWorkloadList(); // Send updated full list
+
+        socket.emit('admin:feedback', { success: true, message: `Workload "${removedLabel}" (ID: ${workloadId}) removed successfully.` });
+    } else {
+        console.warn(`Admin ${clientId} attempted to remove non-existent workload ID: ${workloadId}`);
+        socket.emit('admin:feedback', { success: false, message: `Workload with ID ${workloadId} not found.` });
+    }
+  });
+  // --- END NEW Handler ---
 
   socket.on('disconnect', () => {
     console.log(`Client disconnected: ${clientId}`);
     const client = matrixState.clients.get(clientId);
     if(client) client.connected = false;
     handleClientDisconnect(clientId);
-    broadcastClientList();
-    broadcastStatus();
+    broadcastClientList(); broadcastStatus();
   });
 });
 
-// Broadcast current matrix computation status
 function broadcastStatus() {
   const statusPayload = {
     isRunning: matrixState.isRunning,
@@ -497,8 +502,7 @@ function broadcastClientList() {
   const clientList = Array.from(matrixState.clients.values()).map(client => ({
     id: client.id, joinedAt: client.joinedAt, completedTasks: client.completedTasks,
     gpuInfo: client.gpuInfo, lastActive: client.lastActive, connected: client.connected,
-    usingCpu: client.gpuInfo?.isCpuComputation || false,
-    isPuppeteer: client.isPuppeteer
+    usingCpu: client.gpuInfo?.isCpuComputation || false, isPuppeteer: client.isPuppeteer
   }));
   io.emit('clients:update', { clients: clientList });
 }
@@ -517,13 +521,11 @@ function assignTasksToAvailableClients() { // For matrix tasks
   }
 }
 
-
-// Optional: Spawn Puppeteer workers from server itself
 if (process.env.HEADLESS_POOL) {
   const poolSize = Number(process.env.HEADLESS_POOL);
   if (poolSize > 0) {
     console.log(`HEADLESS_POOL environment variable set. Spawning ${poolSize} Puppeteer workers...`);
-    import('./headless-client.js') // Assuming headless-client.js is ESM and in root
+    import('./headless-client.js')
       .then(module => {
         const serverUrl = `http${useHttps ? 's' : ''}://localhost:${PORT}/`;
         module.spawnPuppeteerWorkers(serverUrl, poolSize, false)
@@ -532,7 +534,6 @@ if (process.env.HEADLESS_POOL) {
       .catch(err => console.error("Failed to import headless-client.js:", err));
   }
 }
-
 
 server.listen(PORT, () => {
   loadCustomWorkloads();

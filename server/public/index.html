@@ -19,6 +19,8 @@
         button:disabled { background-color: #cccccc; cursor: not-allowed; }
         button.secondary { background-color: #2196F3; }
         button.secondary:hover { background-color: #0b7dda; }
+        button.danger { background-color: #f44336; } /* For remove button */
+        button.danger:hover { background-color: #da190b; }
         .stats-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 10px; margin-bottom: 20px; }
         .stat-box { background: #f9f9f9; padding: 15px; border-radius: 6px; text-align: center; border: 1px solid #eee; }
         .stat-value { font-size: 24px; font-weight: bold; margin: 5px 0; }
@@ -34,10 +36,11 @@
         .admin-controls label, .wgsl-controls label { margin-bottom: 5px; font-size: 0.9em; }
         .admin-controls input, .admin-controls select, .wgsl-controls input, .wgsl-controls select, .wgsl-controls textarea { padding: 8px; border-radius: 4px; border: 1px solid #ccc; }
         .wgsl-controls textarea { min-height: 150px; font-family: monospace; width: 100%; }
-        .wgsl-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(250px, 1fr)); gap: 10px; margin-top: 15px; }
-        .wgsl-card { padding: 10px; border-radius: 6px; background: #e9e9e9; font-size: 0.9em; }
+        .wgsl-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); gap: 10px; margin-top: 15px; } /* Adjusted minmax for remove button */
+        .wgsl-card { padding: 15px; border-radius: 6px; background: #e9e9e9; font-size: 0.9em; display: flex; flex-direction: column; justify-content: space-between; } /* Flex for button positioning */
         .wgsl-card h4 { margin-top:0; margin-bottom: 5px; }
         .wgsl-card pre { white-space: pre-wrap; word-break: break-all; max-height: 100px; overflow-y: auto; background: #fff; padding: 5px; border-radius: 3px;}
+        .wgsl-card-actions { margin-top: 10px; text-align: right; } /* Container for action buttons */
     </style>
 </head>
 <body>
@@ -131,6 +134,7 @@
                 </div>
             </div>
             <button id="push-wgsl-workload">Push WGSL Workload</button>
+            <button id="startQueuedWgslButton" class="secondary">Start All Queued WGSL Workloads</button>
             <div class="log-container" id="admin-log-wgsl">Admin WGSL actions will be logged here...</div>
         </div>
 
@@ -146,7 +150,6 @@
     <script src="/socket.io/socket.io.js"></script>
     <script src="client.js"></script>
     <script>
-        // Secure context check (already present in user's HTML)
         document.addEventListener('DOMContentLoaded', function() {
             const secureContextStatus = document.getElementById('secure-context-status');
             if (window.isSecureContext) {
