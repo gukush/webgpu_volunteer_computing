@@ -19,7 +19,7 @@
         button:disabled { background-color: #cccccc; cursor: not-allowed; }
         button.secondary { background-color: #2196F3; }
         button.secondary:hover { background-color: #0b7dda; }
-        button.danger { background-color: #f44336; } /* For remove button */
+        button.danger { background-color: #f44336; }
         button.danger:hover { background-color: #da190b; }
         .stats-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 10px; margin-bottom: 20px; }
         .stat-box { background: #f9f9f9; padding: 15px; border-radius: 6px; text-align: center; border: 1px solid #eee; }
@@ -32,15 +32,19 @@
         .client-puppeteer { border-left-style: dashed; }
         #admin-panel { display: none; margin-top: 20px; padding: 20px; background: #f9f9f9; border-radius: 8px; border: 1px solid #ddd; }
         .admin-controls, .wgsl-controls { display: flex; flex-wrap: wrap; gap: 15px; margin-top: 15px; align-items: flex-end; }
-        .admin-controls div, .wgsl-controls div { display: flex; flex-direction: column; }
-        .admin-controls label, .wgsl-controls label { margin-bottom: 5px; font-size: 0.9em; }
-        .admin-controls input, .admin-controls select, .wgsl-controls input, .wgsl-controls select, .wgsl-controls textarea { padding: 8px; border-radius: 4px; border: 1px solid #ccc; }
+        .admin-controls div, .wgsl-controls div, .wgsl-chunking-controls div { display: flex; flex-direction: column; } /* Added .wgsl-chunking-controls div */
+        .admin-controls label, .wgsl-controls label, .wgsl-chunking-controls label { margin-bottom: 5px; font-size: 0.9em; } /* Added .wgsl-chunking-controls label */
+        .admin-controls input, .admin-controls select, .wgsl-controls input, .wgsl-controls select, .wgsl-controls textarea,
+        .wgsl-chunking-controls input, .wgsl-chunking-controls select { padding: 8px; border-radius: 4px; border: 1px solid #ccc; } /* Added .wgsl-chunking-controls inputs */
         .wgsl-controls textarea { min-height: 150px; font-family: monospace; width: 100%; }
-        .wgsl-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); gap: 10px; margin-top: 15px; } /* Adjusted minmax for remove button */
-        .wgsl-card { padding: 15px; border-radius: 6px; background: #e9e9e9; font-size: 0.9em; display: flex; flex-direction: column; justify-content: space-between; } /* Flex for button positioning */
+        .wgsl-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); gap: 10px; margin-top: 15px; }
+        .wgsl-card { padding: 15px; border-radius: 6px; background: #e9e9e9; font-size: 0.9em; display: flex; flex-direction: column; justify-content: space-between; }
         .wgsl-card h4 { margin-top:0; margin-bottom: 5px; }
         .wgsl-card pre { white-space: pre-wrap; word-break: break-all; max-height: 100px; overflow-y: auto; background: #fff; padding: 5px; border-radius: 3px;}
-        .wgsl-card-actions { margin-top: 10px; text-align: right; } /* Container for action buttons */
+        .wgsl-card-actions { margin-top: 10px; text-align: right; }
+        .wgsl-chunking-options { border: 1px dashed #ccc; padding: 15px; margin-top: 15px; border-radius: 4px; background-color: #fdfdfd;}
+        .wgsl-chunking-options legend { font-weight: bold; padding: 0 5px; margin-left: 10px; color: #555;}
+        .wgsl-chunking-controls { display: flex; flex-wrap: wrap; gap: 15px; align-items: flex-end; }
     </style>
 </head>
 <body>
@@ -96,7 +100,7 @@
             <p>Start a new matrix multiplication computation:</p>
             <div class="admin-controls">
                 <div><label for="matrix-size">Matrix Size:</label><select id="matrix-size"><option value="128">128x128</option><option value="256">256x256</option><option value="512" selected>512x512</option><option value="1024">1024x1024</option><option value="2048">2048x2048</option></select></div>
-                <div><label for="chunk-size">Chunk Size:</label><select id="chunk-size"><option value="16">16 rows</option><option value="32" selected>32 rows</option><option value="64">64 rows</option><option value="128">128 rows</option></select></div>
+                <div><label for="chunk-size">Chunk Size (Matrix Rows):</label><select id="chunk-size"><option value="16">16 rows</option><option value="32" selected>32 rows</option><option value="64">64 rows</option><option value="128">128 rows</option></select></div>
                 <button id="start-computation">Start Matrix Computation</button>
             </div>
             <div class="log-container" id="admin-log-matrix">Admin matrix actions will be logged here...</div>
@@ -113,26 +117,61 @@
                  <div style="flex-grow: 1;"><label for="wgsl-src">WGSL Source Code:</label><textarea id="wgsl-src" placeholder="@compute @workgroup_size(64) fn main(...) { ... }"></textarea></div>
             </div>
              <div class="wgsl-controls">
-                <div><label for="wgsl-groups-x">Workgroups X:</label><input type="number" id="wgsl-groups-x" value="1"></div>
-                <div><label for="wgsl-groups-y">Workgroups Y:</label><input type="number" id="wgsl-groups-y" value="1"></div>
-                <div><label for="wgsl-groups-z">Workgroups Z:</label><input type="number" id="wgsl-groups-z" value="1"></div>
+                <div><label for="wgsl-groups-x">Workgroups X:</label><input type="number" id="wgsl-groups-x" value="1" min="1"></div>
+                <div><label for="wgsl-groups-y">Workgroups Y:</label><input type="number" id="wgsl-groups-y" value="1" min="1"></div>
+                <div><label for="wgsl-groups-z">Workgroups Z:</label><input type="number" id="wgsl-groups-z" value="1" min="1"></div>
             </div>
             <div class="wgsl-controls">
                 <div>
-                    <label for="wgsl-bind-layout">Bind Layout:</label>
+                    <label for="wgsl-bind-layout">Bind Layout Convention:</label>
                     <select id="wgsl-bind-layout">
-                        <option value="storage-in-storage-out" selected>Storage In -> Storage Out</option>
-                        <option value="custom" disabled>Custom (not implemented yet)</option>
-                    </select>
+                        <option value="storage-in-storage-out" selected>Default (Uniforms @0, Input @1, Output @2)</option>
+                        </select>
                 </div>
-                <div><label for="wgsl-output-size">Output Buffer Size (bytes):</label><input type="number" id="wgsl-output-size" placeholder="e.g., 1024"></div>
+                <div><label for="wgsl-output-size">Total Output Buffer Size (bytes):</label><input type="number" id="wgsl-output-size" placeholder="e.g., 1024 (Final aggregated size if chunked)"></div>
             </div>
             <div class="wgsl-controls">
                  <div style="flex-grow: 1;">
-                    <label for="wgsl-input-data">Input Data (Optional, Base64 Encoded):</label>
+                    <label for="wgsl-input-data">Input Data (Base64 Encoded, Required if Chunkable):</label>
                     <textarea id="wgsl-input-data" placeholder="Base64 encoded binary data for the input buffer..." rows="3"></textarea>
                 </div>
             </div>
+
+            <div class="wgsl-controls">
+                <div>
+                    <label for="wgsl-chunkable" style="flex-direction: row; align-items: center;">
+                        <input type="checkbox" id="wgsl-chunkable" style="margin-right: 5px;">Chunkable Workload
+                    </label>
+                </div>
+            </div>
+
+            <fieldset class="wgsl-chunking-options" id="wgsl-chunking-options-fieldset" style="display:none;">
+                <legend>Chunking Parameters</legend>
+                <div class="wgsl-chunking-controls">
+                    <div>
+                        <label for="wgsl-chunk-processing-type">Input Chunk Type:</label>
+                        <select id="wgsl-chunk-processing-type">
+                            <option value="elements" selected>Elements</option>
+                            <option value="bytes">Bytes</option>
+                        </select>
+                    </div>
+                    <div>
+                        <label for="wgsl-input-chunk-size">Input Chunk Size (per type):</label>
+                        <input type="number" id="wgsl-input-chunk-size" value="1024">
+                    </div>
+                    <div id="wgsl-element-size-bytes-container">
+                        <label for="wgsl-input-element-size-bytes">Input Element Size (bytes):</label>
+                        <input type="number" id="wgsl-input-element-size-bytes" value="4">
+                    </div>
+                    <div>
+                        <label for="wgsl-output-aggregation-method">Output Aggregation:</label>
+                        <select id="wgsl-output-aggregation-method">
+                            <option value="concatenate" selected>Concatenate</option>
+                            <option value="none" disabled>None (Not fully supported)</option>
+                        </select>
+                    </div>
+                </div>
+            </fieldset>
             <button id="push-wgsl-workload">Push WGSL Workload</button>
             <button id="startQueuedWgslButton" class="secondary">Start All Queued WGSL Workloads</button>
             <div class="log-container" id="admin-log-wgsl">Admin WGSL actions will be logged here...</div>
@@ -156,9 +195,30 @@
                 secureContextStatus.textContent = 'Running in a secure context (HTTPS or localhost) - WebGPU can be used.';
                 secureContextStatus.className = 'status success';
             } else {
-                secureContextStatus.innerHTML = 'Not running in a secure context. WebGPU requires HTTPS or localhost. <a href="https://' + window.location.host + window.location.pathname + '">Switch to HTTPS</a>';
+                secureContextStatus.innerHTML = 'Not running in a secure context. WebGPU requires HTTPS or localhost. <a href="https://' + window.location.host + window.location.pathname + '">Try HTTPS</a>';
                 secureContextStatus.className = 'status error';
             }
+
+            // Toggle visibility of chunking options
+            const chunkableCheckbox = document.getElementById('wgsl-chunkable');
+            const chunkingOptionsDiv = document.getElementById('wgsl-chunking-options-fieldset');
+            const chunkProcessingTypeSelect = document.getElementById('wgsl-chunk-processing-type');
+            const elementSizeBytesContainer = document.getElementById('wgsl-element-size-bytes-container');
+
+            chunkableCheckbox.addEventListener('change', function() {
+                chunkingOptionsDiv.style.display = this.checked ? 'block' : 'none';
+                if (this.checked) { // If chunkable, also check initial state of processing type
+                    elementSizeBytesContainer.style.display = chunkProcessingTypeSelect.value === 'elements' ? 'flex' : 'none';
+                } else {
+                    elementSizeBytesContainer.style.display = 'none';
+                }
+            });
+
+            chunkProcessingTypeSelect.addEventListener('change', function() {
+                if (chunkableCheckbox.checked) {
+                    elementSizeBytesContainer.style.display = this.value === 'elements' ? 'flex' : 'none';
+                }
+            });
         });
     </script>
 </body>
