@@ -66,6 +66,7 @@ const MATRIX_TASK_TIMEOUT = 3 * 60 * 1000;
 // --- Custom WGSL Workload Management ---
 const customWorkloads = new Map(); // Stores WorkloadMeta and results
 const CUSTOM_WGSL_REQUIRED_VOTES = 1; // How many clients must return identical result for custom WGSL. Adjust as needed.
+const CUSTOM_TASKS_FILE = 'custom_tasks.json';
 
 app.post('/api/workloads', (req, res) => {
   const { label, wgsl, entry = 'main', workgroupCount, bindLayout = "storage-in-storage-out", input, outputSize } = req.body;
@@ -98,15 +99,38 @@ app.post('/api/workloads', (req, res) => {
     outputSize, // Bytes each client must copy back
     status: 'pending', // pending, processing, complete, error
     results: [], // To store { socketId, result (Array<number>), submissionTime }
+    processingTimes: [], // To store { clientId, timeMs } for successful contributions
     createdAt: Date.now()
   };
   customWorkloads.set(id, meta);
-
+  saveCustomWorkloads(); // Persist after adding
   io.emit('workload:new', meta); // Broadcast to every client
   console.log(`📡 Pushed custom WGSL workload ${id} (${meta.label}) to ${io.engine.clientsCount} clients`);
   res.json({ ok: true, id, message: `Workload "${meta.label}" queued.` });
 });
 
+// --- Persistence for Custom Workloads ---
+function saveCustomWorkloads() {
+  const workloadsArray = Array.from(customWorkloads.values());
+  fs.writeFile(CUSTOM_TASKS_FILE, JSON.stringify(workloadsArray, null, 2), (err) => {
+    if (err) {
+      console.error('Error saving custom workloads:', err);
+    } else {
+      console.log(`Custom workloads saved to ${CUSTOM_TASKS_FILE}`);
+    }
+  });
+}
+
+function loadCustomWorkloads() {
+  try {
+    if (fs.existsSync(CUSTOM_TASKS_FILE)) {
+      const data = fs.readFileSync(CUSTOM_TASKS_FILE, 'utf8');
+      const workloadsArray = JSON.parse(data);
+      workloadsArray.forEach(workload => customWorkloads.set(workload.id, workload));
+      console.log(`Loaded ${customWorkloads.size} custom workloads from ${CUSTOM_TASKS_FILE}`);
+    }
+  } catch (err) { console.error('Error loading custom workloads:', err); }
+}
 
 // Generate random matrix of given size (existing)
 function generateRandomMatrix(size) {
@@ -364,7 +388,7 @@ io.on('connection', (socket) => {
   });
 
   // --- Custom WGSL Workload Socket Handlers ---
-  socket.on('workload:done', ({ id, result }) => {
+  socket.on('workload:done', ({ id, result, processingTime }) => {
     const workload = customWorkloads.get(id);
     if (!workload) {
       console.warn(`Client ${clientId} submitted result for unknown custom workload ${id}`);
@@ -377,7 +401,7 @@ io.on('connection', (socket) => {
     }
 
     console.log(`Client ${clientId} submitted result for custom workload ${id} (${workload.label}). Result length: ${result?.length}`);
-    workload.results.push({ socketId: clientId, clientReportedId: socket.id, result, submissionTime: Date.now() });
+    workload.results.push({ socketId: clientId, clientReportedId: socket.id, result, submissionTime: Date.now(), processingTime });
 
     // Simple verification: check if enough identical results are in.
     const resultCounts = workload.results.reduce((acc, resEntry) => {
@@ -387,19 +411,32 @@ io.on('connection', (socket) => {
     }, {});
 
     let verifiedResultKey = null;
+    let contributingSubmissions = [];
     for (const [key, count] of Object.entries(resultCounts)) {
         if (count >= CUSTOM_WGSL_REQUIRED_VOTES) {
             verifiedResultKey = key;
+            contributingSubmissions = workload.results.filter(r => JSON.stringify(r.result) === verifiedResultKey);
             break;
         }
     }
 
     if (verifiedResultKey) {
-        workload.status = 'complete';
-        workload.finalResult = JSON.parse(verifiedResultKey); // Store the verified result
-        workload.completedAt = Date.now();
-        console.log(`✅ Custom WGSL Workload ${id} (${workload.label}) finished and verified.`);
-        io.emit('workload:complete', { id, label: workload.label, finalResult: workload.finalResult /* consider size limits */ });
+        if (workload.status !== 'complete') { // Ensure we only process completion once
+            workload.status = 'complete';
+            workload.finalResult = JSON.parse(verifiedResultKey); // Store the verified result
+            workload.completedAt = Date.now();
+
+            // Store processing times of clients who contributed to the verified result
+            contributingSubmissions.forEach(sub => {
+                if (sub.processingTime !== undefined) {
+                    workload.processingTimes = workload.processingTimes || [];
+                    workload.processingTimes.push({ clientId: sub.socketId, timeMs: sub.processingTime });
+                }
+            });
+            saveCustomWorkloads(); // Persist changes
+            console.log(`✅ Custom WGSL Workload ${id} (${workload.label}) finished and verified. Avg time (approx): ${workload.processingTimes?.reduce((sum, pt) => sum + pt.timeMs, 0) / (workload.processingTimes?.length || 1) } ms`);
+            io.emit('workload:complete', { id, label: workload.label, finalResult: workload.finalResult /* consider size limits */ });
+        }
         // Optional: Clean up large results from memory if not needed after broadcasting completion.
         // customWorkloads.get(id).results = []; // Or store summary
     } else {
@@ -498,5 +535,6 @@ if (process.env.HEADLESS_POOL) {
 
 
 server.listen(PORT, () => {
+  loadCustomWorkloads();
   console.log(`Server running on ${useHttps ? 'HTTPS' : 'HTTP'} at ${useHttps ? 'https' : 'http'}://localhost:${PORT}`);
 });

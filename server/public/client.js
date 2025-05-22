@@ -418,7 +418,7 @@ socket.on('workload:new', async meta => {
 
         const processingTime = performance.now() - startTime;
         logTaskActivity(`Custom workload "${meta.label}" completed in ${processingTime.toFixed(0)}ms. Result size: ${result.length} bytes.`);
-        socket.emit('workload:done', { id: meta.id, result });
+        socket.emit('workload:done', { id: meta.id, result, processingTime });
 
     } catch (err) {
         logTaskActivity(`Error processing custom workload "${meta.label}": ${err.message}`, 'error');

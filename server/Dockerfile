@@ -11,17 +11,29 @@ RUN apt-get update && apt-get install -y \
 
 WORKDIR /app
 
+# This command will copy package.json.
+# If you happen to have a package-lock.json in your build context, it will also be copied,
+# and "npm install" will use it. Otherwise, "npm install" will create one inside the image.
 COPY package*.json ./
 
-# Using npm ci for cleaner installs if package-lock.json is present and up-to-date
-# If not, npm install is fine.
-RUN npm ci --omit=dev || npm install --omit=dev
+# Removed "RUN npm ci --omit=dev --verbose"
+# Now, npm install will handle the installation.
+# It will generate a package-lock.json inside the image if one wasn't copied.
+# --omit=dev ensures devDependencies (like nodemon) are not installed in the final image.
+RUN npm install --omit=dev --verbose
 
+# Copy the rest of your application code
 COPY . .
 
 EXPOSE 3000
 
-# Set PUPPETEER_SKIP_CHROMIUM_DOWNLOAD to true if you've handled Chromium separately
-# ENV PUPPETEER_EXECUTABLE_PATH /usr/bin/google-chrome-stable
+# Puppeteer configuration:
+# The system dependencies installed via apt-get should be sufficient for Puppeteer.
+# PUPPETEER_SKIP_CHROMIUM_DOWNLOAD=true tells Puppeteer not to download its own Chromium.
+ENV PUPPETEER_SKIP_CHROMIUM_DOWNLOAD=true
+# You might need to tell Puppeteer where to find the system's Chromium if it doesn't auto-detect.
+# Common paths are /usr/bin/chromium or /usr/bin/chromium-browser.
+# If Puppeteer can't find Chromium, you might need to set:
+# ENV PUPPETEER_EXECUTABLE_PATH=/usr/bin/chromium-browser (or the correct path)
 
 CMD ["node", "server.js"]
