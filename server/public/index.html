@@ -45,6 +45,7 @@
         .wgsl-chunking-options { border: 1px dashed #ccc; padding: 15px; margin-top: 15px; border-radius: 4px; background-color: #fdfdfd;}
         .wgsl-chunking-options legend { font-weight: bold; padding: 0 5px; margin-left: 10px; color: #555;}
         .wgsl-chunking-controls { display: flex; flex-wrap: wrap; gap: 15px; align-items: flex-end; }
+        .client-card .status.info { font-size: 0.8em; padding: 2px 5px; border-radius: 3px; display: inline-block; margin-top:3px;}
     </style>
 </head>
 <body>
@@ -105,7 +106,18 @@
             </div>
             <div class="log-container" id="admin-log-matrix">Admin matrix actions will be logged here...</div>
         </div>
-
+                <div class="card">
+            <h3>System Parameters</h3>
+            <div class="admin-controls">
+                <div>
+                    <label for="admin-k-value">Redundancy Factor (K):</label>
+                    <input type="number" id="admin-k-value" value="1" min="1" step="1" style="width: 80px;">
+                </div>
+                <button id="set-k-button" class="secondary">Set K</button>
+            </div>
+            Current K: <span id="current-k-display">1</span>
+            <div class="log-container" id="admin-log-system">System admin actions logged here...</div>
+        </div>
         <div class="card">
             <h3>Custom WGSL Workload</h3>
             <p>Upload and dispatch a custom WGSL compute shader:</p>
