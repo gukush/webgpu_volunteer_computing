@@ -241,6 +241,7 @@ function prepareAndQueueChunks(parentWorkload) {
       dispatchesMade: 0,
       submissions: [],
       activeAssignments: new Set(),
+      assignedClients: new Set(),
       verified_result_base64: null
     };
 
@@ -409,10 +410,15 @@ function broadcastStatus() {
 }
 
 function assignCustomChunkToAvailableClients() {
-  for (const [clientId, client] of matrixState.clients.entries()) {
-    if (!client.connected || !client.gpuInfo || client.isBusyWithCustomChunk || client.isBusyWithMatrixTask || !client.socket) {
-      continue;
-    }
+  const availableClients = Array.from(matrixState.clients.entries()).filter(([clientId, client]) =>
+    client.connected &&
+    client.gpuInfo &&
+    !client.isBusyWithCustomChunk &&
+    !client.isBusyWithMatrixTask &&
+    client.socket
+  );
+
+  for (const [clientId, client] of availableClients) {
     for (const parent of customWorkloads.values()) {
       if (!parent.isChunkParent || !['assigning_chunks', 'processing_chunks'].includes(parent.status)) continue;
 
@@ -420,9 +426,16 @@ function assignCustomChunkToAvailableClients() {
       if (!store) continue;
 
       for (const cd of store.allChunkDefs) {
-        if (cd.status !== 'completed' && !cd.verified_result_base64 && cd.dispatchesMade < ADMIN_K_PARAMETER && !cd.activeAssignments.has(clientId)) {
+        if (
+          cd.status !== 'completed' &&
+          !cd.verified_result_base64 &&
+          cd.dispatchesMade < ADMIN_K_PARAMETER &&
+          !cd.assignedClients.has(clientId)
+        ) {
+          // Assign this chunk to this client
           cd.dispatchesMade++;
           cd.activeAssignments.add(clientId);
+          cd.assignedClients.add(clientId);
           cd.status = 'active';
           cd.assignedTo = clientId;
           cd.assignedAt = Date.now();
@@ -430,10 +443,10 @@ function assignCustomChunkToAvailableClients() {
 
           client.socket.emit('workload:chunk_assign', { ...cd });
           console.log(`Assigned chunk ${cd.chunkId} (${parent.id}) to ${clientId}`);
-          client.isBusyWithCustomChunk = true;
           break;
         }
       }
+
       if (client.isBusyWithCustomChunk) break;
     }
   }
@@ -688,7 +701,7 @@ io.on('connection', socket => {
     }
     cd.submissions.push({ clientId: socket.id, result_base64: result, processingTime });
     parent.processingTimes.push({ clientId: socket.id, chunkId, timeMs: processingTime });
-
+/*
     const counts = cd.submissions.reduce((acc, s) => {
       acc[s.result_base64] = (acc[s.result_base64] || 0) + 1;
       return acc;
@@ -697,27 +710,43 @@ io.on('connection', socket => {
     for (const [k, c] of Object.entries(counts)) {
       if (c >= ADMIN_K_PARAMETER) { vk = k; break; }
     }
-    if (vk) {
-      cd.verified_result_base64 = vk;
+    if (vk && !cd.verified_result_base64) {
+  cd.verified_result_base64 = vk;
+  cd.status = 'completed';
+  store.completedChunksData.set(chunkOrderIndex, Buffer.from(vk, 'base64'));
+  console.log(`Chunk ${chunkId} VERIFIED (${store.completedChunksData.size}/${store.expectedChunks})`);
+}
+*/
+    if (cd.submissions.length >= ADMIN_K_PARAMETER && !cd.verified_result_base64) {
+      const firstResult = cd.submissions[0].result_base64;
+      cd.verified_result_base64 = firstResult;
       cd.status = 'completed';
-      store.completedChunksData.set(chunkOrderIndex, Buffer.from(vk, 'base64'));
-      console.log(`Chunk ${chunkId} VERIFIED (${store.completedChunksData.size}/${store.expectedChunks})`);
+      store.completedChunksData.set(chunkOrderIndex, Buffer.from(firstResult, 'base64'));
+      console.log(`Chunk ${chunkId} accepted after ${ADMIN_K_PARAMETER} submissions (${store.completedChunksData.size}/${store.expectedChunks})`);
     }
 
-    if (cd.verified_result_base64 && store.completedChunksData.size === store.expectedChunks) {
-      console.log(`All chunks for ${parentId} verified, aggregating...`);
-      parent.status = 'aggregating';
-      // simple concatenate:
-      const buffers = [];
-      for (let i = 0; i < store.expectedChunks; i++) {
-        buffers.push(store.completedChunksData.get(i));
-      }
-      const final = Buffer.concat(buffers);
-      parent.finalResult = Array.from(final);
-      parent.status = 'complete';
-      parent.completedAt = Date.now();
-      io.emit('workload:complete', { id: parentId, label: parent.label, finalResult: parent.finalResult });
-    }
+
+if (
+  !parent.finalResult &&                                // prevent double finalizing
+  store.completedChunksData.size === store.expectedChunks
+) {
+  console.log(`All chunks for ${parentId} verified, aggregating...`);
+  parent.status = 'aggregating';
+  parent.finalResult = Array.from(Buffer.concat(
+    Array.from({ length: store.expectedChunks }, (_, i) => store.completedChunksData.get(i))
+  ));
+  parent.status = 'complete';
+  parent.completedAt = Date.now();
+  io.emit('workload:complete', {
+    id: parentId,
+    label: parent.label,
+    finalResult: parent.finalResult
+  });
+
+  saveCustomWorkloads();
+  broadcastCustomWorkloadList();
+}
+
 
     saveCustomWorkloads();
     broadcastCustomWorkloadList();
