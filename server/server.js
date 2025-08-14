@@ -573,13 +573,15 @@ io.on('connection', socket => {
   socket.emit('register', { clientId: socket.id });
   socket.emit('admin:k_update', ADMIN_K_PARAMETER);
 
-  socket.on('client:join', data => {
-    const client = matrixState.clients.get(socket.id);
-    if (client) {
-      client.gpuInfo = data.gpuInfo;
-      console.log(`Client ${socket.id} joined; GPU info recorded.`);
-      broadcastClientList();
-    }
+  socket.on('client:join', (data) => {
+    const c = matrixState.clients.get(socket.id);
+    if (!c) return;
+    if (c.hasJoined) return; // avoid double-join on reconnecting code paths
+    c.hasJoined = true;
+    c.gpuInfo = data.gpuInfo;
+    c.hasWebGPU = !!data.hasWebGPU;
+    console.log(`Client ${socket.id} joined; GPU info recorded.`);
+    broadcastClientList();
   });
 
   socket.on('task:request', () => {
@@ -724,6 +726,33 @@ io.on('connection', socket => {
       store.completedChunksData.set(chunkOrderIndex, Buffer.from(firstResult, 'base64'));
       console.log(`Chunk ${chunkId} accepted after ${ADMIN_K_PARAMETER} submissions (${store.completedChunksData.size}/${store.expectedChunks})`);
     }
+
+    socket.on('workload:busy', ({ id, reason }) => {
+    const c = matrixState.clients.get(socket.id);
+    if (c) c.isBusyWithNonChunkedWGSL = false;
+    const wl = customWorkloads.get(id);
+    if (wl && !wl.isChunkParent) {
+      wl.activeAssignments.delete(socket.id);
+      if (wl.status !== 'complete') wl.status = 'pending_dispatch';
+      console.warn(`WGSL ${id} declined by ${socket.id} (${reason||'busy'})`);
+      saveCustomWorkloads(); broadcastCustomWorkloadList();
+    }
+    tryDispatchNonChunkedWorkloads();
+  });
+
+
+  socket.on('workload:error', ({ id, message }) => {
+  const c = matrixState.clients.get(socket.id);
+  if (c) c.isBusyWithNonChunkedWGSL = false;
+  const wl = customWorkloads.get(id);
+  if (wl && !wl.isChunkParent) {
+    wl.activeAssignments.delete(socket.id);
+    if (wl.status !== 'complete') wl.status = 'pending_dispatch';
+    console.warn(`WGSL ${id} errored on ${socket.id}: ${message}`);
+    saveCustomWorkloads(); broadcastCustomWorkloadList();
+  }
+  tryDispatchNonChunkedWorkloads();
+  });
 
 
 if (

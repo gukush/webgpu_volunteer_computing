@@ -58,14 +58,14 @@ export async function spawnPuppeteerWorkers(targetUrl, numInstances, runHeadful 
 // It checks if the script is the main module being run.
 async function main() {
     const argv = minimist(process.argv.slice(2));
-    const url = argv._[0] ?? 'http://localhost:3000/';
+    const url = argv._[0] ?? 'https://localhost:3000/';
     const count = Number(argv.instances ?? 1); // --instances 4
     const headful = argv.headful ? true : false;  // opt-in with --headful
 
     if (argv.help || argv.h) {
         console.log("Usage: node headless-client.js [url] [--instances N] [--headful]");
         console.log("\nOptions:");
-        console.log("  url                URL of the WebGPU volunteer computing page (default: http://localhost:3000/)");
+        console.log("  url                URL of the WebGPU volunteer computing page (default: https://localhost:3000/)");
         console.log("  --instances N      Number of headless browser instances to launch (default: 1)");
         console.log("  --headful          Run Chrome in headful mode instead of headless (for debugging)");
         process.exit(0);

@@ -13,6 +13,11 @@ const state = {
   statistics: { processingTime: 0 }
 };
 
+const inFlightWorkloads = new Set();
+let workloadListenerBound = false;
+let hasJoinedOnce = false;
+
+
 const elements = {
   webgpuStatus: document.getElementById('webgpu-status'),
   gpuInfo: document.getElementById('gpu-info'),
@@ -59,8 +64,65 @@ const IS_HEADLESS = PARAMS.get('mode') === 'headless';
 const WORKER_ID = PARAMS.get('workerId') || 'N/A';
 const socket = io({ query: IS_HEADLESS ? { mode: 'headless', workerId: WORKER_ID } : {} });
 
+
+function bindWorkloadListener() {
+  if (workloadListenerBound) return;
+  workloadListenerBound = true;
+
+  // Remove any anonymous handlers that may have been added previously
+  socket.off('workload:new');
+
+  function onWorkloadNew(meta) {
+    console.log('[HEADLESS] workload:new', meta.id, meta.label,
+                'wgslBusy=', !!state.isComputingWgsl,
+                'matrixBusy=', !!state.matrixBusy,
+                'chunkBusy=', !!state.isComputingChunk);
+
+    // drop duplicate deliveries of the same workload id
+    if (inFlightWorkloads.has(meta.id)) {
+      console.warn('[HEADLESS] duplicate workload event, declining', meta.id);
+      socket.emit('workload:busy', { id: meta.id, reason: 'duplicate-event' });
+      return;
+    }
+
+    // decline if any local lock is held
+    if (state.isComputingWgsl || state.matrixBusy || state.isComputingChunk) {
+      console.warn('[HEADLESS] Busy, rejecting workload', meta.id);
+      socket.emit('workload:busy', { id: meta.id, reason: 'local-busy' });
+      return;
+    }
+
+    // accept: set lock synchronously, before any await
+    state.isComputingWgsl = true;
+    inFlightWorkloads.add(meta.id);
+    console.log('[HEADLESS] Accepting WGSL workload', meta.id);
+
+    (async () => {
+      try {
+        const result = await executeWGSL(meta.code, meta.inputData);
+        socket.emit('workload:done', { id: meta.id, result });
+      } catch (err) {
+        console.error('[HEADLESS] WGSL failed', err);
+        socket.emit('workload:error', { id: meta.id, message: err?.message || String(err) });
+      } finally {
+        state.isComputingWgsl = false;
+        inFlightWorkloads.delete(meta.id);
+        console.log('[HEADLESS] WGSL finished', meta.id);
+      }
+    })();
+  }
+
+  socket.on('workload:new', onWorkloadNew);
+}
+
+
+
 async function initWebGPU() {
+  console.log(`[HEADLESS] Checking WebGPU support...`);
+  console.log(`[HEADLESS] isSecureContext: ${window.isSecureContext}`);
+  console.log(`[HEADLESS] navigator.gpu available: ${!!navigator.gpu}`);
   if (!window.isSecureContext) {
+    console.error(`[HEADLESS] Not a secure context`);
     elements.webgpuStatus.innerHTML = `WebGPU requires a secure context.`;
     elements.webgpuStatus.className = 'status error';
     elements.joinComputation.disabled = false;
@@ -380,12 +442,25 @@ function updateComputationStatusDisplay() {
   elements.computationStatus.textContent = txt;
   elements.computationStatus.className = cls;
 }
-
+/*
 socket.on('connect', () => {
   state.connected = true;
   elements.clientStatus.textContent = 'Connected';
   elements.clientStatus.className = 'status success';
   logTaskActivity('Connected to server');
+});
+*/
+
+
+socket.on('connect', () => {
+  if (!hasJoinedOnce) {
+    hasJoinedOnce = true;
+    socket.emit('client:join', {
+      gpuInfo: state.adapterInfo || { vendor: 'unknown' },
+      hasWebGPU: !!state.device
+    });
+  }
+  bindWorkloadListener();
 });
 
 socket.on('register', data => {
@@ -403,6 +478,7 @@ socket.on('state:update', data => {
 });
 
 socket.on('task:assign', async task => {
+  state.matrixBusy = true;
   if (state.isComputingMatrix || state.isComputingWgsl || state.isComputingChunk) return;
   try {
     const out = await processMatrixTask(task);
@@ -451,6 +527,13 @@ socket.on('workload:removed', ({ id }) => {
 });
 
 socket.on('workload:new', async meta => {
+  console.log(`[HEADLESS] Received WGSL workload: ${meta.id}, label: ${meta.label}`);
+  console.log(`[HEADLESS] State check:`);
+  console.log(`  - isComputingMatrix: ${state.isComputingMatrix}`);
+  console.log(`  - isComputingWgsl: ${state.isComputingWgsl}`);
+  console.log(`  - isComputingChunk: ${state.isComputingChunk}`);
+  console.log(`  - currentTask: ${state.currentTask ? JSON.stringify(state.currentTask) : 'null'}`);
+  console.log(`  - device available: ${!!state.device}`);
   if (meta.isChunkParent) return;
   if (state.isComputingMatrix || state.isComputingWgsl || state.isComputingChunk) {
     socket.emit('workload:error', { id: meta.id, message: 'Busy' });
@@ -692,6 +775,54 @@ socket.on('workloads:list_update', all => {
   });
 });
 
+
+socket.on('workload:new', async meta => {
+  console.log(`[HEADLESS] Received WGSL workload: ${meta.id}`);
+
+  if (meta.isChunkParent) return;
+  if (state.isComputingMatrix || state.isComputingWgsl || state.isComputingChunk) {
+    console.log(`[HEADLESS] Busy, rejecting workload`);
+    socket.emit('workload:error', { id: meta.id, message: 'Busy' });
+    return;
+  }
+  if (!state.device) {
+    console.log(`[HEADLESS] No GPU device available`);
+    socket.emit('workload:error', { id: meta.id, message: 'No GPU' });
+    return;
+  }
+
+  state.isComputingWgsl = true;
+  state.currentTask = meta;
+  updateComputationStatusDisplay();
+  console.log(`[HEADLESS] Processing WGSL ${meta.label}`);
+
+  try {
+    const t0 = performance.now();
+    console.log(`[HEADLESS] Creating shader module...`);
+    const shader = state.device.createShaderModule({ code: meta.wgsl });
+
+    console.log(`[HEADLESS] Getting compilation info...`);
+    const ci = await shader.getCompilationInfo();
+    if (ci.messages.some(m => m.type === 'error')) {
+      const errors = ci.messages.filter(m=>m.type==='error').map(m=>m.message).join('\n');
+      console.error(`[HEADLESS] Shader compilation errors: ${errors}`);
+      throw new Error(errors);
+    }
+
+    console.log(`[HEADLESS] Creating compute pipeline...`);
+    // ... rest of the code ...
+
+    console.log(`[HEADLESS] WGSL complete, sending result`);
+    socket.emit('workload:done', { id: meta.id, result: resultBase64, processingTime: dt });
+  } catch (err) {
+    console.error(`[HEADLESS] WGSL error: ${err.message}`, err);
+    socket.emit('workload:error', { id: meta.id, message: err.message });
+  } finally {
+    state.isComputingWgsl = false;
+    state.currentTask = null;
+    updateComputationStatusDisplay();
+  }
+});
 
 socket.on('workload:complete', data => {
   logTaskActivity(`Workload ${data.label||data.id} complete!`, 'success');
