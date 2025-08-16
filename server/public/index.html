@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>WebGPU Volunteer Computing</title>
+    <title>Multi-Framework Volunteer Computing</title>
     <style>
         body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; max-width: 1200px; margin: 0 auto; padding: 20px; line-height: 1.6; color: #333; }
         header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px; padding-bottom: 10px; border-bottom: 1px solid #eee; }
@@ -25,19 +25,19 @@
         .stat-box { background: #f9f9f9; padding: 15px; border-radius: 6px; text-align: center; border: 1px solid #eee; }
         .stat-value { font-size: 24px; font-weight: bold; margin: 5px 0; }
         .log-container { max-height: 300px; overflow-y: auto; background: #f8f8f8; padding: 10px; border-radius: 4px; font-family: monospace; margin-top: 15px; font-size: 0.9em; }
-        .client-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(200px, 1fr)); gap: 10px; margin-top: 15px; }
+        .client-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); gap: 10px; margin-top: 15px; }
         .client-card { padding: 10px; border-radius: 6px; background: #f1f1f1; border-left: 4px solid #4CAF50; font-size: 0.9em; }
         .client-inactive { border-left-color: #999; opacity: 0.7; }
         .client-cpu { border-left-color: #ffc107; }
         .client-puppeteer { border-left-style: dashed; }
         #admin-panel { display: none; margin-top: 20px; padding: 20px; background: #f9f9f9; border-radius: 8px; border: 1px solid #ddd; }
         .admin-controls, .wgsl-controls { display: flex; flex-wrap: wrap; gap: 15px; margin-top: 15px; align-items: flex-end; }
-        .admin-controls div, .wgsl-controls div, .wgsl-chunking-controls div { display: flex; flex-direction: column; } /* Added .wgsl-chunking-controls div */
-        .admin-controls label, .wgsl-controls label, .wgsl-chunking-controls label { margin-bottom: 5px; font-size: 0.9em; } /* Added .wgsl-chunking-controls label */
+        .admin-controls div, .wgsl-controls div, .wgsl-chunking-controls div { display: flex; flex-direction: column; }
+        .admin-controls label, .wgsl-controls label, .wgsl-chunking-controls label { margin-bottom: 5px; font-size: 0.9em; }
         .admin-controls input, .admin-controls select, .wgsl-controls input, .wgsl-controls select, .wgsl-controls textarea,
-        .wgsl-chunking-controls input, .wgsl-chunking-controls select { padding: 8px; border-radius: 4px; border: 1px solid #ccc; } /* Added .wgsl-chunking-controls inputs */
+        .wgsl-chunking-controls input, .wgsl-chunking-controls select { padding: 8px; border-radius: 4px; border: 1px solid #ccc; }
         .wgsl-controls textarea { min-height: 150px; font-family: monospace; width: 100%; }
-        .wgsl-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); gap: 10px; margin-top: 15px; }
+        .wgsl-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: 10px; margin-top: 15px; }
         .wgsl-card { padding: 15px; border-radius: 6px; background: #e9e9e9; font-size: 0.9em; display: flex; flex-direction: column; justify-content: space-between; }
         .wgsl-card h4 { margin-top:0; margin-bottom: 5px; }
         .wgsl-card pre { white-space: pre-wrap; word-break: break-all; max-height: 100px; overflow-y: auto; background: #fff; padding: 5px; border-radius: 3px;}
@@ -46,17 +46,42 @@
         .wgsl-chunking-options legend { font-weight: bold; padding: 0 5px; margin-left: 10px; color: #555;}
         .wgsl-chunking-controls { display: flex; flex-wrap: wrap; gap: 15px; align-items: flex-end; }
         .client-card .status.info { font-size: 0.8em; padding: 2px 5px; border-radius: 3px; display: inline-block; margin-top:3px;}
+
+        /* Framework-specific styles */
+        .framework-badge {
+            display: inline-block; padding: 2px 6px; margin: 2px; background: #007bff; color: white;
+            border-radius: 3px; font-size: 0.8em; font-weight: bold;
+        }
+        .framework-badge.webgpu { background: #4CAF50; }
+        .framework-badge.webgl { background: #FF9800; }
+        .framework-badge.cuda { background: #76B900; }
+        .framework-badge.opencl { background: #FF5722; }
+        .framework-badge.vulkan { background: #9C27B0; }
+
+        .framework-options {
+            border: 1px solid #ddd; padding: 15px; margin-top: 10px; border-radius: 4px;
+            background-color: #fafafa; display: none;
+        }
+        .framework-options.active { display: block; }
+        .framework-options h4 { margin-top: 0; color: #666; }
+
+        .compilation-options {
+            background: #f5f5f5; padding: 10px; border-radius: 4px; margin-top: 10px;
+        }
+        .compilation-options textarea {
+            width: 100%; min-height: 80px; font-family: monospace; font-size: 0.9em;
+        }
     </style>
 </head>
 <body>
     <header>
-        <h1>WebGPU Volunteer Computing</h1>
+        <h1>Multi-Framework Volunteer Computing</h1>
         <div>
             <button id="toggle-admin" class="secondary">Admin Panel</button>
         </div>
     </header>
     <div class="status info" id="secure-context-status">Checking secure context...</div>
-    <div class="status info" id="webgpu-status">Checking WebGPU support...</div>
+    <div class="status info" id="webgpu-status">Checking framework support...</div>
 
     <div class="container">
         <div class="card">
@@ -73,11 +98,12 @@
                 <button id="leave-computation" disabled>Leave</button>
             </div>
             <div id="gpu-info" class="status info" style="margin-top: 15px;">GPU information will appear here</div>
+            <div id="framework-info" class="status info" style="margin-top: 15px;">Framework capabilities will appear here</div>
         </div>
 
         <div class="card">
-            <h2>My Task (Matrix / Default)</h2>
-            <div class="status info" id="task-status">No matrix task assigned</div>
+            <h2>My Task Status</h2>
+            <div class="status info" id="task-status">No task assigned</div>
             <div class="stats-grid">
                 <div class="stat-box"><div>My Tasks</div><div class="stat-value" id="my-tasks">0</div></div>
                 <div class="stat-box"><div>Processing</div><div class="stat-value" id="processing-time">0ms</div></div>
@@ -106,7 +132,8 @@
             </div>
             <div class="log-container" id="admin-log-matrix">Admin matrix actions will be logged here...</div>
         </div>
-                <div class="card">
+
+        <div class="card">
             <h3>System Parameters</h3>
             <div class="admin-controls">
                 <div>
@@ -118,84 +145,147 @@
             Current K: <span id="current-k-display">1</span>
             <div class="log-container" id="admin-log-system">System admin actions logged here...</div>
         </div>
+
         <div class="card">
-            <h3>Custom WGSL Workload</h3>
-            <p>Upload and dispatch a custom WGSL compute shader:</p>
-            <div class="wgsl-controls">
-                <div><label for="wgsl-label">Label:</label><input type="text" id="wgsl-label" placeholder="e.g., Mandelbrot 4K"></div>
-                <div><label for="wgsl-entry-point">Entry Point:</label><input type="text" id="wgsl-entry-point" value="main"></div>
-            </div>
-            <div class="wgsl-controls">
-                 <div style="flex-grow: 1;"><label for="wgsl-src">WGSL Source Code:</label><textarea id="wgsl-src" placeholder="@compute @workgroup_size(64) fn main(...) { ... }"></textarea></div>
-            </div>
-             <div class="wgsl-controls">
-                <div><label for="wgsl-groups-x">Workgroups X:</label><input type="number" id="wgsl-groups-x" value="1" min="1"></div>
-                <div><label for="wgsl-groups-y">Workgroups Y:</label><input type="number" id="wgsl-groups-y" value="1" min="1"></div>
-                <div><label for="wgsl-groups-z">Workgroups Z:</label><input type="number" id="wgsl-groups-z" value="1" min="1"></div>
-            </div>
+            <h3>Multi-Framework Compute Workload</h3>
+            <p>Create and dispatch custom compute workloads across different frameworks:</p>
+
+            <!-- Framework Selection -->
             <div class="wgsl-controls">
                 <div>
-                    <label for="wgsl-bind-layout">Bind Layout Convention:</label>
-                    <select id="wgsl-bind-layout">
-                        <option value="storage-in-storage-out" selected>Default (Uniforms @0, Input @1, Output @2)</option>
-                        </select>
+                    <label for="compute-framework">Computing Framework:</label>
+                    <select id="compute-framework">
+                        <option value="webgpu" selected>WebGPU (.wgsl)</option>
+                        <option value="webgl">WebGL (.glsl)</option>
+                        <option value="cuda">CUDA (.cu)</option>
+                        <option value="opencl">OpenCL (.cl)</option>
+                        <option value="vulkan">Vulkan (.comp)</option>
+                    </select>
                 </div>
-                <div><label for="wgsl-output-size">Total Output Buffer Size (bytes):</label><input type="number" id="wgsl-output-size" placeholder="e.g., 1024 (Final aggregated size if chunked)"></div>
+                <div><label for="compute-label">Workload Label:</label><input type="text" id="compute-label" placeholder="e.g., Vector Processing"></div>
+                <div><label for="compute-entry-point">Entry Point:</label><input type="text" id="compute-entry-point" value="main"></div>
             </div>
+
+            <!-- Generic Kernel Source -->
             <div class="wgsl-controls">
-                 <div style="flex-grow: 1;">
-                    <label for="wgsl-input-data">Input Data (Base64 Encoded, Required if Chunkable):</label>
-                    <textarea id="wgsl-input-data" placeholder="Base64 encoded binary data for the input buffer..." rows="3"></textarea>
+                <div style="flex-grow: 1;">
+                    <label for="compute-kernel-src">Kernel Source Code:</label>
+                    <textarea id="compute-kernel-src" placeholder="Enter your kernel/shader source code here..."></textarea>
                 </div>
             </div>
 
+            <!-- Framework-specific options -->
+            <div id="framework-webgpu" class="framework-options active">
+                <h4>WebGPU Options</h4>
+                <p>Standard WebGPU compute shader with storage buffers.</p>
+            </div>
+
+            <div id="framework-webgl" class="framework-options">
+                <h4>WebGL Options</h4>
+                <p>WebGL compute using transform feedback or compute shaders.</p>
+                <div class="compilation-options">
+                    <label>WebGL-Specific Options:</label>
+                    <textarea placeholder='{"useComputeShaders": true, "version": "300 es"}'></textarea>
+                </div>
+            </div>
+
+            <div id="framework-cuda" class="framework-options">
+                <h4>CUDA Options</h4>
+                <p>CUDA kernels executed on GPU via native client.</p>
+                <div class="compilation-options">
+                    <label>CUDA Compilation Options:</label>
+                    <textarea placeholder='{"deviceId": 0, "computeCapability": "7.5", "optimization": "-O3"}'></textarea>
+                </div>
+            </div>
+
+            <div id="framework-opencl" class="framework-options">
+                <h4>OpenCL Options</h4>
+                <p>OpenCL kernels for heterogeneous computing.</p>
+                <div class="compilation-options">
+                    <label>OpenCL Compilation Options:</label>
+                    <textarea placeholder='{"deviceType": "GPU", "platform": 0, "buildOptions": "-cl-fast-relaxed-math"}'></textarea>
+                </div>
+            </div>
+
+            <div id="framework-vulkan" class="framework-options">
+                <h4>Vulkan Options</h4>
+                <p>Vulkan compute shaders with explicit resource management.</p>
+                <div class="compilation-options">
+                    <label>Vulkan Compilation Options:</label>
+                    <textarea placeholder='{"spirvVersion": "1.5", "vulkanVersion": "1.2", "optimizationLevel": 2}'></textarea>
+                </div>
+            </div>
+
+            <!-- Common workload parameters -->
+            <div class="wgsl-controls">
+                <div><label for="compute-groups-x">Workgroups X:</label><input type="number" id="compute-groups-x" value="1" min="1"></div>
+                <div><label for="compute-groups-y">Workgroups Y:</label><input type="number" id="compute-groups-y" value="1" min="1"></div>
+                <div><label for="compute-groups-z">Workgroups Z:</label><input type="number" id="compute-groups-z" value="1" min="1"></div>
+            </div>
+
+            <div class="wgsl-controls">
+                <div><label for="compute-output-size">Total Output Buffer Size (bytes):</label><input type="number" id="compute-output-size" placeholder="e.g., 4096"></div>
+                <div style="flex-grow: 1;">
+                    <label for="compute-input-data">Input Data (Base64):</label>
+                    <textarea id="compute-input-data" placeholder="Base64 encoded binary input data..." rows="3"></textarea>
+                </div>
+            </div>
+
+            <!-- Chunking options -->
             <div class="wgsl-controls">
                 <div>
-                    <label for="wgsl-chunkable" style="flex-direction: row; align-items: center;">
-                        <input type="checkbox" id="wgsl-chunkable" style="margin-right: 5px;">Chunkable Workload
+                    <label for="compute-chunkable" style="flex-direction: row; align-items: center;">
+                        <input type="checkbox" id="compute-chunkable" style="margin-right: 5px;">Enable Chunking
                     </label>
                 </div>
             </div>
 
-            <fieldset class="wgsl-chunking-options" id="wgsl-chunking-options-fieldset" style="display:none;">
+            <fieldset class="wgsl-chunking-options" id="compute-chunking-options-fieldset" style="display:none;">
                 <legend>Chunking Parameters</legend>
                 <div class="wgsl-chunking-controls">
                     <div>
-                        <label for="wgsl-chunk-processing-type">Input Chunk Type:</label>
-                        <select id="wgsl-chunk-processing-type">
+                        <label for="compute-chunk-processing-type">Chunk Type:</label>
+                        <select id="compute-chunk-processing-type">
                             <option value="elements" selected>Elements</option>
                             <option value="bytes">Bytes</option>
                         </select>
                     </div>
                     <div>
-                        <label for="wgsl-input-chunk-size">Input Chunk Size (per type):</label>
-                        <input type="number" id="wgsl-input-chunk-size" value="1024">
-                    </div>
-                    <div id="wgsl-element-size-bytes-container">
-                        <label for="wgsl-input-element-size-bytes">Input Element Size (bytes):</label>
-                        <input type="number" id="wgsl-input-element-size-bytes" value="4">
+                        <label for="compute-input-chunk-size">Input Chunk Size:</label>
+                        <input type="number" id="compute-input-chunk-size" value="1024">
                     </div>
                     <div>
-                        <label for="wgsl-output-aggregation-method">Output Aggregation:</label>
-                        <select id="wgsl-output-aggregation-method">
+                        <label for="compute-chunk-output-size">Output Size Per Chunk (bytes):</label>
+                        <input type="number" id="compute-chunk-output-size" placeholder="e.g., 512">
+                    </div>
+                    <div id="compute-element-size-bytes-container">
+                        <label for="compute-input-element-size-bytes">Element Size (bytes):</label>
+                        <input type="number" id="compute-input-element-size-bytes" value="4">
+                    </div>
+                    <div>
+                        <label for="compute-output-aggregation-method">Output Aggregation:</label>
+                        <select id="compute-output-aggregation-method">
                             <option value="concatenate" selected>Concatenate</option>
-                            <option value="none" disabled>None (Not fully supported)</option>
                         </select>
                     </div>
                 </div>
             </fieldset>
-            <button id="push-wgsl-workload">Push WGSL Workload</button>
-            <button id="startQueuedWgslButton" class="secondary">Start All Queued WGSL Workloads</button>
-            <div class="log-container" id="admin-log-wgsl">Admin WGSL actions will be logged here...</div>
+
+            <!-- Action buttons -->
+            <div style="margin-top: 20px;">
+                <button id="push-compute-workload">Create Workload</button>
+                <button id="start-queued-compute-button" class="secondary">Start All Queued</button>
+            </div>
+
+            <div class="log-container" id="admin-log-wgsl">Compute workload actions will be logged here...</div>
         </div>
 
         <div class="card">
-            <h3>Active Custom WGSL Workloads</h3>
+            <h3>Active Compute Workloads</h3>
             <div class="wgsl-grid" id="active-wgsl-workloads-grid">
-                <p>No custom WGSL workloads active or history not loaded.</p>
+                <p>No compute workloads active.</p>
             </div>
         </div>
-
     </div>
 
     <script src="/socket.io/socket.io.js"></script>
@@ -204,22 +294,59 @@
         document.addEventListener('DOMContentLoaded', function() {
             const secureContextStatus = document.getElementById('secure-context-status');
             if (window.isSecureContext) {
-                secureContextStatus.textContent = 'Running in a secure context (HTTPS or localhost) - WebGPU can be used.';
+                secureContextStatus.textContent = 'Running in a secure context (HTTPS or localhost) - All frameworks can be used.';
                 secureContextStatus.className = 'status success';
             } else {
-                secureContextStatus.innerHTML = 'Not running in a secure context. WebGPU requires HTTPS or localhost. <a href="https://' + window.location.host + window.location.pathname + '">Try HTTPS</a>';
+                secureContextStatus.innerHTML = 'Not running in a secure context. WebGPU/WebGL require HTTPS or localhost. <a href="https://' + window.location.host + window.location.pathname + '">Try HTTPS</a>';
                 secureContextStatus.className = 'status error';
             }
 
-            // Toggle visibility of chunking options
-            const chunkableCheckbox = document.getElementById('wgsl-chunkable');
-            const chunkingOptionsDiv = document.getElementById('wgsl-chunking-options-fieldset');
-            const chunkProcessingTypeSelect = document.getElementById('wgsl-chunk-processing-type');
-            const elementSizeBytesContainer = document.getElementById('wgsl-element-size-bytes-container');
+            // Framework-specific UI handling
+            const frameworkSelect = document.getElementById('compute-framework');
+            const frameworkOptions = document.querySelectorAll('.framework-options');
+            const entryPointInput = document.getElementById('compute-entry-point');
+            const kernelTextarea = document.getElementById('compute-kernel-src');
+
+            // Framework-specific defaults
+            const frameworkDefaults = {
+                webgpu: { entry: 'main', placeholder: '@compute @workgroup_size(64) fn main(@builtin(global_invocation_id) id: vec3<u32>) {\n  // WebGPU compute shader\n}' },
+                webgl: { entry: 'main', placeholder: '#version 300 es\n// WebGL compute shader\nvoid main() {\n  // GLSL code\n}' },
+                cuda: { entry: 'kernel', placeholder: '__global__ void kernel(float* input, float* output, int n) {\n  // CUDA kernel\n}' },
+                opencl: { entry: 'kernel', placeholder: '__kernel void kernel(__global float* input, __global float* output) {\n  // OpenCL kernel\n}' },
+                vulkan: { entry: 'main', placeholder: '#version 450\nlayout(local_size_x = 64) in;\n// Vulkan compute shader\nvoid main() {\n  // GLSL compute\n}' }
+            };
+
+            frameworkSelect.addEventListener('change', function() {
+                const selectedFramework = this.value;
+
+                // Hide all framework options
+                frameworkOptions.forEach(option => {
+                    option.classList.remove('active');
+                });
+
+                // Show selected framework options
+                const activeOption = document.getElementById(`framework-${selectedFramework}`);
+                if (activeOption) {
+                    activeOption.classList.add('active');
+                }
+
+                // Update entry point and placeholder
+                const defaults = frameworkDefaults[selectedFramework];
+                if (defaults) {
+                    entryPointInput.value = defaults.entry;
+                    kernelTextarea.placeholder = defaults.placeholder;
+                }
+            });
+
+            // Chunking options toggle
+            const chunkableCheckbox = document.getElementById('compute-chunkable');
+            const chunkingOptionsDiv = document.getElementById('compute-chunking-options-fieldset');
+            const chunkProcessingTypeSelect = document.getElementById('compute-chunk-processing-type');
+            const elementSizeBytesContainer = document.getElementById('compute-element-size-bytes-container');
 
             chunkableCheckbox.addEventListener('change', function() {
                 chunkingOptionsDiv.style.display = this.checked ? 'block' : 'none';
-                if (this.checked) { // If chunkable, also check initial state of processing type
+                if (this.checked) {
                     elementSizeBytesContainer.style.display = chunkProcessingTypeSelect.value === 'elements' ? 'flex' : 'none';
                 } else {
                     elementSizeBytesContainer.style.display = 'none';
@@ -229,6 +356,86 @@
             chunkProcessingTypeSelect.addEventListener('change', function() {
                 if (chunkableCheckbox.checked) {
                     elementSizeBytesContainer.style.display = this.value === 'elements' ? 'flex' : 'none';
+                }
+            });
+
+            // Initialize with WebGPU defaults
+            frameworkSelect.dispatchEvent(new Event('change'));
+
+            // Enhanced workload creation
+            document.getElementById('push-compute-workload').addEventListener('click', async () => {
+                const framework = frameworkSelect.value;
+                const chunkable = chunkableCheckbox.checked;
+
+                // Get framework-specific compilation options
+                const activeFrameworkOption = document.querySelector('.framework-options.active');
+                const compilationOptsTextarea = activeFrameworkOption?.querySelector('textarea');
+                let compilationOptions = {};
+
+                if (compilationOptsTextarea && compilationOptsTextarea.value.trim()) {
+                    try {
+                        compilationOptions = JSON.parse(compilationOptsTextarea.value);
+                    } catch (e) {
+                        alert('Invalid JSON in compilation options: ' + e.message);
+                        return;
+                    }
+                }
+
+                const payload = {
+                    label: document.getElementById('compute-label').value || 'Untitled Workload',
+                    framework: framework,
+                    kernel: document.getElementById('compute-kernel-src').value,
+                    entry: document.getElementById('compute-entry-point').value || 'main',
+                    workgroupCount: [
+                        +document.getElementById('compute-groups-x').value || 1,
+                        +document.getElementById('compute-groups-y').value || 1,
+                        +document.getElementById('compute-groups-z').value || 1
+                    ],
+                    outputSize: +document.getElementById('compute-output-size').value,
+                    input: document.getElementById('compute-input-data').value || undefined,
+                    chunkable: chunkable,
+                    compilationOptions: compilationOptions
+                };
+
+                if (chunkable) {
+                    const chunkOutputSize = +document.getElementById('compute-chunk-output-size').value;
+                    if (!chunkOutputSize || chunkOutputSize <= 0) {
+                        alert('Chunk Output Size is required and must be > 0 for chunkable workloads');
+                        return;
+                    }
+
+                    payload.inputChunkProcessingType = document.getElementById('compute-chunk-processing-type').value;
+                    payload.inputChunkSize = +document.getElementById('compute-input-chunk-size').value;
+                    payload.chunkOutputSize = chunkOutputSize;
+                    payload.inputElementSizeBytes = +document.getElementById('compute-input-element-size-bytes').value;
+                    payload.outputAggregationMethod = document.getElementById('compute-output-aggregation-method').value;
+                }
+
+                logAdminActivity(`Creating ${framework.toUpperCase()} workload "${payload.label}"...`, 'wgsl');
+
+                try {
+                    const res = await fetch('/api/workloads', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify(payload)
+                    });
+                    const j = await res.json();
+
+                    if (res.ok && j.ok) {
+                        logAdminActivity(`✅ ID ${j.id.substring(0,6)}: ${j.message}`, 'wgsl', 'success');
+                    } else {
+                        logAdminActivity(`❌ Error: ${j.error || res.statusText}`, 'wgsl', 'error');
+                    }
+                } catch (err) {
+                    logAdminActivity(`❌ Network error: ${err.message}`, 'wgsl', 'error');
+                }
+            });
+
+            // Start queued workloads
+            document.getElementById('start-queued-compute-button').addEventListener('click', () => {
+                logAdminActivity('Starting all queued compute workloads...', 'wgsl');
+                if (typeof socket !== 'undefined') {
+                    socket.emit('admin:startQueuedCustomWorkloads');
                 }
             });
         });

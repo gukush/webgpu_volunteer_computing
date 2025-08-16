@@ -9,6 +9,35 @@ import { Server as SocketIOServer } from 'socket.io';
 
 const app = express();
 
+const SUPPORTED_FRAMEWORKS = {
+  'webgpu': {
+    browserBased: true,
+    shaderExtension: '.wgsl',
+    defaultBindLayout: 'storage-in-storage-out'
+  },
+  'webgl': {
+    browserBased: true,
+    shaderExtension: '.glsl',
+    defaultBindLayout: 'webgl-transform-feedback'
+  },
+  'cuda': {
+    browserBased: false,
+    shaderExtension: '.cu',
+    defaultBindLayout: 'cuda-global-memory'
+  },
+  'opencl': {
+    browserBased: false,
+    shaderExtension: '.cl',
+    defaultBindLayout: 'opencl-global-memory'
+  },
+  'vulkan': {
+    browserBased: false,
+    shaderExtension: '.comp',
+    defaultBindLayout: 'vulkan-storage-buffer'
+  }
+};
+
+
 let server;
 let useHttps = false;
 const PORT = process.env.PORT || 3000;
@@ -96,6 +125,8 @@ function loadCustomWorkloads() {
         workload.results = workload.results || [];
         workload.dispatchesMade = workload.dispatchesMade || 0;
         workload.activeAssignments = new Set(workload.activeAssignments || []);
+        // NEW: Ensure chunkOutputSize is preserved on load
+        workload.chunkOutputSize = workload.chunkOutputSize || workload.outputSize;
 
         if (workload.isChunkParent && workload.status !== 'complete' && workload.status !== 'error') {
           if (['chunking_queued', 'chunking', 'assigning_chunks', 'aggregating', 'processing_chunks', 'pending_dispatch'].includes(workload.status)
@@ -123,51 +154,92 @@ function broadcastCustomWorkloadList() {
 
 app.post('/api/workloads', (req, res) => {
   const {
-    label, wgsl, entry = 'main', workgroupCount, bindLayout = "storage-in-storage-out",
-    input, outputSize,
-    chunkable = false, inputChunkProcessingType = 'elements', inputChunkSize,
-    inputElementSizeBytes = 4, outputAggregationMethod = 'concatenate'
+    label,
+    framework = 'webgpu', // Default to webgpu for backward compatibility
+    kernel, // Generic kernel code (replaces wgsl field)
+    wgsl, // Keep for backward compatibility
+    entry = 'main',
+    workgroupCount,
+    bindLayout,
+    input,
+    outputSize,
+    chunkable = false,
+    inputChunkProcessingType = 'elements',
+    inputChunkSize,
+    chunkOutputSize, // NEW: Output size per chunk
+    inputElementSizeBytes = 4,
+    outputAggregationMethod = 'concatenate',
+    // Framework-specific options
+    compilationOptions = {}
   } = req.body;
 
-  if (!wgsl || !workgroupCount || !outputSize) {
-    return res.status(400).json({ error: 'Missing required fields: wgsl, workgroupCount, outputSize' });
+  // Validate framework
+  if (!SUPPORTED_FRAMEWORKS[framework]) {
+    return res.status(400).json({
+      error: `Unsupported framework: ${framework}. Supported: ${Object.keys(SUPPORTED_FRAMEWORKS).join(', ')}`
+    });
   }
-  if (!Array.isArray(workgroupCount) || workgroupCount.length !== 3 || !workgroupCount.every(n => typeof n === 'number' && n > 0)) {
-    return res.status(400).json({ error: 'workgroupCount must be an array of 3 positive numbers.' });
+
+  // Use kernel field or fall back to wgsl for backward compatibility
+  const kernelCode = kernel || wgsl;
+  if (!kernelCode || !workgroupCount || !outputSize) {
+    return res.status(400).json({
+      error: 'Missing required fields: kernel/wgsl, workgroupCount, outputSize'
+    });
   }
-  if (typeof outputSize !== 'number' || outputSize <= 0) {
-    return res.status(400).json({ error: 'outputSize must be a positive number.' });
+
+  // Validate chunking parameters
+  if (chunkable) {
+    if (!chunkOutputSize || chunkOutputSize <= 0) {
+      return res.status(400).json({
+        error: 'chunkOutputSize is required and must be > 0 for chunkable workloads'
+      });
+    }
+    if (!input) {
+      return res.status(400).json({
+        error: 'input is required for chunkable workloads'
+      });
+    }
   }
+
+  // Set default bind layout based on framework
+  const effectiveBindLayout = bindLayout || SUPPORTED_FRAMEWORKS[framework].defaultBindLayout;
 
   const id = uuidv4();
   const workloadMeta = {
     id,
-    label: label || `Custom Workload ${id.substring(0, 6)}`,
-    wgsl, entry,
-    workgroupCount, bindLayout, input, outputSize,
+    label: label || `${framework.toUpperCase()} Workload ${id.substring(0, 6)}`,
+    framework,
+    kernel: kernelCode, // Store as generic kernel
+    wgsl: framework === 'webgpu' ? kernelCode : undefined, // Keep for compatibility
+    entry,
+    workgroupCount,
+    bindLayout: effectiveBindLayout,
+    input,
+    outputSize,
     status: 'queued',
-    results: [], processingTimes: [],
+    results: [],
+    processingTimes: [],
     createdAt: Date.now(),
-    chunkable, inputChunkProcessingType, inputChunkSize,
-    inputElementSizeBytes, outputAggregationMethod,
+    chunkable,
+    inputChunkProcessingType,
+    inputChunkSize,
+    chunkOutputSize, // NEW: Store chunk output size
+    inputElementSizeBytes,
+    outputAggregationMethod,
     isChunkParent: chunkable,
     dispatchesMade: 0,
-    activeAssignments: new Set()
+    activeAssignments: new Set(),
+    compilationOptions // Store framework-specific compilation options
   };
 
-  if (chunkable) {
-    if (!inputChunkSize || inputChunkSize <= 0) {
-      return res.status(400).json({ error: 'Missing or invalid inputChunkSize for chunkable workload.' });
-    }
-    if (inputChunkProcessingType === 'elements' && (!inputElementSizeBytes || inputElementSizeBytes <= 0)) {
-      return res.status(400).json({ error: 'Missing or invalid inputElementSizeBytes for chunkable workload with element processing type.' });
-    }
-    if (!input) {
-      return res.status(400).json({ error: 'Input data (base64) is required for chunkable workloads.' });
-    }
+  // Validate framework-specific requirements
+  if (framework === 'cuda' && !compilationOptions.deviceId) {
+    compilationOptions.deviceId = 0; // Default to device 0
   }
 
   customWorkloads.set(id, workloadMeta);
+
   if (chunkable) {
     const prepResult = prepareAndQueueChunks(workloadMeta);
     if (!prepResult.success) {
@@ -178,11 +250,8 @@ app.post('/api/workloads', (req, res) => {
 
   saveCustomWorkloads();
   broadcastCustomWorkloadList();
-  const messageVerb = chunkable
-    ? "accepted for chunking. Chunks prepared."
-    : "queued.";
-  console.log(`📡 Workload ${id} (${workloadMeta.label}) ${messageVerb}`);
-  res.json({ ok: true, id, message: `Workload "${workloadMeta.label}" ${messageVerb}` });
+  console.log(`📡 ${framework.toUpperCase()} workload ${id} (${workloadMeta.label}) queued.`);
+  res.json({ ok: true, id, message: `${framework.toUpperCase()} workload "${workloadMeta.label}" queued.` });
 });
 
 
@@ -270,6 +339,25 @@ app.get('/api/status', (req, res) => {
   });
 });
 
+app.get('/api/frameworks', (req, res) => {
+  const stats = {};
+
+  Object.keys(SUPPORTED_FRAMEWORKS).forEach(framework => {
+    const clients = Array.from(matrixState.clients.values())
+      .filter(c => c.supportedFrameworks.includes(framework));
+
+    const workloads = Array.from(customWorkloads.values())
+      .filter(w => w.framework === framework);
+
+    stats[framework] = {
+      availableClients: clients.length,
+      activeWorkloads: workloads.filter(w => w.status !== 'complete').length,
+      completedWorkloads: workloads.filter(w => w.status === 'complete').length
+    };
+  });
+
+  res.json({ frameworks: SUPPORTED_FRAMEWORKS, stats });
+});
 
 
 function prepareAndQueueChunks(parentWorkload) {
@@ -303,7 +391,8 @@ function prepareAndQueueChunks(parentWorkload) {
     expectedChunks: numChunks,
     status: 'awaiting_start',
     aggregationMethod: parentWorkload.outputAggregationMethod,
-    finalOutputSize: parentWorkload.outputSize
+    finalOutputSize: parentWorkload.outputSize,
+    chunkOutputSize: parentWorkload.chunkOutputSize // NEW: Store chunk output size
   };
 
   for (let i = 0; i < numChunks; i++) {
@@ -319,17 +408,21 @@ function prepareAndQueueChunks(parentWorkload) {
       chunkId,
       chunkOrderIndex: i,
       status: 'queued',
-      wgsl: parentWorkload.wgsl,
+      framework: parentWorkload.framework, // NEW: Include framework
+      kernel: parentWorkload.kernel, // NEW: Include kernel code
+      wgsl: parentWorkload.wgsl, // Keep for compatibility
       entry: parentWorkload.entry,
       workgroupCount: parentWorkload.workgroupCount,
       bindLayout: parentWorkload.bindLayout,
+      outputSize: parentWorkload.chunkOutputSize, // NEW: Use chunk output size instead of parent output size
       inputData: chunkInputDataSlice.toString('base64'),
       chunkUniforms: {},
       dispatchesMade: 0,
       submissions: [],
       activeAssignments: new Set(),
       assignedClients: new Set(),
-      verified_result_base64: null
+      verified_result_base64: null,
+      compilationOptions: parentWorkload.compilationOptions // NEW: Include compilation options
     };
 
     if (parentWorkload.inputChunkProcessingType === 'elements') {
@@ -345,7 +438,7 @@ function prepareAndQueueChunks(parentWorkload) {
   }
 
   customWorkloadChunks.set(parentId, chunksForParent);
-  console.log(`Workload ${parentId}: Prepared ${chunksForParent.allChunkDefs.length} chunks.`);
+  console.log(`Workload ${parentId}: Prepared ${chunksForParent.allChunkDefs.length} chunks with output size ${parentWorkload.chunkOutputSize} each.`);
   return { success: true };
 }
 
@@ -509,6 +602,11 @@ function assignCustomChunkToAvailableClients() {
     for (const parent of customWorkloads.values()) {
       if (!parent.isChunkParent || !['assigning_chunks', 'processing_chunks'].includes(parent.status)) continue;
 
+      // Check if client supports the required framework
+      if (!client.supportedFrameworks.includes(parent.framework)) {
+        continue;
+      }
+
       const store = customWorkloadChunks.get(parent.id);
       if (!store) continue;
 
@@ -519,7 +617,6 @@ function assignCustomChunkToAvailableClients() {
           cd.dispatchesMade < ADMIN_K_PARAMETER &&
           !cd.assignedClients.has(clientId)
         ) {
-          // Assign this chunk to this client
           cd.dispatchesMade++;
           cd.activeAssignments.add(clientId);
           cd.assignedClients.add(clientId);
@@ -528,8 +625,14 @@ function assignCustomChunkToAvailableClients() {
           cd.assignedAt = Date.now();
           client.isBusyWithCustomChunk = true;
 
-          client.socket.emit('workload:chunk_assign', { ...cd });
-          console.log(`Assigned chunk ${cd.chunkId} (${parent.id}) to ${clientId}`);
+          const taskData = {
+            ...cd,
+            framework: parent.framework,
+            compilationOptions: parent.compilationOptions
+          };
+
+          client.socket.emit('workload:chunk_assign', taskData);
+          console.log(`Assigned ${parent.framework} chunk ${cd.chunkId} to ${clientId}`);
           break;
         }
       }
@@ -541,17 +644,32 @@ function assignCustomChunkToAvailableClients() {
 
 function tryDispatchNonChunkedWorkloads() {
   for (const [clientId, client] of matrixState.clients.entries()) {
-    if (!client.connected || !client.gpuInfo || client.isBusyWithCustomChunk || client.isBusyWithMatrixTask || client.isBusyWithNonChunkedWGSL || !client.socket) {
+    if (!client.connected || !client.gpuInfo || client.isBusyWithCustomChunk ||
+        client.isBusyWithMatrixTask || client.isBusyWithNonChunkedWGSL || !client.socket) {
       continue;
     }
+
     for (const wl of customWorkloads.values()) {
       if (!wl.isChunkParent && ['pending_dispatch', 'pending'].includes(wl.status)
-        && !wl.finalResult && wl.dispatchesMade < ADMIN_K_PARAMETER && !wl.activeAssignments.has(clientId)) {
+        && !wl.finalResult && wl.dispatchesMade < ADMIN_K_PARAMETER
+        && !wl.activeAssignments.has(clientId)) {
+
+        // Check framework compatibility
+        if (!client.supportedFrameworks.includes(wl.framework)) {
+          continue;
+        }
+
         wl.dispatchesMade++;
         wl.activeAssignments.add(clientId);
         client.isBusyWithNonChunkedWGSL = true;
-        console.log(`Dispatching WGSL ${wl.label} (ID ${wl.id}) to ${clientId}`);
-        client.socket.emit('workload:new', wl);
+        console.log(`Dispatching ${wl.framework} workload ${wl.label} to ${clientId}`);
+
+        const taskData = {
+          ...wl,
+          compilationOptions: wl.compilationOptions
+        };
+
+        client.socket.emit('workload:new', taskData);
         break;
       }
     }
@@ -649,7 +767,9 @@ io.on('connection', socket => {
     lastActive: Date.now(),
     completedTasks: 0,
     gpuInfo: null,
+    supportedFrameworks: [], // Track which frameworks this client supports
     isPuppeteer: socket.handshake.query.mode === 'headless',
+    clientType: 'browser', // 'browser' or 'native'
     isBusyWithMatrixTask: false,
     isBusyWithCustomChunk: false,
     isBusyWithNonChunkedWGSL: false
@@ -663,11 +783,15 @@ io.on('connection', socket => {
   socket.on('client:join', (data) => {
     const c = matrixState.clients.get(socket.id);
     if (!c) return;
-    if (c.hasJoined) return; // avoid double-join on reconnecting code paths
+    if (c.hasJoined) return;
+
     c.hasJoined = true;
     c.gpuInfo = data.gpuInfo;
     c.hasWebGPU = !!data.hasWebGPU;
-    console.log(`Client ${socket.id} joined; GPU info recorded.`);
+    c.supportedFrameworks = data.supportedFrameworks || ['webgpu']; // Default to webgpu
+    c.clientType = data.clientType || 'browser';
+
+    console.log(`Client ${socket.id} joined; supports frameworks: ${c.supportedFrameworks.join(', ')}`);
     broadcastClientList();
   });
 
@@ -978,6 +1102,8 @@ function broadcastClientList() {
     joinedAt: c.joinedAt,
     completedTasks: c.completedTasks,
     gpuInfo: c.gpuInfo,
+    supportedFrameworks: c.supportedFrameworks,
+    clientType: c.clientType,
     lastActive: c.lastActive,
     connected: c.connected,
     usingCpu: c.gpuInfo?.isCpuComputation || false,
