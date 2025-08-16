@@ -65,6 +65,114 @@ const WORKER_ID = PARAMS.get('workerId') || 'N/A';
 const socket = io({ query: IS_HEADLESS ? { mode: 'headless', workerId: WORKER_ID } : {} });
 
 
+async function executeWGSL(meta) {
+  console.log(`[HEADLESS] Starting WGSL execution for ${meta.id}`);
+
+  if (!state.device) {
+    throw new Error('No GPU device available');
+  }
+
+  const t0 = performance.now();
+
+  try {
+    // Create shader module
+    console.log(`[HEADLESS] Creating shader module...`);
+    const shader = state.device.createShaderModule({ code: meta.wgsl });
+
+    // Check for compilation errors
+    console.log(`[HEADLESS] Getting compilation info...`);
+    const ci = await shader.getCompilationInfo();
+    if (ci.messages.some(m => m.type === 'error')) {
+      const errors = ci.messages.filter(m => m.type === 'error').map(m => m.message).join('\n');
+      console.error(`[HEADLESS] Shader compilation errors: ${errors}`);
+      throw new Error(`Shader compilation failed: ${errors}`);
+    }
+
+    // Create pipeline
+    console.log(`[HEADLESS] Creating compute pipeline...`);
+    const pipeline = state.device.createComputePipeline({
+      layout: 'auto',
+      compute: {
+        module: shader,
+        entryPoint: meta.entry || 'main'
+      }
+    });
+
+    // Prepare input buffer
+    const inputBytes = meta.input
+      ? Uint8Array.from(atob(meta.input), c => c.charCodeAt(0))
+      : new Uint8Array();
+
+    let binding = 0;
+    const entries = [];
+
+    // Add input buffer if there's input data
+    if (inputBytes.length) {
+      const inBuf = state.device.createBuffer({
+        size: Math.max(16, inputBytes.byteLength),
+        usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+        mappedAtCreation: true
+      });
+      new Uint8Array(inBuf.getMappedRange()).set(inputBytes);
+      inBuf.unmap();
+      entries.push({ binding: binding++, resource: { buffer: inBuf } });
+    }
+
+    // Create output buffer
+    const outBuf = state.device.createBuffer({
+      size: Math.max(16, meta.outputSize),
+      usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC
+    });
+    entries.push({ binding: binding++, resource: { buffer: outBuf } });
+
+    // Create bind group
+    const bg = state.device.createBindGroup({
+      layout: pipeline.getBindGroupLayout(0),
+      entries
+    });
+
+    // Execute compute pass
+    console.log(`[HEADLESS] Dispatching workgroups: ${meta.workgroupCount}`);
+    const enc = state.device.createCommandEncoder();
+    const pass = enc.beginComputePass();
+    pass.setPipeline(pipeline);
+    pass.setBindGroup(0, bg);
+    pass.dispatchWorkgroups(...meta.workgroupCount);
+    pass.end();
+
+    // Read back results
+    const readBuf = state.device.createBuffer({
+      size: outBuf.size,
+      usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ
+    });
+    enc.copyBufferToBuffer(outBuf, 0, readBuf, 0, outBuf.size);
+    state.device.queue.submit([enc.finish()]);
+
+    await readBuf.mapAsync(GPUMapMode.READ);
+    const resultBytes = new Uint8Array(readBuf.getMappedRange().slice(0));
+    readBuf.unmap();
+
+    const dt = performance.now() - t0;
+    console.log(`[HEADLESS] WGSL completed in ${dt.toFixed(0)}ms, ${resultBytes.length} bytes`);
+
+    // Convert result to base64
+    const resultBase64 = btoa(String.fromCharCode(...resultBytes));
+
+    logTaskActivity(`WGSL ${meta.label} done in ${dt.toFixed(0)}ms`);
+
+    // Return both result and processing time
+    return {
+      result: resultBase64,
+      processingTime: dt
+    };
+
+  } catch (err) {
+    console.error(`[HEADLESS] WGSL execution error:`, err);
+    logTaskActivity(`WGSL error: ${err.message}`, 'error');
+    throw err;
+  }
+}
+
 function bindWorkloadListener() {
   if (workloadListenerBound) return;
   workloadListenerBound = true;
@@ -99,8 +207,12 @@ function bindWorkloadListener() {
 
     (async () => {
       try {
-        const result = await executeWGSL(meta.code, meta.inputData);
-        socket.emit('workload:done', { id: meta.id, result });
+        const { result, processingTime } = await executeWGSL(meta);
+        socket.emit('workload:done', {
+          id: meta.id,
+          result,
+          processingTime
+        });
       } catch (err) {
         console.error('[HEADLESS] WGSL failed', err);
         socket.emit('workload:error', { id: meta.id, message: err?.message || String(err) });

@@ -185,6 +185,93 @@ app.post('/api/workloads', (req, res) => {
   res.json({ ok: true, id, message: `Workload "${workloadMeta.label}" ${messageVerb}` });
 });
 
+
+// Start a matrix-multiplication run
+app.post('/api/matrix/start', (req, res) => {
+  const { matrixSize, chunkSize } = req.body || {};
+  if (!Number.isInteger(matrixSize) || !Number.isInteger(chunkSize) || matrixSize <= 0 || chunkSize <= 0) {
+    return res.status(400).json({ error: 'matrixSize and chunkSize must be positive integers' });
+  }
+  const problem = prepareMatrixMultiplication(matrixSize, chunkSize);
+  res.json({
+    ok: true,
+    problem: { size: problem.size, chunkSize: problem.chunkSize },
+    totalTasks: matrixState.stats.totalTasks
+  });
+});
+
+// Set redundancy factor K (same as the admin panel)
+app.post('/api/system/k', (req, res) => {
+  const { k } = req.body || {};
+  if (!Number.isInteger(k) || k < 1) return res.status(400).json({ error: 'k must be integer ≥ 1' });
+  ADMIN_K_PARAMETER = k;
+  io.emit('admin:k_update', ADMIN_K_PARAMETER);
+  res.json({ ok: true, k: ADMIN_K_PARAMETER });
+});
+
+// Start all queued WGSL workloads (mirrors the admin “Start All Queued…” button)
+app.post('/api/workloads/startQueued', (req, res) => {
+  let startedNonChunked = 0, activatedChunkParents = 0;
+  customWorkloads.forEach(wl => {
+    if (wl.status === 'queued') {
+      wl.startedAt = Date.now();
+      if (wl.isChunkParent) {
+        const prep = prepareAndQueueChunks(wl);
+        if (!prep.success) return;
+        const store = customWorkloadChunks.get(wl.id);
+        wl.status = 'assigning_chunks';
+        store.status = 'assigning_chunks';
+        store.allChunkDefs.forEach(cd => {
+          cd.status = 'queued';
+          cd.dispatchesMade = 0;
+          cd.submissions = [];
+          cd.activeAssignments.clear();
+          cd.verified_result_base64 = null;
+        });
+        io.emit('workload:parent_started', { id: wl.id, label: wl.label, status: wl.status });
+        activatedChunkParents++;
+      } else {
+        wl.status = 'pending_dispatch';
+        startedNonChunked++;
+      }
+    }
+  });
+  saveCustomWorkloads();
+  broadcastCustomWorkloadList();
+  res.json({ ok: true, activatedChunkParents, startedNonChunked });
+});
+
+// Optional: remove a workload by id
+app.delete('/api/workloads/:id', (req, res) => {
+  const { id } = req.params;
+  if (!customWorkloads.has(id)) return res.status(404).json({ error: 'Not found' });
+  customWorkloadChunks.delete(id);
+  customWorkloads.delete(id);
+  saveCustomWorkloads();
+  broadcastCustomWorkloadList();
+  res.json({ ok: true });
+});
+
+// Optional: quick status snapshot for scripts
+app.get('/api/status', (req, res) => {
+  res.json({
+    k: ADMIN_K_PARAMETER,
+    matrix: {
+      isRunning: matrixState.isRunning,
+      stats: matrixState.stats,
+      problem: matrixState.problem ? { size: matrixState.problem.size, chunkSize: matrixState.problem.chunkSize } : null
+    },
+    workloads: Array.from(customWorkloads.values()).map(w => ({
+      id: w.id, label: w.label, status: w.status, isChunkParent: w.isChunkParent, startedAt: w.startedAt, completedAt: w.completedAt
+    })),
+    clients: Array.from(matrixState.clients.values()).map(c => ({
+      id: c.id, connected: c.connected, completedTasks: c.completedTasks, usingCpu: c.usingCpu, hasWebGPU: c.hasWebGPU
+    }))
+  });
+});
+
+
+
 function prepareAndQueueChunks(parentWorkload) {
   const parentId = parentWorkload.id;
 
@@ -727,32 +814,7 @@ io.on('connection', socket => {
       console.log(`Chunk ${chunkId} accepted after ${ADMIN_K_PARAMETER} submissions (${store.completedChunksData.size}/${store.expectedChunks})`);
     }
 
-    socket.on('workload:busy', ({ id, reason }) => {
-    const c = matrixState.clients.get(socket.id);
-    if (c) c.isBusyWithNonChunkedWGSL = false;
-    const wl = customWorkloads.get(id);
-    if (wl && !wl.isChunkParent) {
-      wl.activeAssignments.delete(socket.id);
-      if (wl.status !== 'complete') wl.status = 'pending_dispatch';
-      console.warn(`WGSL ${id} declined by ${socket.id} (${reason||'busy'})`);
-      saveCustomWorkloads(); broadcastCustomWorkloadList();
-    }
-    tryDispatchNonChunkedWorkloads();
-  });
 
-
-  socket.on('workload:error', ({ id, message }) => {
-  const c = matrixState.clients.get(socket.id);
-  if (c) c.isBusyWithNonChunkedWGSL = false;
-  const wl = customWorkloads.get(id);
-  if (wl && !wl.isChunkParent) {
-    wl.activeAssignments.delete(socket.id);
-    if (wl.status !== 'complete') wl.status = 'pending_dispatch';
-    console.warn(`WGSL ${id} errored on ${socket.id}: ${message}`);
-    saveCustomWorkloads(); broadcastCustomWorkloadList();
-  }
-  tryDispatchNonChunkedWorkloads();
-  });
 
 
 if (
@@ -779,6 +841,34 @@ if (
 
     saveCustomWorkloads();
     broadcastCustomWorkloadList();
+  });
+
+
+ socket.on('workload:busy', ({ id, reason }) => {
+    const c = matrixState.clients.get(socket.id);
+    if (c) c.isBusyWithNonChunkedWGSL = false;
+    const wl = customWorkloads.get(id);
+    if (wl && !wl.isChunkParent) {
+      wl.activeAssignments.delete(socket.id);
+      if (wl.status !== 'complete') wl.status = 'pending_dispatch';
+      console.warn(`WGSL ${id} declined by ${socket.id} (${reason||'busy'})`);
+      saveCustomWorkloads(); broadcastCustomWorkloadList();
+    }
+    tryDispatchNonChunkedWorkloads();
+  });
+
+
+  socket.on('workload:error', ({ id, message }) => {
+  const c = matrixState.clients.get(socket.id);
+  if (c) c.isBusyWithNonChunkedWGSL = false;
+  const wl = customWorkloads.get(id);
+  if (wl && !wl.isChunkParent) {
+    wl.activeAssignments.delete(socket.id);
+    if (wl.status !== 'complete') wl.status = 'pending_dispatch';
+    console.warn(`WGSL ${id} errored on ${socket.id}: ${message}`);
+    saveCustomWorkloads(); broadcastCustomWorkloadList();
+  }
+  tryDispatchNonChunkedWorkloads();
   });
 
   socket.on('workload:chunk_error', ({ parentId, chunkId, message }) => {
