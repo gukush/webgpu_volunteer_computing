@@ -21,6 +21,8 @@
         button.secondary:hover { background-color: #0b7dda; }
         button.danger { background-color: #f44336; }
         button.danger:hover { background-color: #da190b; }
+        button.enhanced { background-color: #9C27B0; }
+        button.enhanced:hover { background-color: #7B1FA2; }
         .stats-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 10px; margin-bottom: 20px; }
         .stat-box { background: #f9f9f9; padding: 15px; border-radius: 6px; text-align: center; border: 1px solid #eee; }
         .stat-value { font-size: 24px; font-weight: bold; margin: 5px 0; }
@@ -32,11 +34,11 @@
         .client-puppeteer { border-left-style: dashed; }
         #admin-panel { display: none; margin-top: 20px; padding: 20px; background: #f9f9f9; border-radius: 8px; border: 1px solid #ddd; }
         .admin-controls, .wgsl-controls { display: flex; flex-wrap: wrap; gap: 15px; margin-top: 15px; align-items: flex-end; }
-        .admin-controls div, .wgsl-controls div, .wgsl-chunking-controls div { display: flex; flex-direction: column; }
-        .admin-controls label, .wgsl-controls label, .wgsl-chunking-controls label { margin-bottom: 5px; font-size: 0.9em; }
+        .admin-controls div, .wgsl-controls div, .wgsl-chunking-controls div, .enhanced-controls div { display: flex; flex-direction: column; }
+        .admin-controls label, .wgsl-controls label, .wgsl-chunking-controls label, .enhanced-controls label { margin-bottom: 5px; font-size: 0.9em; }
         .admin-controls input, .admin-controls select, .wgsl-controls input, .wgsl-controls select, .wgsl-controls textarea,
-        .wgsl-chunking-controls input, .wgsl-chunking-controls select { padding: 8px; border-radius: 4px; border: 1px solid #ccc; }
-        .wgsl-controls textarea { min-height: 150px; font-family: monospace; width: 100%; }
+        .wgsl-chunking-controls input, .wgsl-chunking-controls select, .enhanced-controls input, .enhanced-controls select, .enhanced-controls textarea { padding: 8px; border-radius: 4px; border: 1px solid #ccc; }
+        .wgsl-controls textarea, .enhanced-controls textarea { min-height: 150px; font-family: monospace; width: 100%; }
         .wgsl-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: 10px; margin-top: 15px; }
         .wgsl-card { padding: 15px; border-radius: 6px; background: #e9e9e9; font-size: 0.9em; display: flex; flex-direction: column; justify-content: space-between; }
         .wgsl-card h4 { margin-top:0; margin-bottom: 5px; }
@@ -44,8 +46,19 @@
         .wgsl-card-actions { margin-top: 10px; text-align: right; }
         .wgsl-chunking-options { border: 1px dashed #ccc; padding: 15px; margin-top: 15px; border-radius: 4px; background-color: #fdfdfd;}
         .wgsl-chunking-options legend { font-weight: bold; padding: 0 5px; margin-left: 10px; color: #555;}
-        .wgsl-chunking-controls { display: flex; flex-wrap: wrap; gap: 15px; align-items: flex-end; }
+        .wgsl-chunking-controls, .enhanced-controls { display: flex; flex-wrap: wrap; gap: 15px; align-items: flex-end; }
         .client-card .status.info { font-size: 0.8em; padding: 2px 5px; border-radius: 3px; display: inline-block; margin-top:3px;}
+
+        /* Enhanced chunking system styles */
+        .enhanced-section { border: 2px solid #9C27B0; border-radius: 8px; padding: 20px; margin-top: 20px; background: linear-gradient(145deg, #f8f4ff, #fff); }
+        .enhanced-section h3 { color: #9C27B0; margin-top: 0; }
+        .strategy-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: 15px; margin-top: 15px; }
+        .strategy-card { padding: 15px; border-radius: 6px; background: #fff; border: 1px solid #ddd; font-size: 0.9em; }
+        .strategy-card h4 { margin-top: 0; margin-bottom: 8px; color: #333; }
+        .strategy-card .strategy-type { display: inline-block; padding: 2px 8px; background: #9C27B0; color: white; border-radius: 3px; font-size: 0.8em; margin-bottom: 8px; }
+        .strategy-card .strategy-type.assembly { background: #FF5722; }
+        .strategy-upload-section { background: #f0f8ff; padding: 15px; border-radius: 6px; margin-top: 15px; border: 1px dashed #2196F3; }
+        .multi-input-section { background: #f8fff0; padding: 15px; border-radius: 6px; margin-top: 15px; border: 1px dashed #4CAF50; }
 
         /* Framework-specific styles */
         .framework-badge {
@@ -71,6 +84,17 @@
         .compilation-options textarea {
             width: 100%; min-height: 80px; font-family: monospace; font-size: 0.9em;
         }
+
+        /* Enhanced workload styles */
+        .workload-status { display: inline-block; padding: 3px 8px; border-radius: 3px; font-size: 0.8em; color: white; }
+        .workload-status.queued { background: #FF9800; }
+        .workload-status.running { background: #2196F3; }
+        .workload-status.complete { background: #4CAF50; }
+        .workload-status.error { background: #f44336; }
+        .workload-status.enhanced { background: #9C27B0; }
+
+        .enhanced-workload-card { border-left: 4px solid #9C27B0; }
+        .enhanced-workload-card .strategy-info { font-size: 0.8em; color: #666; margin-top: 5px; }
     </style>
 </head>
 <body>
@@ -91,6 +115,7 @@
                 <div class="stat-box"><div>Active Clients</div><div class="stat-value" id="active-clients">0</div></div>
                 <div class="stat-box"><div>Total Tasks</div><div class="stat-value" id="total-tasks">0</div></div>
                 <div class="stat-box"><div>Completed</div><div class="stat-value" id="completed-tasks">0</div></div>
+                <div class="stat-box"><div>Enhanced Tasks</div><div class="stat-value" id="enhanced-tasks">0</div></div>
                 <div class="stat-box"><div>Elapsed Time</div><div class="stat-value" id="elapsed-time">0s</div></div>
             </div>
             <div>
@@ -107,6 +132,8 @@
             <div class="stats-grid">
                 <div class="stat-box"><div>My Tasks</div><div class="stat-value" id="my-tasks">0</div></div>
                 <div class="stat-box"><div>Processing</div><div class="stat-value" id="processing-time">0ms</div></div>
+                <div class="stat-box"><div>Framework</div><div class="stat-value" id="current-framework">-</div></div>
+                <div class="stat-box"><div>Strategy</div><div class="stat-value" id="current-strategy">-</div></div>
             </div>
             <div class="log-container" id="task-log">Task activity will appear here...</div>
         </div>
@@ -131,6 +158,187 @@
                 <button id="start-computation">Start Matrix Computation</button>
             </div>
             <div class="log-container" id="admin-log-matrix">Admin matrix actions will be logged here...</div>
+        </div>
+
+        <!-- Enhanced Chunking System Section -->
+        <div class="enhanced-section">
+            <h3>🚀 Enhanced Chunking System</h3>
+
+            <!-- Strategy Management -->
+            <div class="card">
+                <h4>Strategy Management</h4>
+                <div style="display: flex; gap: 15px; margin-bottom: 15px;">
+                    <button id="list-strategies-btn" class="enhanced">List Available Strategies</button>
+                    <button id="refresh-strategies-btn" class="secondary">Refresh</button>
+                </div>
+
+                <div class="strategy-upload-section">
+                    <h4>📁 Upload Custom Strategy</h4>
+                    <div class="enhanced-controls">
+                        <div>
+                            <label for="strategy-type">Strategy Type:</label>
+                            <select id="strategy-type">
+                                <option value="chunking">Chunking Strategy</option>
+                                <option value="assembly">Assembly Strategy</option>
+                            </select>
+                        </div>
+                        <div>
+                            <label for="strategy-name">Strategy Name:</label>
+                            <input type="text" id="strategy-name" placeholder="e.g., my_custom_chunking">
+                        </div>
+                        <div style="flex-grow: 1;">
+                            <label for="strategy-code">Strategy Code:</label>
+                            <textarea id="strategy-code" placeholder="import { BaseChunkingStrategy } from '../../strategies/base/BaseChunkingStrategy.js';
+
+export default class MyCustomStrategy extends BaseChunkingStrategy {
+  constructor() {
+    super('my_custom_strategy');
+  }
+
+  planExecution(workload) {
+    // Implementation here
+  }
+
+  createChunkDescriptors(plan) {
+    // Implementation here
+  }
+}" rows="12"></textarea>
+                        </div>
+                        <button id="upload-strategy-btn" class="enhanced">Upload Strategy</button>
+                    </div>
+                </div>
+
+                <div id="available-strategies" class="strategy-grid">
+                    <div class="strategy-card">
+                        <div class="strategy-type">chunking</div>
+                        <h4>Loading strategies...</h4>
+                        <p>Click "List Available Strategies" to load</p>
+                    </div>
+                </div>
+                <div class="log-container" id="admin-log-strategies">Strategy management actions will be logged here...</div>
+            </div>
+
+            <!-- Enhanced Tiled Matrix -->
+            <div class="card">
+                <h4>🔲 Enhanced Tiled Matrix Multiplication</h4>
+                <p>Advanced matrix multiplication with pluggable tiling strategies:</p>
+                <div class="enhanced-controls">
+                    <div>
+                        <label for="enhanced-matrix-size">Matrix Size:</label>
+                        <select id="enhanced-matrix-size">
+                            <option value="256">256×256</option>
+                            <option value="512" selected>512×512</option>
+                            <option value="1024">1024×1024</option>
+                            <option value="2048">2048×2048</option>
+                            <option value="4096">4096×4096</option>
+                        </select>
+                    </div>
+                    <div>
+                        <label for="tile-size">Tile Size:</label>
+                        <select id="tile-size">
+                            <option value="32">32×32</option>
+                            <option value="64" selected>64×64</option>
+                            <option value="128">128×128</option>
+                            <option value="256">256×256</option>
+                        </select>
+                    </div>
+                    <div>
+                        <label for="enhanced-matrix-label">Label:</label>
+                        <input type="text" id="enhanced-matrix-label" placeholder="Enhanced Matrix Computation">
+                    </div>
+                    <button id="start-enhanced-matrix" class="enhanced">Start Enhanced Matrix</button>
+                </div>
+                <div class="log-container" id="admin-log-enhanced-matrix">Enhanced matrix actions will be logged here...</div>
+            </div>
+
+            <!-- Advanced Workload Creation -->
+            <div class="card">
+                <h4>⚡ Advanced Workload Creation</h4>
+                <p>Create custom workloads with pluggable chunking and assembly strategies:</p>
+
+                <div class="enhanced-controls">
+                    <div>
+                        <label for="advanced-framework">Framework:</label>
+                        <select id="advanced-framework">
+                            <option value="webgpu" selected>WebGPU</option>
+                            <option value="webgl">WebGL</option>
+                            <option value="cuda">CUDA</option>
+                            <option value="opencl">OpenCL</option>
+                            <option value="vulkan">Vulkan</option>
+                        </select>
+                    </div>
+                    <div>
+                        <label for="advanced-label">Workload Label:</label>
+                        <input type="text" id="advanced-label" placeholder="Custom Advanced Workload">
+                    </div>
+                </div>
+
+                <div class="enhanced-controls">
+                    <div>
+                        <label for="chunking-strategy">Chunking Strategy:</label>
+                        <select id="chunking-strategy">
+                            <option value="linear">Linear</option>
+                            <option value="matrix_tiled">Matrix Tiled</option>
+                            <option value="custom">Custom (from dropdown)</option>
+                        </select>
+                    </div>
+                    <div>
+                        <label for="assembly-strategy">Assembly Strategy:</label>
+                        <select id="assembly-strategy">
+                            <option value="linear_assembly">Linear Assembly</option>
+                            <option value="matrix_tiled_assembly">Matrix Tiled Assembly</option>
+                            <option value="custom">Custom (from dropdown)</option>
+                        </select>
+                    </div>
+                </div>
+
+                <div class="enhanced-controls">
+                    <div style="flex-grow: 1;">
+                        <label for="advanced-kernel">Kernel Source:</label>
+                        <textarea id="advanced-kernel" placeholder="@compute @workgroup_size(64) fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+  // Your custom kernel code here
+}" rows="8"></textarea>
+                    </div>
+                </div>
+
+                <div class="enhanced-controls">
+                    <div style="flex-grow: 1;">
+                        <label for="advanced-metadata">Strategy Metadata (JSON):</label>
+                        <textarea id="advanced-metadata" placeholder='{"elementSize": 4, "chunkSize": 1024}' rows="4"></textarea>
+                    </div>
+                </div>
+
+                <div class="multi-input-section">
+                    <h4>🔗 Multi-Input Support</h4>
+                    <div class="enhanced-controls">
+                        <div>
+                            <label for="input-format">Input Format:</label>
+                            <select id="input-format">
+                                <option value="binary">Single Binary Input</option>
+                                <option value="json">Multi-Input JSON</option>
+                            </select>
+                        </div>
+                    </div>
+                    <div class="enhanced-controls">
+                        <div style="flex-grow: 1;">
+                            <label for="advanced-input-data">Input Data:</label>
+                            <textarea id="advanced-input-data" placeholder='For binary: base64-encoded data
+For multi-input JSON:
+{
+  "image_a": "base64-data...",
+  "image_b": "base64-data...",
+  "parameters": {"blend_mode": "multiply"}
+}' rows="6"></textarea>
+                        </div>
+                    </div>
+                </div>
+
+                <div style="margin-top: 20px;">
+                    <button id="create-advanced-workload" class="enhanced">Create Advanced Workload</button>
+                    <button id="validate-advanced-workload" class="secondary">Validate Configuration</button>
+                </div>
+                <div class="log-container" id="admin-log-advanced">Advanced workload actions will be logged here...</div>
+            </div>
         </div>
 
         <div class="card">
@@ -362,7 +570,148 @@
             // Initialize with WebGPU defaults
             frameworkSelect.dispatchEvent(new Event('change'));
 
-            // Enhanced workload creation
+            // Enhanced chunking system handlers
+
+            // Strategy management
+            document.getElementById('list-strategies-btn').addEventListener('click', async () => {
+                logEnhancedActivity('Loading available strategies...', 'strategies');
+                try {
+                    const res = await fetch('/api/strategies');
+                    const data = await res.json();
+                    displayAvailableStrategies(data);
+                    logEnhancedActivity('✅ Strategies loaded successfully', 'strategies', 'success');
+                } catch (err) {
+                    logEnhancedActivity('❌ Failed to load strategies: ' + err.message, 'strategies', 'error');
+                }
+            });
+
+            document.getElementById('upload-strategy-btn').addEventListener('click', async () => {
+                const type = document.getElementById('strategy-type').value;
+                const name = document.getElementById('strategy-name').value;
+                const code = document.getElementById('strategy-code').value;
+
+                if (!name || !code) {
+                    alert('Strategy name and code are required');
+                    return;
+                }
+
+                logEnhancedActivity(`Uploading ${type} strategy "${name}"...`, 'strategies');
+                try {
+                    const res = await fetch('/api/strategies/register', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ strategyCode: code, type, name })
+                    });
+                    const result = await res.json();
+
+                    if (res.ok && result.success) {
+                        logEnhancedActivity(`✅ Strategy "${name}" uploaded successfully`, 'strategies', 'success');
+                        // Clear the form
+                        document.getElementById('strategy-name').value = '';
+                        document.getElementById('strategy-code').value = '';
+                        // Refresh strategies list
+                        document.getElementById('list-strategies-btn').click();
+                    } else {
+                        logEnhancedActivity(`❌ Upload failed: ${result.error}`, 'strategies', 'error');
+                    }
+                } catch (err) {
+                    logEnhancedActivity('❌ Network error: ' + err.message, 'strategies', 'error');
+                }
+            });
+
+            // Enhanced tiled matrix
+            document.getElementById('start-enhanced-matrix').addEventListener('click', async () => {
+                const matrixSize = parseInt(document.getElementById('enhanced-matrix-size').value);
+                const tileSize = parseInt(document.getElementById('tile-size').value);
+                const label = document.getElementById('enhanced-matrix-label').value ||
+                    `Enhanced Matrix ${matrixSize}×${matrixSize} (${tileSize}×${tileSize} tiles)`;
+
+                logEnhancedActivity(`Starting enhanced tiled matrix: ${matrixSize}×${matrixSize}, tiles: ${tileSize}×${tileSize}...`, 'enhanced-matrix');
+
+                try {
+                    const res = await fetch('/api/matrix/tiled-advanced', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ matrixSize, tileSize, label })
+                    });
+                    const result = await res.json();
+
+                    if (res.ok && result.success) {
+                        logEnhancedActivity(`✅ ${result.message} (ID: ${result.id.substring(0,6)})`, 'enhanced-matrix', 'success');
+                    } else {
+                        logEnhancedActivity(`❌ Failed: ${result.error}`, 'enhanced-matrix', 'error');
+                    }
+                } catch (err) {
+                    logEnhancedActivity('❌ Network error: ' + err.message, 'enhanced-matrix', 'error');
+                }
+            });
+
+            // Advanced workload creation
+            document.getElementById('create-advanced-workload').addEventListener('click', async () => {
+                const framework = document.getElementById('advanced-framework').value;
+                const label = document.getElementById('advanced-label').value || 'Custom Advanced Workload';
+                const chunkingStrategy = document.getElementById('chunking-strategy').value;
+                const assemblyStrategy = document.getElementById('assembly-strategy').value;
+                const kernel = document.getElementById('advanced-kernel').value;
+                const metadataText = document.getElementById('advanced-metadata').value;
+                const inputData = document.getElementById('advanced-input-data').value;
+
+                if (!kernel || !metadataText || !inputData) {
+                    alert('Kernel source, metadata, and input data are required');
+                    return;
+                }
+
+                let metadata;
+                try {
+                    metadata = JSON.parse(metadataText);
+                } catch (e) {
+                    alert('Invalid metadata JSON: ' + e.message);
+                    return;
+                }
+
+                const payload = {
+                    label,
+                    chunkingStrategy,
+                    assemblyStrategy,
+                    framework,
+                    input: inputData,
+                    metadata: {
+                        ...metadata,
+                        customShader: kernel
+                    }
+                };
+
+                logEnhancedActivity(`Creating advanced workload "${label}" with ${chunkingStrategy}/${assemblyStrategy}...`, 'advanced');
+
+                try {
+                    const res = await fetch('/api/workloads/advanced', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify(payload)
+                    });
+                    const result = await res.json();
+
+                    if (res.ok && result.success) {
+                        logEnhancedActivity(`✅ ${result.message} (ID: ${result.id.substring(0,6)})`, 'advanced', 'success');
+                    } else {
+                        logEnhancedActivity(`❌ Failed: ${result.error}`, 'advanced', 'error');
+                    }
+                } catch (err) {
+                    logEnhancedActivity('❌ Network error: ' + err.message, 'advanced', 'error');
+                }
+            });
+
+            document.getElementById('validate-advanced-workload').addEventListener('click', () => {
+                const metadataText = document.getElementById('advanced-metadata').value;
+                try {
+                    JSON.parse(metadataText);
+                    logEnhancedActivity('✅ Configuration is valid', 'advanced', 'success');
+                } catch (e) {
+                    logEnhancedActivity('❌ Invalid metadata JSON: ' + e.message, 'advanced', 'error');
+                }
+            });
+
+            // Traditional workload creation
             document.getElementById('push-compute-workload').addEventListener('click', async () => {
                 const framework = frameworkSelect.value;
                 const chunkable = chunkableCheckbox.checked;
@@ -438,6 +787,82 @@
                     socket.emit('admin:startQueuedCustomWorkloads');
                 }
             });
+
+            // Helper functions for enhanced logging
+            function logEnhancedActivity(message, section, level = 'info') {
+                const logId = `admin-log-${section}`;
+                const logElement = document.getElementById(logId);
+                if (logElement) {
+                    const timestamp = new Date().toLocaleTimeString();
+                    const levelIcon = {
+                        'info': '📋',
+                        'success': '✅',
+                        'error': '❌',
+                        'warning': '⚠️'
+                    }[level] || '📋';
+
+                    logElement.innerHTML += `\n[${timestamp}] ${levelIcon} ${message}`;
+                    logElement.scrollTop = logElement.scrollHeight;
+                }
+            }
+
+            function displayAvailableStrategies(data) {
+                const container = document.getElementById('available-strategies');
+                if (!data.available || Object.keys(data.available).length === 0) {
+                    container.innerHTML = '<div class="strategy-card"><h4>No strategies loaded</h4><p>Upload custom strategies or check server configuration</p></div>';
+                    return;
+                }
+
+                let html = '';
+                for (const [name, strategy] of Object.entries(data.available)) {
+                    const type = strategy.type || 'unknown';
+                    const description = strategy.description || 'No description available';
+
+                    html += `
+                        <div class="strategy-card">
+                            <div class="strategy-type ${type}">${type}</div>
+                            <h4>${name}</h4>
+                            <p>${description}</p>
+                            <div style="font-size: 0.8em; color: #666; margin-top: 5px;">
+                                Loaded: ${new Date(strategy.loadedAt || Date.now()).toLocaleString()}
+                            </div>
+                        </div>
+                    `;
+                }
+
+                container.innerHTML = html;
+
+                // Update strategy dropdowns
+                updateStrategyDropdowns(data.available);
+            }
+
+            function updateStrategyDropdowns(strategies) {
+                const chunkingSelect = document.getElementById('chunking-strategy');
+                const assemblySelect = document.getElementById('assembly-strategy');
+
+                // Clear existing custom options
+                Array.from(chunkingSelect.options).forEach(option => {
+                    if (option.value.startsWith('custom_')) {
+                        option.remove();
+                    }
+                });
+                Array.from(assemblySelect.options).forEach(option => {
+                    if (option.value.startsWith('custom_')) {
+                        option.remove();
+                    }
+                });
+
+                // Add loaded strategies
+                for (const [name, strategy] of Object.entries(strategies)) {
+                    if (strategy.type === 'chunking') {
+                        const option = new Option(name, name);
+                        chunkingSelect.add(option);
+                    } else if (strategy.type === 'assembly') {
+                        const option = new Option(name, name);
+                        assemblySelect.add(option);
+                    }
+                }
+            }
         });
     </script>
 </body>

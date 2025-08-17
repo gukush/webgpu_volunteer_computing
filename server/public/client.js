@@ -1,4 +1,4 @@
-// client.js
+// client.js - Complete Enhanced Version
 const state = {
   webgpuSupported: false,
   device: null,
@@ -13,6 +13,7 @@ const state = {
   statistics: { processingTime: 0 }
 };
 
+// Enhanced: Multi-framework state tracking
 const frameworkState = {
   webgpu: { supported: false, device: null, adapterInfo: null },
   webgl: { supported: false, context: null, extensions: null }
@@ -21,7 +22,6 @@ const frameworkState = {
 const inFlightWorkloads = new Set();
 let workloadListenerBound = false;
 let hasJoinedOnce = false;
-
 
 const elements = {
   webgpuStatus: document.getElementById('webgpu-status'),
@@ -69,14 +69,14 @@ const IS_HEADLESS = PARAMS.get('mode') === 'headless';
 const WORKER_ID = PARAMS.get('workerId') || 'N/A';
 const socket = io({ query: IS_HEADLESS ? { mode: 'headless', workerId: WORKER_ID } : {} });
 
-
+// Enhanced: Multi-framework capability detection
 async function detectFrameworkCapabilities() {
   const capabilities = {
     supportedFrameworks: [],
     clientType: 'browser'
   };
 
-  // WebGPU detection (existing logic)
+  // WebGPU detection (existing logic enhanced)
   if (window.isSecureContext && navigator.gpu) {
     try {
       const adapter = await navigator.gpu.requestAdapter();
@@ -111,7 +111,6 @@ async function detectFrameworkCapabilities() {
       const extensions = {
         transformFeedback: gl.getExtension('OES_texture_float'),
         vertexArrayObject: gl.getExtension('OES_vertex_array_object'),
-        // Add other useful extensions
       };
 
       frameworkState.webgl = { supported: true, context: gl, extensions };
@@ -124,6 +123,252 @@ async function detectFrameworkCapabilities() {
   return capabilities;
 }
 
+// Enhanced: Multi-input, multi-framework execution
+async function executeEnhancedChunk(chunk) {
+  console.log(`[ENHANCED] Starting execution for ${chunk.chunkId} with strategy ${chunk.chunkingStrategy || 'unknown'}`);
+
+  if (!state.device) {
+    throw new Error('No GPU device available');
+  }
+
+  if (!chunk.outputSize || chunk.outputSize <= 0) {
+    throw new Error(`Invalid chunk output size: ${chunk.outputSize}`);
+  }
+
+  const t0 = performance.now();
+
+  try {
+    console.log(`[ENHANCED] Creating shader module...`);
+    const shader = state.device.createShaderModule({
+      code: chunk.kernel || chunk.wgsl
+    });
+
+    const ci = await shader.getCompilationInfo();
+    if (ci.messages.some(m => m.type === 'error')) {
+      const errors = ci.messages.filter(m => m.type === 'error').map(m => m.message).join('\n');
+      throw new Error(`Shader compilation failed: ${errors}`);
+    }
+
+    const pipeline = state.device.createComputePipeline({
+      layout: 'auto',
+      compute: {
+        module: shader,
+        entryPoint: chunk.entry || 'main'
+      }
+    });
+
+    let binding = 0;
+    const entries = [];
+
+    // Enhanced: Handle multiple inputs based on schema
+    if (chunk.inputSchema && chunk.chunkInputs) {
+      console.log(`[MULTI-INPUT] Processing chunk with ${chunk.inputSchema.inputs.length} inputs`);
+
+      // Handle uniforms first
+      for (const uniformDef of chunk.inputSchema.uniforms || []) {
+        const uniformBuffer = createUniformBuffer(chunk.uniforms, uniformDef);
+        entries.push({ binding: binding++, resource: { buffer: uniformBuffer } });
+      }
+
+      // Handle inputs
+      for (const inputDef of chunk.inputSchema.inputs) {
+        const inputData = chunk.chunkInputs[inputDef.name];
+
+        if (inputDef.type === 'storage_buffer') {
+          const storageBuffer = createStorageBuffer(inputData, inputDef);
+          entries.push({ binding: binding++, resource: { buffer: storageBuffer } });
+        }
+      }
+
+      // Add output buffers
+      for (const outputDef of chunk.inputSchema.outputs) {
+        const outputBuffer = state.device.createBuffer({
+          size: Math.max(16, chunk.outputSize),
+          usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC
+        });
+        entries.push({ binding: binding++, resource: { buffer: outputBuffer } });
+      }
+
+    } else {
+      // Handle legacy single-input format with uniforms
+
+      // Add uniforms buffer if present
+      if (chunk.uniforms && Object.keys(chunk.uniforms).length > 0) {
+        console.log(`[ENHANCED] Setting up uniforms:`, chunk.uniforms);
+
+        const uniformArray = createUniformArray(chunk.uniforms, chunk.chunkingStrategy);
+
+        const uniformBuffer = state.device.createBuffer({
+          size: Math.max(16, uniformArray.byteLength),
+          usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST
+        });
+
+        state.device.queue.writeBuffer(uniformBuffer, 0, uniformArray);
+        entries.push({ binding: binding++, resource: { buffer: uniformBuffer } });
+      }
+
+      // Handle input data
+      const inputBytes = chunk.inputData
+        ? Uint8Array.from(atob(chunk.inputData), c => c.charCodeAt(0))
+        : new Uint8Array();
+
+      if (inputBytes.length > 0) {
+        const inputBuffer = state.device.createBuffer({
+          size: Math.max(16, inputBytes.byteLength),
+          usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+          mappedAtCreation: true
+        });
+        new Uint8Array(inputBuffer.getMappedRange()).set(inputBytes);
+        inputBuffer.unmap();
+        entries.push({ binding: binding++, resource: { buffer: inputBuffer } });
+      }
+
+      // Create output buffer
+      console.log(`[ENHANCED] Creating output buffer: ${chunk.outputSize} bytes`);
+      const outputBuffer = state.device.createBuffer({
+        size: Math.max(16, parseInt(chunk.outputSize)),
+        usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC
+      });
+      entries.push({ binding: binding++, resource: { buffer: outputBuffer } });
+    }
+
+    // Create bind group and execute
+    const bindGroup = state.device.createBindGroup({
+      layout: pipeline.getBindGroupLayout(0),
+      entries
+    });
+
+    console.log(`[ENHANCED] Dispatching workgroups:`, chunk.workgroupCount);
+    const encoder = state.device.createCommandEncoder();
+    const computePass = encoder.beginComputePass();
+    computePass.setPipeline(pipeline);
+    computePass.setBindGroup(0, bindGroup);
+    computePass.dispatchWorkgroups(...chunk.workgroupCount);
+    computePass.end();
+
+    // Read back results
+    const outputBuffer = entries[entries.length - 1].resource.buffer;
+    const readBuffer = state.device.createBuffer({
+      size: outputBuffer.size,
+      usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ
+    });
+
+    encoder.copyBufferToBuffer(outputBuffer, 0, readBuffer, 0, outputBuffer.size);
+    state.device.queue.submit([encoder.finish()]);
+
+    await readBuffer.mapAsync(GPUMapMode.READ);
+    const resultBytes = new Uint8Array(readBuffer.getMappedRange().slice(0));
+    readBuffer.unmap();
+
+    const dt = performance.now() - t0;
+    console.log(`[ENHANCED] Chunk ${chunk.chunkId} completed in ${dt.toFixed(0)}ms, ${resultBytes.length} bytes output`);
+
+    const resultBase64 = btoa(String.fromCharCode(...resultBytes));
+
+    return {
+      result: resultBase64,
+      processingTime: dt
+    };
+
+  } catch (err) {
+    console.error(`[ENHANCED] Chunk execution error:`, err);
+    throw err;
+  }
+}
+
+// Helper functions for multi-input support
+function createStorageBuffer(inputData, inputDef) {
+  let bytes;
+
+  if (typeof inputData === 'string') {
+    bytes = Uint8Array.from(atob(inputData), c => c.charCodeAt(0));
+  } else if (inputData instanceof Buffer) {
+    bytes = new Uint8Array(inputData);
+  } else {
+    bytes = new Uint8Array(inputData);
+  }
+
+  const buffer = state.device.createBuffer({
+    size: Math.max(16, bytes.byteLength),
+    usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+    mappedAtCreation: true
+  });
+
+  new Uint8Array(buffer.getMappedRange()).set(bytes);
+  buffer.unmap();
+
+  return buffer;
+}
+
+function createUniformBuffer(inputData, inputDef) {
+  let uniformBytes;
+
+  if (typeof inputData === 'object' && !Buffer.isBuffer(inputData)) {
+    uniformBytes = serializeUniforms(inputData, inputDef);
+  } else {
+    uniformBytes = new Uint8Array(inputData);
+  }
+
+  const buffer = state.device.createBuffer({
+    size: Math.max(16, uniformBytes.byteLength),
+    usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST
+  });
+
+  state.device.queue.writeBuffer(buffer, 0, uniformBytes);
+  return buffer;
+}
+
+function createUniformArray(uniforms, strategy) {
+  switch (strategy) {
+    case 'matrix_tiled':
+      return new Uint32Array([
+        uniforms.matrix_n || 0,
+        uniforms.tile_start_row || 0,
+        uniforms.tile_start_col || 0,
+        uniforms.tile_rows || 0,
+        uniforms.tile_cols || 0,
+        uniforms.tile_size || 0
+      ]);
+
+    case 'matrix_rows':
+      return new Uint32Array([
+        uniforms.matrix_n || 0,
+        uniforms.output_start_row || 0,
+        uniforms.rows_to_compute || 0
+      ]);
+
+    default:
+      const values = Object.values(uniforms).filter(v => typeof v === 'number');
+      return new Uint32Array(values);
+  }
+}
+
+function serializeUniforms(uniformObj, inputDef) {
+  // Simple serialization based on field definitions
+  if (inputDef && inputDef.fields) {
+    const values = inputDef.fields.map(field => uniformObj[field] || 0);
+    return new Uint32Array(values);
+  }
+
+  // Fallback: serialize all numeric values
+  const values = Object.values(uniformObj).filter(v => typeof v === 'number');
+  return new Uint32Array(values);
+}
+
+// Enhanced: Framework-agnostic kernel execution
+async function executeFrameworkKernel(meta) {
+  const framework = meta.framework || 'webgpu';
+
+  switch (framework) {
+    case 'webgpu':
+      return await executeWGSL(meta);
+    case 'webgl':
+      return await executeWebGLCompute(meta);
+    default:
+      throw new Error(`Unsupported framework: ${framework}`);
+  }
+}
+
 async function executeWGSL(meta) {
   console.log(`[HEADLESS] Starting WGSL execution for ${meta.id || meta.chunkId}`);
 
@@ -131,7 +376,6 @@ async function executeWGSL(meta) {
     throw new Error('No GPU device available');
   }
 
-  // Validate output size
   if (!meta.outputSize || meta.outputSize <= 0) {
     throw new Error(`Invalid output size: ${meta.outputSize}`);
   }
@@ -139,11 +383,9 @@ async function executeWGSL(meta) {
   const t0 = performance.now();
 
   try {
-    // Create shader module
     console.log(`[HEADLESS] Creating shader module...`);
     const shader = state.device.createShaderModule({ code: meta.wgsl || meta.kernel });
 
-    // Check for compilation errors
     console.log(`[HEADLESS] Getting compilation info...`);
     const ci = await shader.getCompilationInfo();
     if (ci.messages.some(m => m.type === 'error')) {
@@ -152,7 +394,6 @@ async function executeWGSL(meta) {
       throw new Error(`Shader compilation failed: ${errors}`);
     }
 
-    // Create pipeline
     console.log(`[HEADLESS] Creating compute pipeline...`);
     const pipeline = state.device.createComputePipeline({
       layout: 'auto',
@@ -162,7 +403,6 @@ async function executeWGSL(meta) {
       }
     });
 
-    // Prepare input buffer
     const inputBytes = meta.input || meta.inputData
       ? Uint8Array.from(atob(meta.input || meta.inputData), c => c.charCodeAt(0))
       : new Uint8Array();
@@ -170,7 +410,6 @@ async function executeWGSL(meta) {
     let binding = 0;
     const entries = [];
 
-    // Add uniforms buffer for chunks if chunk uniforms are present
     if (meta.chunkUniforms) {
       const uniformVals = [
         meta.chunkUniforms.chunkOffsetBytes || 0,
@@ -193,7 +432,6 @@ async function executeWGSL(meta) {
       entries.push({ binding: binding++, resource: { buffer: uniBuf } });
     }
 
-    // Add input buffer if there's input data
     if (inputBytes.length) {
       const inBuf = state.device.createBuffer({
         size: Math.max(16, inputBytes.byteLength),
@@ -205,7 +443,6 @@ async function executeWGSL(meta) {
       entries.push({ binding: binding++, resource: { buffer: inBuf } });
     }
 
-    // Create output buffer with validated size
     console.log(`[HEADLESS] Creating output buffer with size: ${meta.outputSize} bytes`);
     const outBuf = state.device.createBuffer({
       size: Math.max(16, parseInt(meta.outputSize)),
@@ -213,13 +450,11 @@ async function executeWGSL(meta) {
     });
     entries.push({ binding: binding++, resource: { buffer: outBuf } });
 
-    // Create bind group
     const bg = state.device.createBindGroup({
       layout: pipeline.getBindGroupLayout(0),
       entries
     });
 
-    // Execute compute pass
     console.log(`[HEADLESS] Dispatching workgroups: ${meta.workgroupCount}`);
     const enc = state.device.createCommandEncoder();
     const pass = enc.beginComputePass();
@@ -228,7 +463,6 @@ async function executeWGSL(meta) {
     pass.dispatchWorkgroups(...meta.workgroupCount);
     pass.end();
 
-    // Read back results
     const readBuf = state.device.createBuffer({
       size: outBuf.size,
       usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ
@@ -243,12 +477,10 @@ async function executeWGSL(meta) {
     const dt = performance.now() - t0;
     console.log(`[HEADLESS] WGSL completed in ${dt.toFixed(0)}ms, ${resultBytes.length} bytes output`);
 
-    // Convert result to base64
     const resultBase64 = btoa(String.fromCharCode(...resultBytes));
 
     logTaskActivity(`WGSL ${meta.label || meta.chunkId} done in ${dt.toFixed(0)}ms`);
 
-    // Return both result and processing time
     return {
       result: resultBase64,
       processingTime: dt
@@ -261,6 +493,7 @@ async function executeWGSL(meta) {
   }
 }
 
+// Basic WebGL compute support (simplified)
 async function executeWebGLCompute(meta) {
   console.log(`[WebGL] Starting compute execution for ${meta.id}`);
 
@@ -268,135 +501,10 @@ async function executeWebGLCompute(meta) {
     throw new Error('WebGL not available');
   }
 
-  const gl = frameworkState.webgl.context;
-  const t0 = performance.now();
-
-  try {
-    // Create shaders
-    const vertexShader = gl.createShader(gl.VERTEX_SHADER);
-    const fragmentShader = gl.createShader(gl.FRAGMENT_SHADER);
-
-    // Parse the GLSL kernel code - assume it contains both vertex and fragment shaders
-    // or generate a passthrough vertex shader
-    const shaderParts = parseGLSLKernel(meta.kernel);
-
-    gl.shaderSource(vertexShader, shaderParts.vertex);
-    gl.compileShader(vertexShader);
-
-    if (!gl.getShaderParameter(vertexShader, gl.COMPILE_STATUS)) {
-      throw new Error('Vertex shader compilation failed: ' + gl.getShaderInfoLog(vertexShader));
-    }
-
-    gl.shaderSource(fragmentShader, shaderParts.fragment);
-    gl.compileShader(fragmentShader);
-
-    if (!gl.getShaderParameter(fragmentShader, gl.COMPILE_STATUS)) {
-      throw new Error('Fragment shader compilation failed: ' + gl.getShaderInfoLog(fragmentShader));
-    }
-
-    // Create program
-    const program = gl.createProgram();
-    gl.attachShader(program, vertexShader);
-    gl.attachShader(program, fragmentShader);
-
-    // Setup transform feedback if needed
-    if (meta.bindLayout === 'webgl-transform-feedback') {
-      gl.transformFeedbackVaryings(program, ['gl_Position'], gl.SEPARATE_ATTRIBS);
-    }
-
-    gl.linkProgram(program);
-
-    if (!gl.getProgramParameter(program, gl.LINK_STATUS)) {
-      throw new Error('Program linking failed: ' + gl.getProgramInfoLog(program));
-    }
-
-    // Setup input data
-    const inputBytes = meta.input
-      ? Uint8Array.from(atob(meta.input), c => c.charCodeAt(0))
-      : new Uint8Array();
-
-    // Create buffers and textures for data
-    const inputBuffer = gl.createBuffer();
-    gl.bindBuffer(gl.ARRAY_BUFFER, inputBuffer);
-    gl.bufferData(gl.ARRAY_BUFFER, inputBytes, gl.STATIC_DRAW);
-
-    // Create output buffer
-    const outputBuffer = gl.createBuffer();
-    gl.bindBuffer(gl.ARRAY_BUFFER, outputBuffer);
-    gl.bufferData(gl.ARRAY_BUFFER, meta.outputSize, gl.DYNAMIC_DRAW);
-
-    // Execute the compute operation
-    gl.useProgram(program);
-
-    // Bind transform feedback if needed
-    if (meta.bindLayout === 'webgl-transform-feedback') {
-      gl.bindTransformFeedback(gl.TRANSFORM_FEEDBACK, gl.createTransformFeedback());
-      gl.bindBufferBase(gl.TRANSFORM_FEEDBACK_BUFFER, 0, outputBuffer);
-      gl.beginTransformFeedback(gl.POINTS);
-    }
-
-    // Draw call to execute computation
-    const numVertices = Math.floor(inputBytes.length / 4); // Assuming float32 input
-    gl.drawArrays(gl.POINTS, 0, Math.max(1, numVertices));
-
-    if (meta.bindLayout === 'webgl-transform-feedback') {
-      gl.endTransformFeedback();
-    }
-
-    // Read back results
-    gl.bindBuffer(gl.ARRAY_BUFFER, outputBuffer);
-    const resultBytes = new Uint8Array(meta.outputSize);
-    gl.getBufferSubData(gl.ARRAY_BUFFER, 0, resultBytes);
-
-    const dt = performance.now() - t0;
-    console.log(`[WebGL] Compute completed in ${dt.toFixed(0)}ms, ${resultBytes.length} bytes`);
-
-    const resultBase64 = btoa(String.fromCharCode(...resultBytes));
-    return { result: resultBase64, processingTime: dt };
-
-  } catch (err) {
-    console.error(`[WebGL] Execution error:`, err);
-    throw err;
-  }
+  // Simplified WebGL execution - would need more sophisticated implementation
+  throw new Error('WebGL compute execution not yet fully implemented');
 }
 
-function parseGLSLKernel(kernelCode) {
-  // Simple parser - in practice, you might want more sophisticated parsing
-  if (kernelCode.includes('#vertex') && kernelCode.includes('#fragment')) {
-    const parts = kernelCode.split('#fragment');
-    return {
-      vertex: parts[0].replace('#vertex', '').trim(),
-      fragment: '#version 300 es\n' + parts[1].trim()
-    };
-  }
-
-  // Generate a passthrough vertex shader and use the kernel as fragment shader
-  const vertexShader = `#version 300 es
-    in vec4 a_position;
-    void main() {
-      gl_Position = a_position;
-    }`;
-
-  const fragmentShader = `#version 300 es
-    precision highp float;
-    out vec4 fragColor;
-    ${kernelCode}`;
-
-  return { vertex: vertexShader, fragment: fragmentShader };
-}
-
-async function executeFrameworkKernel(meta) {
-  const framework = meta.framework || 'webgpu';
-  // console.log(`Meta: ${JSON.stringify(meta, null, 2)}`);
-  switch (framework) {
-    case 'webgpu':
-      return await executeWGSL(meta);
-    case 'webgl':
-      return await executeWebGLCompute(meta);
-    default:
-      throw new Error(`Unsupported framework: ${framework}`);
-  }
-}
 function bindWorkloadListener() {
   if (workloadListenerBound) return;
   workloadListenerBound = true;
@@ -455,20 +563,20 @@ function bindWorkloadListener() {
   socket.on('workload:new', onWorkloadNew);
 }
 
-
-
 async function initWebGPU() {
   console.log(`[HEADLESS] Checking WebGPU support...`);
   console.log(`[HEADLESS] isSecureContext: ${window.isSecureContext}`);
   console.log(`[HEADLESS] navigator.gpu available: ${!!navigator.gpu}`);
+
   if (!window.isSecureContext) {
     console.error(`[HEADLESS] Not a secure context`);
     elements.webgpuStatus.innerHTML = `WebGPU requires a secure context.`;
     elements.webgpuStatus.className = 'status error';
     return false;
   }
+
   if (!navigator.gpu) {
-    elements.webgpuStatus.textContent = 'WebGPU not supported – CPU fallback.';
+    elements.webgpuStatus.textContent = 'WebGPU not supported — CPU fallback.';
     elements.webgpuStatus.className = 'status warning';
     return false;
   }
@@ -509,6 +617,13 @@ async function initWebGPU() {
     state.device = await chosen.adapter.requestDevice();
     state.webgpuSupported = true;
 
+    // Update framework state
+    frameworkState.webgpu = {
+      supported: true,
+      device: state.device,
+      adapterInfo: state.adapterInfo
+    };
+
     elements.webgpuStatus.textContent = `WebGPU: ${state.adapterInfo.vendor}`;
     elements.webgpuStatus.className = 'status success';
     elements.gpuInfo.innerHTML = `
@@ -530,22 +645,15 @@ async function initWebGPU() {
   }
 }
 
-
 async function init() {
   if (IS_HEADLESS) {
     document.documentElement.style.display = 'none';
     console.log(`Headless worker ${WORKER_ID}`);
   }
 
-  // Initialize all available frameworks
   await initWebGPU();
-
-  // Detect all framework capabilities
   const capabilities = await detectFrameworkCapabilities();
-
-  // Update UI to show supported frameworks
   updateFrameworkDisplay(capabilities);
-
   updateComputationStatusDisplay();
 
   if (IS_HEADLESS) {
@@ -556,7 +664,6 @@ async function init() {
     }
   }
 }
-
 
 function updateFrameworkDisplay(capabilities) {
   if (IS_HEADLESS) return;
@@ -574,7 +681,6 @@ function updateFrameworkDisplay(capabilities) {
     ).join(' ')}
   `;
 
-  // Insert after GPU info
   const gpuInfo = elements.gpuInfo;
   if (gpuInfo.nextSibling) {
     gpuInfo.parentNode.insertBefore(frameworkInfo, gpuInfo.nextSibling);
@@ -744,7 +850,6 @@ function joinComputation() {
   elements.joinComputation.disabled = true;
   elements.leaveComputation.disabled = false;
 
-  // Detect capabilities before joining
   detectFrameworkCapabilities().then(capabilities => {
     socket.emit('client:join', {
       gpuInfo: frameworkState.webgpu.adapterInfo || frameworkState.webgl.extensions || { vendor: 'CPU Fallback' },
@@ -754,7 +859,6 @@ function joinComputation() {
     });
   });
 }
-
 
 function leaveComputation() {
   elements.joinComputation.disabled = false;
@@ -841,15 +945,6 @@ function updateComputationStatusDisplay() {
   elements.computationStatus.textContent = txt;
   elements.computationStatus.className = cls;
 }
-/*
-socket.on('connect', () => {
-  state.connected = true;
-  elements.clientStatus.textContent = 'Connected';
-  elements.clientStatus.className = 'status success';
-  logTaskActivity('Connected to server');
-});
-*/
-
 
 socket.on('connect', () => {
   if (!hasJoinedOnce) {
@@ -925,14 +1020,135 @@ socket.on('workload:removed', ({ id }) => {
   if (card) card.remove();
 });
 
+// Enhanced: Enhanced chunk assignment handler
+socket.on('workload:chunk_assign', async chunk => {
+  const framework = chunk.framework || 'webgpu';
+
+  if (state.isComputingMatrix || state.isComputingWgsl || state.isComputingChunk) {
+    const eventName = chunk.enhanced ? 'workload:chunk_error_enhanced' : 'workload:chunk_error';
+    socket.emit(eventName, {
+      parentId: chunk.parentId,
+      chunkId: chunk.chunkId,
+      message: 'Client busy'
+    });
+    return;
+  }
+
+  if (!frameworkState[framework]?.supported) {
+    const eventName = chunk.enhanced ? 'workload:chunk_error_enhanced' : 'workload:chunk_error';
+    socket.emit(eventName, {
+      parentId: chunk.parentId,
+      chunkId: chunk.chunkId,
+      message: `Framework ${framework} not supported`
+    });
+    return;
+  }
+
+  if (!chunk.outputSize || chunk.outputSize <= 0) {
+    const eventName = chunk.enhanced ? 'workload:chunk_error_enhanced' : 'workload:chunk_error';
+    socket.emit(eventName, {
+      parentId: chunk.parentId,
+      chunkId: chunk.chunkId,
+      message: `Invalid chunk output size: ${chunk.outputSize}`
+    });
+    return;
+  }
+
+  state.isComputingChunk = true;
+  state.currentTask = chunk;
+  updateComputationStatusDisplay();
+
+  const strategy = chunk.chunkingStrategy || 'unknown';
+  logTaskActivity(`Processing ${framework} chunk ${chunk.chunkId} (${strategy}, output: ${chunk.outputSize} bytes)`);
+
+  try {
+    let result;
+
+    if (chunk.enhanced || chunk.inputSchema) {
+      result = await executeEnhancedChunk(chunk);
+    } else {
+      result = await executeFrameworkKernel(chunk);
+    }
+
+    const eventName = chunk.enhanced ? 'workload:chunk_done_enhanced' : 'workload:chunk_done';
+    const eventData = {
+      parentId: chunk.parentId,
+      chunkId: chunk.chunkId,
+      chunkOrderIndex: chunk.chunkOrderIndex,
+      result: result.result,
+      processingTime: result.processingTime
+    };
+
+    if (chunk.enhanced) {
+      eventData.strategy = chunk.chunkingStrategy;
+      eventData.metadata = chunk.metadata;
+    }
+
+    socket.emit(eventName, eventData);
+
+  } catch (err) {
+    logTaskActivity(`${framework} chunk error: ${err.message}`, 'error');
+    const eventName = chunk.enhanced ? 'workload:chunk_error_enhanced' : 'workload:chunk_error';
+    socket.emit(eventName, {
+      parentId: chunk.parentId,
+      chunkId: chunk.chunkId,
+      message: `${framework}: ${err.message}`
+    });
+  } finally {
+    state.isComputingChunk = false;
+    state.currentTask = null;
+    updateComputationStatusDisplay();
+    requestMatrixTask();
+  }
+});
+
+socket.on('workloads:list_update', all => {
+  if (IS_HEADLESS) return;
+
+  elements.activeWgslWorkloadsGrid.innerHTML = '';
+
+  if (!all.length) {
+    elements.activeWgslWorkloadsGrid.innerHTML = '<p>No WGSL workloads.</p>';
+    return;
+  }
+
+  all.forEach(wl => {
+    const card = document.createElement('div');
+    card.className = `wgsl-card status-${wl.status}`;
+    card.id = `wgsl-card-${wl.id}`;
+
+    let html = `
+      <h4>${wl.label} (${wl.id.substring(0,6)})${wl.isChunkParent?' (Chunked)':''}</h4>
+      <p>Status: ${wl.status}</p>
+    `;
+
+    if (wl.status === 'complete' && wl.startedAt && wl.completedAt) {
+      const elapsedMs = wl.completedAt - wl.startedAt;
+      html += `<p><small>Completed in ${(elapsedMs/1000).toFixed(2)} s (incl. dispatch & collection)</small></p>`;
+    }
+
+    html += `
+      <div class="wgsl-card-actions">
+        <button class="remove-wgsl-button danger" data-workload-id="${wl.id}">
+          Remove (X)
+        </button>
+      </div>
+    `;
+
+    card.innerHTML = html;
+    elements.activeWgslWorkloadsGrid.appendChild(card);
+
+    card.querySelector('.remove-wgsl-button').addEventListener('click', () => {
+      const id = wl.id;
+      if (confirm(`Remove workload "${wl.label}" (ID ${id.substring(0,6)})?`)) {
+        socket.emit('admin:removeCustomWorkload', { workloadId: id });
+      }
+    });
+  });
+});
+
 socket.on('workload:new', async meta => {
   console.log(`[HEADLESS] Received WGSL workload: ${meta.id}, label: ${meta.label}`);
-  console.log(`[HEADLESS] State check:`);
-  console.log(`  - isComputingMatrix: ${state.isComputingMatrix}`);
-  console.log(`  - isComputingWgsl: ${state.isComputingWgsl}`);
-  console.log(`  - isComputingChunk: ${state.isComputingChunk}`);
-  console.log(`  - currentTask: ${state.currentTask ? JSON.stringify(state.currentTask) : 'null'}`);
-  console.log(`  - device available: ${!!state.device}`);
   if (meta.isChunkParent) return;
   if (state.isComputingMatrix || state.isComputingWgsl || state.isComputingChunk) {
     socket.emit('workload:error', { id: meta.id, message: 'Busy' });
@@ -980,7 +1196,7 @@ socket.on('workload:new', async meta => {
 
     const bg = state.device.createBindGroup({
       layout: pipeline.getBindGroupLayout(0),
-    entries
+      entries
     });
 
     const enc = state.device.createCommandEncoder();
@@ -1015,278 +1231,17 @@ socket.on('workload:new', async meta => {
   }
 });
 
-
-socket.on('workload:chunk_assign', async chunk => {
-  const framework = chunk.framework || 'webgpu';
-
-  if (state.isComputingMatrix || state.isComputingWgsl || state.isComputingChunk) {
-    socket.emit('workload:chunk_error', {
-      parentId: chunk.parentId,
-      chunkId: chunk.chunkId,
-      message: 'Busy'
-    });
-    return;
-  }
-
-  if (!frameworkState[framework]?.supported) {
-    socket.emit('workload:chunk_error', {
-      parentId: chunk.parentId,
-      chunkId: chunk.chunkId,
-      message: `Framework ${framework} not supported`
-    });
-    return;
-  }
-
-  // Validate chunk has required output size
-  if (!chunk.outputSize || chunk.outputSize <= 0) {
-    socket.emit('workload:chunk_error', {
-      parentId: chunk.parentId,
-      chunkId: chunk.chunkId,
-      message: `Invalid chunk output size: ${chunk.outputSize}`
-    });
-    return;
-  }
-
-  state.isComputingChunk = true;
-  state.currentTask = chunk;
-  updateComputationStatusDisplay();
-  logTaskActivity(`Processing ${framework} chunk ${chunk.chunkId} (output: ${chunk.outputSize} bytes)`);
-
-  try {
-    const { result, processingTime } = await executeFrameworkKernel(chunk);
-
-    socket.emit('workload:chunk_done', {
-      parentId: chunk.parentId,
-      chunkId: chunk.chunkId,
-      chunkOrderIndex: chunk.chunkOrderIndex,
-      result,
-      processingTime
-    });
-  } catch (err) {
-    logTaskActivity(`${framework} chunk error: ${err.message}`, 'error');
-    socket.emit('workload:chunk_error', {
-      parentId: chunk.parentId,
-      chunkId: chunk.chunkId,
-      message: `${framework}: ${err.message}`
-    });
-  } finally {
-    state.isComputingChunk = false;
-    state.currentTask = null;
-    updateComputationStatusDisplay();
-    requestMatrixTask();
-  }
-});
-/*
-socket.on('workload:chunk_assign', async chunk => {
-  if (state.isComputingMatrix || state.isComputingWgsl || state.isComputingChunk) {
-    socket.emit('workload:chunk_error', { parentId: chunk.parentId, chunkId: chunk.chunkId, message: 'Busy' });
-    return;
-  }
-  if (!state.device) {
-    socket.emit('workload:chunk_error', { parentId: chunk.parentId, chunkId: chunk.chunkId, message: 'No GPU' });
-    return;
-  }
-  state.isComputingChunk = true;
-  state.currentTask = chunk;
-  updateComputationStatusDisplay();
-  logTaskActivity(`Processing chunk ${chunk.chunkId}`);
-
-  try {
-    const t0 = performance.now();
-    const shader = state.device.createShaderModule({ code: chunk.wgsl });
-    const ci = await shader.getCompilationInfo();
-    if (ci.messages.some(m => m.type === 'error')) {
-      throw new Error(ci.messages.filter(m=>m.type==='error').map(m=>m.message).join('\n'));
-    }
-    const pipeline = state.device.createComputePipeline({ layout: 'auto', compute: { module: shader, entryPoint: chunk.entry } });
-
-    const inBytes = Uint8Array.from(atob(chunk.inputData), c => c.charCodeAt(0));
-    const inBuf = state.device.createBuffer({
-      size: Math.max(16, inBytes.byteLength),
-      usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
-      mappedAtCreation: true
-    });
-    new Uint8Array(inBuf.getMappedRange()).set(inBytes);
-    inBuf.unmap();
-
-    const uniformVals = [
-      chunk.chunkUniforms.chunkOffsetBytes,
-      chunk.chunkUniforms.chunkInputSizeBytes,
-      chunk.chunkUniforms.totalOriginalInputSizeBytes
-    ];
-    if ('chunkOffsetElements' in chunk.chunkUniforms) {
-      uniformVals.push(
-        chunk.chunkUniforms.chunkOffsetElements,
-        chunk.chunkUniforms.chunkInputSizeElements,
-        chunk.chunkUniforms.totalOriginalInputSizeElements
-      );
-    }
-    const uniBuf = state.device.createBuffer({
-      size: Math.max(16, new Uint32Array(uniformVals).byteLength),
-      usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST
-    });
-    state.device.queue.writeBuffer(uniBuf, 0, new Uint32Array(uniformVals));
-
-    let estOut = chunk.chunkUniforms.chunkInputSizeBytes || 16;
-    const outBuf = state.device.createBuffer({
-      size: Math.max(16, estOut),
-      usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC
-    });
-
-    const bg = state.device.createBindGroup({
-      layout: pipeline.getBindGroupLayout(0),
-      entries: [
-        { binding: 0, resource: { buffer: uniBuf } },
-        { binding: 1, resource: { buffer: inBuf } },
-        { binding: 2, resource: { buffer: outBuf } }
-      ]
-    });
-
-    const enc = state.device.createCommandEncoder();
-    const pass = enc.beginComputePass();
-    pass.setPipeline(pipeline);
-    pass.setBindGroup(0, bg);
-
-    const wgX = Math.ceil((chunk.chunkUniforms.chunkInputSizeBytes / 4) / 64);
-    pass.dispatchWorkgroups(Math.max(1, wgX));
-    pass.end();
-
-    const readBuf = state.device.createBuffer({
-      size: outBuf.size,
-      usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ
-    });
-    enc.copyBufferToBuffer(outBuf, 0, readBuf, 0, outBuf.size);
-    state.device.queue.submit([enc.finish()]);
-    await readBuf.mapAsync(GPUMapMode.READ);
-    const resultBytes = new Uint8Array(readBuf.getMappedRange().slice(0));
-    readBuf.unmap();
-
-    const dt = performance.now() - t0;
-    logTaskActivity(`Chunk ${chunk.chunkId} done in ${dt.toFixed(0)}ms`);
-    const base64 = btoa(String.fromCharCode(...resultBytes));
-    socket.emit('workload:chunk_done', {
-      parentId: chunk.parentId,
-      chunkId: chunk.chunkId,
-      chunkOrderIndex: chunk.chunkOrderIndex,
-      result: base64,
-      processingTime: dt
-    });
-  } catch (err) {
-    logTaskActivity(`Chunk error: ${err.message}`, 'error');
-    socket.emit('workload:chunk_error', {
-      parentId: chunk.parentId,
-      chunkId: chunk.chunkId,
-      message: err.message
-    });
-  } finally {
-    state.isComputingChunk = false;
-    state.currentTask = null;
-    updateComputationStatusDisplay();
-    requestMatrixTask();
-  }
-});
-*/
-socket.on('workloads:list_update', all => {
-  if (IS_HEADLESS) return;
-
-  // clear out the grid
-  elements.activeWgslWorkloadsGrid.innerHTML = '';
-
-  if (!all.length) {
-    elements.activeWgslWorkloadsGrid.innerHTML = '<p>No WGSL workloads.</p>';
-    return;
-  }
-
-  all.forEach(wl => {
-    const card = document.createElement('div');
-    card.className = `wgsl-card status-${wl.status}`;
-    card.id = `wgsl-card-${wl.id}`;
-
-    // Build the inner HTML, including status, optional elapsed time, and Remove button
-    let html = `
-      <h4>${wl.label} (${wl.id.substring(0,6)})${wl.isChunkParent?' (Chunked)':''}</h4>
-      <p>Status: ${wl.status}</p>
-    `;
-
-    // If complete, show total wall-clock
-    if (wl.status === 'complete' && wl.startedAt && wl.completedAt) {
-      const elapsedMs = wl.completedAt - wl.startedAt;
-      html += `<p><small>Completed in ${(elapsedMs/1000).toFixed(2)} s (incl. dispatch & collection)</small></p>`;
-    }
-
-    // Add the Remove button
-    html += `
-      <div class="wgsl-card-actions">
-        <button class="remove-wgsl-button danger" data-workload-id="${wl.id}">
-          Remove (X)
-        </button>
-      </div>
-    `;
-
-    card.innerHTML = html;
-    elements.activeWgslWorkloadsGrid.appendChild(card);
-
-    // Wire up the click handler
-    card.querySelector('.remove-wgsl-button').addEventListener('click', () => {
-      const id = wl.id;
-      if (confirm(`Remove workload "${wl.label}" (ID ${id.substring(0,6)})?`)) {
-        socket.emit('admin:removeCustomWorkload', { workloadId: id });
-      }
-    });
-  });
-});
-
-
-socket.on('workload:new', async meta => {
-  console.log(`[HEADLESS] Received WGSL workload: ${meta.id}`);
-
-  if (meta.isChunkParent) return;
-  if (state.isComputingMatrix || state.isComputingWgsl || state.isComputingChunk) {
-    console.log(`[HEADLESS] Busy, rejecting workload`);
-    socket.emit('workload:error', { id: meta.id, message: 'Busy' });
-    return;
-  }
-  if (!state.device) {
-    console.log(`[HEADLESS] No GPU device available`);
-    socket.emit('workload:error', { id: meta.id, message: 'No GPU' });
-    return;
-  }
-
-  state.isComputingWgsl = true;
-  state.currentTask = meta;
-  updateComputationStatusDisplay();
-  console.log(`[HEADLESS] Processing WGSL ${meta.label}`);
-
-  try {
-    const t0 = performance.now();
-    console.log(`[HEADLESS] Creating shader module...`);
-    const shader = state.device.createShaderModule({ code: meta.wgsl });
-
-    console.log(`[HEADLESS] Getting compilation info...`);
-    const ci = await shader.getCompilationInfo();
-    if (ci.messages.some(m => m.type === 'error')) {
-      const errors = ci.messages.filter(m=>m.type==='error').map(m=>m.message).join('\n');
-      console.error(`[HEADLESS] Shader compilation errors: ${errors}`);
-      throw new Error(errors);
-    }
-
-    console.log(`[HEADLESS] Creating compute pipeline...`);
-    // ... rest of the code ...
-
-    console.log(`[HEADLESS] WGSL complete, sending result`);
-    socket.emit('workload:done', { id: meta.id, result: resultBase64, processingTime: dt });
-  } catch (err) {
-    console.error(`[HEADLESS] WGSL error: ${err.message}`, err);
-    socket.emit('workload:error', { id: meta.id, message: err.message });
-  } finally {
-    state.isComputingWgsl = false;
-    state.currentTask = null;
-    updateComputationStatusDisplay();
-  }
-});
-
 socket.on('workload:complete', data => {
-  logTaskActivity(`Workload ${data.label||data.id} complete!`, 'success');
+  if (data.enhanced) {
+    logTaskActivity(`✅ Enhanced workload ${data.label} complete! (${data.stats?.chunkingStrategy}/${data.stats?.assemblyStrategy})`, 'success');
+
+    if (data.stats) {
+      logTaskActivity(`   Strategy: ${data.stats.chunkingStrategy} → ${data.stats.assemblyStrategy}`, 'info');
+      logTaskActivity(`   Chunks: ${data.stats.totalChunks}`, 'info');
+    }
+  } else {
+    logTaskActivity(`Workload ${data.label||data.id} complete!`, 'success');
+  }
 });
 
 socket.on('workload:parent_started', data => {
@@ -1356,23 +1311,6 @@ elements.startQueuedWgslButton.addEventListener('click', () => {
   logAdminActivity('Starting queued WGSL…', 'wgsl');
   socket.emit('admin:startQueuedCustomWorkloads');
 });
-
-async function init() {
-  if (IS_HEADLESS) {
-    document.documentElement.style.display = 'none';
-    console.log(`Headless worker ${WORKER_ID}`);
-  }
-  await initWebGPU();
-  updateComputationStatusDisplay();
-  if (IS_HEADLESS) {
-    joinComputation();
-  } else {
-    if (new URLSearchParams(location.search).has('admin')) {
-      elements.adminPanel.style.display = 'block';
-    }
-  }
-}
-
 
 const style = document.createElement('style');
 style.textContent = `

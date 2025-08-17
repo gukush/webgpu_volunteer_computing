@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// submit-task.mjs - Multi-framework extension
+// submit-task.mjs - Multi-framework extension with enhanced chunking system
 import fs from 'fs/promises';
 import path from 'path';
 import { fileURLToPath } from 'url';
@@ -17,62 +17,90 @@ const SUPPORTED_FRAMEWORKS = {
 
 function printHelp() {
   console.log(`
+Multi-Framework Volunteer Computing Task Submission
+
 Usage:
-  node submit-task.mjs matrix --size <int> --chunk <int> [--host https://localhost:3000]
-  node submit-task.mjs compute --framework <framework> --kernel <file> --label <name> --workgroups <x,y,z> --output-size <bytes> [options...] [--host https://localhost:3000]
-  node submit-task.mjs wgsl --wgsl <file.wgsl> --label <name> --workgroups <x,y,z> --output-size <bytes> [options...] [--host https://localhost:3000]
-  node submit-task.mjs compute-start [--host https://localhost:3000]
-  node submit-task.mjs set-k --k <int> [--host https://localhost:3000]
+  # Traditional commands
+  node submit-task.mjs matrix --size <int> --chunk <int> [--host <url>]
+  node submit-task.mjs compute --framework <fw> --kernel <file> --label <name> --workgroups <x,y,z> --output-size <bytes> [options...]
+  node submit-task.mjs wgsl --wgsl <file.wgsl> --label <name> --workgroups <x,y,z> --output-size <bytes> [options...]
+
+  # Enhanced commands (new)
+  node submit-task.mjs compute-advanced --framework <fw> --kernel <file> --chunking <strategy> --assembly <strategy> --metadata <json> [options...]
+  node submit-task.mjs matrix-tiled --size <int> --tile-size <int> [--label <name>]
+  node submit-task.mjs sort --algorithm <alg> --array-size <int> [--chunk-size <int>] [--input <file>]
+  node submit-task.mjs strategy-upload --type <chunking|assembly> --name <name> --file <strategy.js>
+  node submit-task.mjs strategies-list
+  node submit-task.mjs frameworks
+
+  # System commands
+  node submit-task.mjs compute-start
+  node submit-task.mjs set-k --k <int>
+  node submit-task.mjs workloads-rm --id <workloadId>
 
 Frameworks:
   ${Object.keys(SUPPORTED_FRAMEWORKS).join(', ')}
 
-Compute Command Options:
-  --framework <framework>     Computing framework to use (required)
+Enhanced Compute Options:
+  --framework <framework>     Computing framework (required)
   --kernel <file>            Kernel source file (required)
-  --label <name>             Human-readable label for the workload
-  --workgroups <x,y,z>       Workgroup dispatch dimensions
-  --output-size <bytes>      Expected total output buffer size in bytes
-  --entry <name>             Kernel entry point function name
-  --bind <layout>            Buffer binding layout convention
-  --input <file.bin>         Input data file (binary)
-  --compilation-opts <json>  Framework-specific compilation options
+  --chunking <strategy>      Chunking strategy name or .js file (required)
+  --assembly <strategy>      Assembly strategy name or .js file (required)
+  --metadata <json>          Strategy-specific metadata (required)
+  --label <name>             Human-readable label
+  --input <file>             Input data file (binary, required for chunking)
+  --compilation-opts <json>  Framework-specific options
 
-Chunking Options (for large workloads):
+Built-in Strategies:
+  Chunking: linear, matrix_tiled, bitonic_sort
+  Assembly: linear_assembly, matrix_tiled_assembly
+
+Sorting Algorithms:
+  bitonic    - Bitonic sort (requires power-of-2 array size)
+  odd-even   - Odd-even sort (any size, often faster convergence)
+  sample     - Sample sort (good for very large arrays)
+
+Examples:
+  # Enhanced tiled matrix multiplication
+  node submit-task.mjs matrix-tiled --size 1024 --tile-size 64 --label "Large Matrix"
+
+  # Custom chunking strategy upload
+  node submit-task.mjs strategy-upload --type chunking --name my_chunking --file ./my_strategy.js
+
+  # Advanced workload with custom strategies
+  node submit-task.mjs compute-advanced \\
+    --framework webgpu \\
+    --kernel ./image_blur.wgsl \\
+    --chunking image_tiled \\
+    --assembly image_tiled_assembly \\
+    --metadata '{"imageWidth": 1920, "imageHeight": 1080, "tileSize": 128}' \\
+    --input ./image_data.bin \\
+    --label "Image Blur Processing"
+
+  # Multi-framework support
+  node submit-task.mjs compute-advanced \\
+    --framework cuda \\
+    --kernel ./fluid_sim.cu \\
+    --chunking ./custom_chunking.js \\
+    --assembly ./custom_assembly.js \\
+    --metadata '{"gridSize": 512, "timeSteps": 100}' \\
+    --input ./initial_conditions.bin \\
+    --compilation-opts '{"deviceId": 0, "computeCapability": "7.5"}'
+
+  # Iterative sorting
+  node submit-task.mjs sort --algorithm bitonic --array-size 2048 --chunk-size 64
+
+  # List available strategies and frameworks
+  node submit-task.mjs strategies-list
+  node submit-task.mjs frameworks
+
+Chunking Options (traditional):
   --chunkable                Enable input chunking
   --chunk-type <type>        Chunking type: elements|bytes
   --chunk-size <n>           Size per chunk
   --chunk-output-size <bytes> Output size per chunk (required for chunking)
   --elem-size <bytes>        Element size in bytes (for element chunking)
   --agg <method>             Output aggregation method: concatenate
-
-Examples:
-  # WebGPU compute shader
-  node submit-task.mjs compute --framework webgpu --kernel ./mandelbrot.wgsl --label "Mandelbrot" --workgroups 64,1,1 --output-size 1048576
-
-  # CUDA kernel
-  node submit-task.mjs compute --framework cuda --kernel ./vecadd.cu --label "Vector Add" --workgroups 1024,1,1 --output-size 4096 --input ./data.bin
-
-  # OpenCL with chunking
-  node submit-task.mjs compute --framework opencl --kernel ./process.cl --label "Data Processing" --workgroups 256,1,1 --output-size 8192 --input ./large_data.bin --chunkable --chunk-type elements --chunk-size 1024 --chunk-output-size 512 --elem-size 4
-
-  # WebGL compute
-  node submit-task.mjs compute --framework webgl --kernel ./shader.glsl --label "WebGL Compute" --workgroups 32,32,1 --output-size 2048
-
-  # Vulkan compute
-  node submit-task.mjs compute --framework vulkan --kernel ./compute.comp --label "Vulkan Compute" --workgroups 128,1,1 --output-size 4096 --compilation-opts '{"spirvVersion": "1.5"}'
-
-  # Legacy WGSL command (backward compatibility)
-  node submit-task.mjs wgsl --wgsl ./mandelbrot.wgsl --label "Mandelbrot" --workgroups 64,1,1 --output-size 1048576
-
-  # Matrix multiplication
-  node submit-task.mjs matrix --size 512 --chunk 32
-
-  # Set redundancy factor
-  node submit-task.mjs set-k --k 2
-
-  # Start all queued compute workloads
-  node submit-task.mjs compute-start
 `);
 }
 
@@ -101,6 +129,15 @@ async function postJSON(url, body) {
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(body)
   });
+  if (!res.ok) {
+    const text = await res.text();
+    throw new Error(`${res.status} ${res.statusText}: ${text}`);
+  }
+  return res.json();
+}
+
+async function getJSON(url) {
+  const res = await fetch(url);
   if (!res.ok) {
     const text = await res.text();
     throw new Error(`${res.status} ${res.statusText}: ${text}`);
@@ -156,6 +193,67 @@ async function parseCompilationOptions(optsString) {
   }
 }
 
+// Enhanced helper functions
+async function readStrategyFile(filePath, strategyType) {
+  try {
+    const resolvedPath = path.resolve(filePath);
+    const strategyCode = await fs.readFile(resolvedPath, 'utf8');
+
+    if (!strategyCode.includes('class') || !strategyCode.includes('extends')) {
+      console.warn(`Warning: ${filePath} doesn't appear to contain a class extending Base${strategyType === 'chunking' ? 'Chunking' : 'Assembly'}Strategy`);
+    }
+
+    return strategyCode;
+  } catch (err) {
+    console.error(`Failed to read strategy file ${filePath}: ${err.message}`);
+    process.exit(1);
+  }
+}
+
+async function parseJSON(jsonString, context) {
+  if (!jsonString) return {};
+
+  try {
+    return JSON.parse(jsonString);
+  } catch (err) {
+    console.error(`Invalid ${context} JSON: ${err.message}`);
+    process.exit(1);
+  }
+}
+
+async function resolveStrategy(strategyInput, strategyType, base) {
+  if (strategyInput.endsWith('.js')) {
+    console.log(`Will upload custom ${strategyType} strategy from ${strategyInput}...`);
+    return `custom_${path.basename(strategyInput, '.js')}_${Date.now()}`;
+  } else {
+    return strategyInput;
+  }
+}
+
+async function generateTestData(arraySize, outputFile, dataType = 'float32') {
+  console.log(`Generating ${arraySize} ${dataType} test values...`);
+
+  let buffer;
+
+  if (dataType === 'float32') {
+    const testArray = new Float32Array(arraySize);
+    for (let i = 0; i < arraySize; i++) {
+      testArray[i] = Math.random() * 1000;
+    }
+    buffer = Buffer.from(testArray.buffer);
+  } else if (dataType === 'int32') {
+    const testArray = new Int32Array(arraySize);
+    for (let i = 0; i < arraySize; i++) {
+      testArray[i] = Math.floor(Math.random() * 1000);
+    }
+    buffer = Buffer.from(testArray.buffer);
+  }
+
+  await fs.writeFile(outputFile, buffer);
+  console.log(`Test data written to ${outputFile}`);
+  return buffer;
+}
+
 async function main() {
   const [, , cmd, ...rest] = process.argv;
   const args = parseArgs(rest);
@@ -163,6 +261,7 @@ async function main() {
 
   if (!cmd || args.help || args.h) return printHelp();
 
+  // Traditional commands
   if (cmd === 'matrix') {
     const size = parseInt(args.size, 10);
     const chunk = parseInt(args.chunk, 10);
@@ -182,6 +281,234 @@ async function main() {
       process.exit(1);
     }
     const out = await postJSON(`${base}/api/system/k`, { k });
+    console.log(JSON.stringify(out, null, 2));
+    return;
+  }
+
+  // Enhanced: Matrix tiled computation
+  if (cmd === 'matrix-tiled') {
+    const size = parseInt(args.size, 10);
+    const tileSize = parseInt(args['tile-size'], 10);
+
+    if (!Number.isInteger(size) || !Number.isInteger(tileSize)) {
+      console.error('matrix-tiled: --size and --tile-size are required integers');
+      process.exit(1);
+    }
+
+    if (tileSize > size) {
+      console.error('matrix-tiled: --tile-size cannot be larger than --size');
+      process.exit(1);
+    }
+
+    const label = args.label || `Tiled Matrix ${size}×${size} (${tileSize}×${tileSize} tiles)`;
+
+    const out = await postJSON(`${base}/api/matrix/tiled-advanced`, {
+      matrixSize: size,
+      tileSize: tileSize,
+      label: label
+    });
+    console.log(JSON.stringify(out, null, 2));
+    return;
+  }
+
+  // Enhanced: Strategy upload
+  if (cmd === 'strategy-upload') {
+    const type = args.type;
+    const name = args.name;
+    const filePath = args.file;
+
+    if (!type || !['chunking', 'assembly'].includes(type)) {
+      console.error('strategy-upload: --type must be "chunking" or "assembly"');
+      process.exit(1);
+    }
+
+    if (!name) {
+      console.error('strategy-upload: --name is required');
+      process.exit(1);
+    }
+
+    if (!filePath) {
+      console.error('strategy-upload: --file is required');
+      process.exit(1);
+    }
+
+    const strategyCode = await readStrategyFile(filePath, type);
+
+    try {
+      const out = await postJSON(`${base}/api/strategies/register`, {
+        strategyCode,
+        type,
+        name
+      });
+      console.log(JSON.stringify(out, null, 2));
+    } catch (err) {
+      console.error('Failed to upload strategy:', err.message);
+      process.exit(1);
+    }
+    return;
+  }
+
+  // Enhanced: List strategies
+  if (cmd === 'strategies-list') {
+    try {
+      const out = await getJSON(`${base}/api/strategies`);
+      console.log(JSON.stringify(out, null, 2));
+    } catch (err) {
+      console.error('Failed to fetch strategies:', err.message);
+      process.exit(1);
+    }
+    return;
+  }
+
+  // Enhanced: Advanced compute workload
+  if (cmd === 'compute-advanced') {
+    const framework = args.framework;
+    if (!framework) {
+      console.error('compute-advanced: --framework is required');
+      console.error(`Supported frameworks: ${Object.keys(SUPPORTED_FRAMEWORKS).join(', ')}`);
+      process.exit(1);
+    }
+
+    await validateFramework(framework);
+
+    if (!args.kernel) {
+      console.error('compute-advanced: --kernel <file> is required');
+      process.exit(1);
+    }
+
+    if (!args.chunking) {
+      console.error('compute-advanced: --chunking <strategy> is required');
+      process.exit(1);
+    }
+
+    if (!args.assembly) {
+      console.error('compute-advanced: --assembly <strategy> is required');
+      process.exit(1);
+    }
+
+    if (!args.metadata) {
+      console.error('compute-advanced: --metadata <json> is required');
+      process.exit(1);
+    }
+
+    if (!args.input) {
+      console.error('compute-advanced: --input <file> is required for advanced chunked workloads');
+      process.exit(1);
+    }
+
+    const kernel = await readKernelFile(args.kernel, framework);
+    const metadata = await parseJSON(args.metadata, 'metadata');
+    const compilationOptions = await parseJSON(args['compilation-opts'], 'compilation options');
+
+    const chunkingStrategy = await resolveStrategy(args.chunking, 'chunking', base);
+    const assemblyStrategy = await resolveStrategy(args.assembly, 'assembly', base);
+
+    // Handle different input formats
+    let inputData;
+    try {
+      if (args.input.endsWith('.json')) {
+        // Multi-input JSON format
+        const inputContent = await fs.readFile(path.resolve(args.input), 'utf8');
+        inputData = inputContent;
+      } else {
+        // Binary input file
+        const inputBuffer = await fs.readFile(path.resolve(args.input));
+        inputData = inputBuffer.toString('base64');
+      }
+    } catch (err) {
+      console.error(`Failed to read input file ${args.input}: ${err.message}`);
+      process.exit(1);
+    }
+
+    const label = args.label || `Advanced ${framework.toUpperCase()} Workload`;
+    const entry = args.entry || SUPPORTED_FRAMEWORKS[framework].defaultEntry;
+
+    const payload = {
+      label,
+      chunkingStrategy,
+      assemblyStrategy,
+      framework,
+      input: inputData,
+      metadata: {
+        ...metadata,
+        customShader: kernel,
+        entry,
+        compilationOptions
+      }
+    };
+
+    // Add custom strategy files if provided
+    if (args.chunking.endsWith('.js')) {
+      payload.customChunkingFile = await readStrategyFile(args.chunking, 'chunking');
+    }
+
+    if (args.assembly.endsWith('.js')) {
+      payload.customAssemblyFile = await readStrategyFile(args.assembly, 'assembly');
+    }
+
+    console.log(`Submitting advanced workload with strategies: ${chunkingStrategy} → ${assemblyStrategy}`);
+
+    try {
+      const out = await postJSON(`${base}/api/workloads/advanced`, payload);
+      console.log(JSON.stringify(out, null, 2));
+    } catch (err) {
+      console.error('Failed to submit advanced workload:', err.message);
+      process.exit(1);
+    }
+    return;
+  }
+
+  // Enhanced: Iterative sorting
+  if (cmd === 'sort') {
+    const algorithm = args.algorithm;
+    const arraySize = parseInt(args['array-size'], 10);
+    const chunkSize = parseInt(args['chunk-size'] || '64', 10);
+
+    if (!algorithm || !['bitonic', 'odd-even', 'sample'].includes(algorithm)) {
+      console.error('sort: --algorithm must be bitonic, odd-even, or sample');
+      process.exit(1);
+    }
+
+    if (!Number.isInteger(arraySize) || arraySize <= 0) {
+      console.error('sort: --array-size must be positive integer');
+      process.exit(1);
+    }
+
+    if (algorithm === 'bitonic' && (arraySize & (arraySize - 1)) !== 0) {
+      console.error('sort: bitonic sort requires power-of-2 array size');
+      process.exit(1);
+    }
+
+    let inputData;
+    if (args.input) {
+      const buf = await fs.readFile(path.resolve(args.input));
+      inputData = buf.toString('base64');
+    } else {
+      console.log('No input file provided, generating random test data...');
+      const testBuffer = await generateTestData(arraySize, `test_array_${arraySize}.bin`);
+      inputData = testBuffer.toString('base64');
+    }
+
+    const strategyMap = {
+      'bitonic': 'bitonic_sort',
+      'odd-even': 'odd_even_sort',
+      'sample': 'sample_sort'
+    };
+
+    const payload = {
+      label: args.label || `${algorithm} sort ${arraySize} elements`,
+      chunkingStrategy: strategyMap[algorithm],
+      assemblyStrategy: 'linear_assembly',
+      framework: 'webgpu',
+      input: inputData,
+      metadata: {
+        arraySize,
+        chunkSize,
+        algorithm
+      }
+    };
+
+    const out = await postJSON(`${base}/api/workloads/iterative`, payload);
     console.log(JSON.stringify(out, null, 2));
     return;
   }
