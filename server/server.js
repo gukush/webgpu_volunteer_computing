@@ -1,4 +1,4 @@
-// server.js - Complete Enhanced Version
+// server.js - Complete Enhanced Version (modified for checksum + strict K-of-N verification)
 import express from 'express';
 import fs from 'fs';
 import path from 'path';
@@ -30,6 +30,22 @@ function checksumMatrixRowsFloat32LE(rows) {
     }
   }
   return sha256Hex(buf);
+}
+
+function tallyKByChecksum(submissions, expectedByteLength, k) {
+  const voteMap = new Map(); // checksum -> Set(clientId)
+  for (const s of submissions) {
+    const sizeOk = (expectedByteLength == null) || (s.byteLength === expectedByteLength);
+    const selfConsistent = s.serverChecksum && (s.serverChecksum === s.reportedChecksum);
+    if (sizeOk && selfConsistent) {
+      if (!voteMap.has(s.serverChecksum)) voteMap.set(s.serverChecksum, new Set());
+      voteMap.get(s.serverChecksum).add(s.clientId); // same client counted once
+    }
+  }
+  for (const [chk, voters] of voteMap.entries()) {
+    if (voters.size >= k) return { ok: true, winningChecksum: chk, voters };
+  }
+  return { ok: false };
 }
 
 function checksumFromBase64(base64) {
@@ -1060,7 +1076,7 @@ io.on('connection', socket => {
     client.isBusyWithMatrixTask = false;
     client.lastActive = Date.now();
 
-    const { assignmentId, taskId, result: received, processingTime } = data;
+    const { assignmentId, taskId, result: received, processingTime, reportedChecksum } = data;
     const inst = matrixState.activeTasks.get(assignmentId);
     if (!inst || inst.logicalTaskId !== taskId || inst.assignedTo !== socket.id) {
       return;
@@ -1070,33 +1086,44 @@ io.on('connection', socket => {
     const tdef = matrixState.tasks.find(t => t.id === taskId);
     if (!tdef || tdef.status === 'completed') return;
 
+    const serverChecksum = checksumMatrixRowsFloat32LE(received);
+
+    // store the submission (now also tracking checksums)
     if (!matrixResultBuffer.has(taskId)) matrixResultBuffer.set(taskId, []);
     matrixResultBuffer.get(taskId).push({
       clientId: socket.id,
       result: received,
       processingTime,
-      submissionTime: Date.now()
+      submissionTime: Date.now(),
+      // NEW fields
+      reportedChecksum: reportedChecksum,
+      serverChecksum
     });
 
+    // tally votes by checksum (distinct clients; require self-consistency)
     const entries = matrixResultBuffer.get(taskId);
-    const counts = entries.reduce((acc, e) => {
-      const k = JSON.stringify(e.result);
-      acc[k] = (acc[k] || 0) + 1;
-      return acc;
-    }, {});
+    const tally = tallyKByChecksum(
+      entries.map(e => ({
+        clientId: e.clientId,
+        serverChecksum: e.serverChecksum,
+        reportedChecksum: e.reportedChecksum
+      })),
+      /* expectedByteLength */ undefined,  // size implicit in Float32 packing
+      ADMIN_K_PARAMETER
+    );
 
     let verified = false;
     let finalData = null;
     let contributors = [];
-
-    for (const [k, c] of Object.entries(counts)) {
-      if (c >= ADMIN_K_PARAMETER) {
-        verified = true;
-        finalData = JSON.parse(k);
-        contributors = entries.filter(e => JSON.stringify(e.result) === k).map(e => e.clientId);
-        break;
-      }
+    if (tally.ok) {
+      // pick a representative result from the winning checksum bucket
+      const winner = entries.find(e => e.serverChecksum === tally.winningChecksum);
+      finalData = winner?.result;
+      contributors = Array.from(tally.voters).slice(0, ADMIN_K_PARAMETER);
+      verified = !!finalData;
     }
+
+    // (old 'counts' loop removed — we now rely on the checksum tally)
 
     if (verified) {
       const ok = processMatrixTaskResult(taskId, finalData, contributors.slice(0, ADMIN_K_PARAMETER));
@@ -1112,7 +1139,7 @@ io.on('connection', socket => {
     }
   });
 
-  socket.on('workload:done', ({ id, result, processingTime }) => {
+  socket.on('workload:done', ({ id, result, processingTime, reportedChecksum }) => {
     const wl = customWorkloads.get(id);
     if (!wl || wl.isChunkParent) {
       socket.emit('workload:error', { id, message: 'Invalid workload ID or is chunk parent.' });
@@ -1122,20 +1149,37 @@ io.on('connection', socket => {
     if (client) client.isBusyWithNonChunkedWGSL = false;
 
     wl.activeAssignments.delete(socket.id);
-    wl.results.push({ clientId: socket.id, result, submissionTime: Date.now(), processingTime });
+
+    const { serverChecksum, byteLength } = checksumFromBase64(result);
+    wl.results.push({
+      clientId: socket.id,
+      result, // base64 payload
+      submissionTime: Date.now(),
+      processingTime,
+      // NEW fields
+      reportedChecksum: reportedChecksum, // from payload
+      serverChecksum,
+      byteLength
+    });
     wl.processingTimes.push({ clientId: socket.id, timeMs: processingTime });
 
-    const counts = wl.results.reduce((acc, e) => {
-      acc[e.result] = (acc[e.result] || 0) + 1;
-      return acc;
-    }, {});
-    let verifiedKey = null;
-    for (const [k, c] of Object.entries(counts)) {
-      if (c >= ADMIN_K_PARAMETER) { verifiedKey = k; break; }
-    }
-    if (verifiedKey) {
+    // Verify by checksum with K unique voters; also check size if wl.outputSize exists
+    const expected = wl.outputSize; // may be undefined
+    const tally = tallyKByChecksum(
+      wl.results.map(r => ({
+        clientId: r.clientId,
+        serverChecksum: r.serverChecksum,
+        reportedChecksum: r.reportedChecksum,
+        byteLength: r.byteLength
+      })),
+      expected,
+      ADMIN_K_PARAMETER
+    );
+
+    if (tally.ok) {
+      const winner = wl.results.find(r => r.serverChecksum === tally.winningChecksum);
       wl.status = 'complete';
-      wl.finalResult = Array.from(Buffer.from(verifiedKey, 'base64'));
+      wl.finalResult = Array.from(Buffer.from(winner.result, 'base64'));
       wl.completedAt = Date.now();
       console.log(`✅ WGSL workload ${id} VERIFIED & COMPLETE.`);
       io.emit('workload:complete', { id, label: wl.label, finalResult: wl.finalResult });
@@ -1148,7 +1192,7 @@ io.on('connection', socket => {
   });
 
   // Enhanced: Handle enhanced chunk completion
-  socket.on('workload:chunk_done_enhanced', ({ parentId, chunkId, result, processingTime, strategy, metadata }) => {
+  socket.on('workload:chunk_done_enhanced', ({ parentId, chunkId, result, processingTime, strategy, metadata, reportedChecksum }) => {
     const client = matrixState.clients.get(socket.id);
     if (client) client.isBusyWithCustomChunk = false;
 
@@ -1156,45 +1200,89 @@ io.on('connection', socket => {
     const chunkStore = customWorkloadChunks.get(parentId);
 
     if (workloadState && chunkStore && chunkStore.enhanced) {
-      const assemblyResult = chunkingManager.handleChunkCompletion(
-        parentId,
-        chunkId,
-        result,
-        processingTime
-      );
+      // Find the chunk descriptor
+      const cd = chunkStore.allChunkDefs.find(c => c.chunkId === chunkId);
+      if (!cd) {
+        console.warn(`Enhanced chunk ${chunkId} not found in store for parent ${parentId}`);
+        return;
+      }
 
-      if (assemblyResult.success && assemblyResult.status === 'complete') {
-        workloadState.status = 'complete';
-        workloadState.finalResult = assemblyResult.finalResult.data;
-        workloadState.completedAt = Date.now();
-        workloadState.assemblyStats = assemblyResult.stats;
+      // Compute server checksum and record submission, then try to verify using shared helper.
+      let checksumData;
+      try {
+        checksumData = checksumFromBase64(result);
+      } catch (err) {
+        console.error(`Enhanced chunk ${chunkId} from ${socket.id} invalid base64`);
+        return;
+      }
 
-        customWorkloadChunks.delete(parentId);
+      const submission = {
+        clientId: socket.id,
+        result_base64: result,
+        processingTime,
+        reportedChecksum: reportedChecksum,
+        serverChecksum: checksumData.serverChecksum,
+        byteLength: checksumData.byteLength
+      };
 
-        console.log(`✅ Enhanced workload ${parentId} completed with ${assemblyResult.stats.chunkingStrategy}/${assemblyResult.stats.assemblyStrategy}`);
+      const verifyRes = verifyAndRecordChunkSubmission(workloadState, chunkStore, cd, submission, cd.chunkOrderIndex, ADMIN_K_PARAMETER);
 
-        io.emit('workload:complete', {
-          id: parentId,
-          label: workloadState.label,
-          finalResult: Array.from(Buffer.from(assemblyResult.finalResult.data, 'base64')),
-          enhanced: true,
-          stats: assemblyResult.stats
-        });
+      // If verification succeeded, hand the verified chunk to chunkingManager for its assembly logic.
+      if (verifyRes.verified) {
+        // Use the verified_result_base64 as the canonical chunk payload
+        const verifiedBase64 = cd.verified_result_base64;
+        const assemblyResult = chunkingManager.handleChunkCompletion(
+          parentId,
+          chunkId,
+          verifiedBase64,
+          processingTime
+        );
 
+        if (assemblyResult.success && assemblyResult.status === 'complete') {
+          workloadState.status = 'complete';
+          workloadState.finalResult = assemblyResult.finalResult.data;
+          workloadState.completedAt = Date.now();
+          workloadState.assemblyStats = assemblyResult.stats;
+
+          customWorkloadChunks.delete(parentId);
+
+          console.log(`✅ Enhanced workload ${parentId} completed with ${assemblyResult.stats.chunkingStrategy}/${assemblyResult.stats.assemblyStrategy}`);
+
+          io.emit('workload:complete', {
+            id: parentId,
+            label: workloadState.label,
+            finalResult: Array.from(Buffer.from(assemblyResult.finalResult.data, 'base64')),
+            enhanced: true,
+            stats: assemblyResult.stats
+          });
+
+          saveCustomWorkloads();
+          broadcastCustomWorkloadList();
+        } else if (!assemblyResult.success) {
+          console.error(`Enhanced chunk processing failed: ${assemblyResult.error}`);
+          workloadState.status = 'error';
+          workloadState.error = assemblyResult.error;
+          saveCustomWorkloads();
+          broadcastCustomWorkloadList();
+        } else {
+          // Partial success - assembly not complete yet.
+          workloadState.status = 'processing_chunks';
+          saveCustomWorkloads();
+          broadcastCustomWorkloadList();
+        }
+      } else {
+        // Not enough matching submissions yet — leave it to future submissions.
+        workloadState.status = 'processing_chunks';
         saveCustomWorkloads();
         broadcastCustomWorkloadList();
-      } else if (!assemblyResult.success) {
-        console.error(`Enhanced chunk processing failed: ${assemblyResult.error}`);
-        workloadState.status = 'error';
-        workloadState.error = assemblyResult.error;
       }
     } else {
       // Fall back to regular chunk processing
-      handleRegularChunkCompletion(parentId, chunkId, result, processingTime);
+      handleRegularChunkCompletion(parentId, chunkId, result, processingTime, reportedChecksum);
     }
   });
 
-  socket.on('workload:chunk_done', ({ parentId, chunkId, chunkOrderIndex, result, processingTime }) => {
+  socket.on('workload:chunk_done', ({ parentId, chunkId, chunkOrderIndex, result, processingTime, reportedChecksum }) => {
     const client = matrixState.clients.get(socket.id);
     if (client) client.isBusyWithCustomChunk = false;
     const parent = customWorkloads.get(parentId);
@@ -1205,21 +1293,36 @@ io.on('connection', socket => {
     if (!cd || cd.verified_result_base64 || cd.status === 'completed') return;
 
     cd.activeAssignments.delete(socket.id);
-    try { Buffer.from(result, 'base64'); } catch {
+
+    // Validate base64 and compute checksum
+    let checksumData;
+    try {
+      checksumData = checksumFromBase64(result);
+    } catch (err) {
       console.error(`Invalid base64 for chunk ${chunkId} from ${socket.id}`);
       return;
     }
-    cd.submissions.push({ clientId: socket.id, result_base64: result, processingTime });
+
+    const submission = {
+      clientId: socket.id,
+      result_base64: result,
+      processingTime,
+      reportedChecksum: reportedChecksum,
+      serverChecksum: checksumData.serverChecksum,
+      byteLength: checksumData.byteLength
+    };
+
     parent.processingTimes.push({ clientId: socket.id, chunkId, timeMs: processingTime });
 
-    if (cd.submissions.length >= ADMIN_K_PARAMETER && !cd.verified_result_base64) {
-      const firstResult = cd.submissions[0].result_base64;
-      cd.verified_result_base64 = firstResult;
-      cd.status = 'completed';
-      store.completedChunksData.set(chunkOrderIndex, Buffer.from(firstResult, 'base64'));
-      console.log(`Chunk ${chunkId} accepted after ${ADMIN_K_PARAMETER} submissions (${store.completedChunksData.size}/${store.expectedChunks})`);
+    // Use shared verification helper
+    const verifyRes = verifyAndRecordChunkSubmission(parent, store, cd, submission, chunkOrderIndex, ADMIN_K_PARAMETER);
+
+    if (verifyRes.verified) {
+      console.log(`Chunk ${chunkId} VERIFIED by K=${ADMIN_K_PARAMETER} (checksum ${verifyRes.winningChecksum.slice(0,8)}…) ` +
+                  `(${store.completedChunksData.size}/${store.expectedChunks})`);
     }
 
+    // After per-chunk verification, aggregation will happen if all chunks are present.
     if (
       !parent.finalResult &&
       store.completedChunksData.size === store.expectedChunks
@@ -1245,9 +1348,121 @@ io.on('connection', socket => {
     broadcastCustomWorkloadList();
   });
 
-  function handleRegularChunkCompletion(parentId, chunkId, result, processingTime) {
-    // Handle regular chunk completion logic here
-    // This is your existing chunk completion logic
+  function verifyAndRecordChunkSubmission(parent, store, cd, submission, chunkOrderIndex, k) {
+    // defensive early return if already verified
+    if (cd.verified_result_base64) {
+      return { verified: true, winningChecksum: cd._winningChecksum || null, winnerSubmission: null };
+    }
+
+    // append submission if not already present from same client + checksum
+    // (avoid double-pushing identical entries)
+    if (!cd.submissions) cd.submissions = [];
+    const dup = cd.submissions.some(s => s.clientId === submission.clientId && s.serverChecksum === submission.serverChecksum);
+    if (!dup) cd.submissions.push(submission);
+
+    // compute expected size: prefer per-chunk descriptor, fallback to parent-level hint
+    const expectedSize = (cd.outputSize != null) ? cd.outputSize : parent.chunkOutputSize;
+
+    // run the generic tally routine
+    const tallyResult = tallyKByChecksum(
+      cd.submissions.map(s => ({
+        clientId: s.clientId,
+        serverChecksum: s.serverChecksum,
+        reportedChecksum: s.reportedChecksum,
+        byteLength: s.byteLength
+      })),
+      expectedSize,
+      k
+    );
+
+    if (!tallyResult.ok) {
+      // Not yet reached K matching, nothing to change
+      return { verified: false, winningChecksum: null, winnerSubmission: null };
+    }
+
+    // If we reach here, a checksum has K distinct voters and we must mark chunk verified.
+    const winningChecksum = tallyResult.winningChecksum;
+
+    // Avoid race: if another request verified between our tally and now, respect it.
+    if (cd.verified_result_base64) {
+      return { verified: true, winningChecksum: cd._winningChecksum || winningChecksum, winnerSubmission: null };
+    }
+
+    // find a submission object that matches the winning checksum
+    const winner = cd.submissions.find(s => s.serverChecksum === winningChecksum);
+    if (!winner) {
+      // Unlikely, but defensive
+      return { verified: false, winningChecksum: null, winnerSubmission: null };
+    }
+
+    // mark verified, persist winner base64 and store buffer for assembly
+    cd.verified_result_base64 = winner.result_base64;
+    cd.status = 'completed';
+    cd._winningChecksum = winningChecksum; // keep for debugging / idempotence
+
+    // store buffer for assembly at the chunkOrderIndex
+    if (!store.completedChunksData) store.completedChunksData = new Map();
+    store.completedChunksData.set(chunkOrderIndex, Buffer.from(winner.result_base64, 'base64'));
+
+    return { verified: true, winningChecksum, winnerSubmission: winner };
+  }
+
+
+  function handleRegularChunkCompletion(parentId, chunkId, result, processingTime, reportedChecksum) {
+    // Default regular chunk completion path uses the same verification helper.
+    const parent = customWorkloads.get(parentId);
+    const store = customWorkloadChunks.get(parentId);
+    if (!parent || !store) return;
+
+    const cd = store.allChunkDefs.find(c => c.chunkId === chunkId);
+    if (!cd || cd.verified_result_base64 || cd.status === 'completed') return;
+
+    // Validate base64 and compute checksum
+    let checksumData;
+    try {
+      checksumData = checksumFromBase64(result);
+    } catch (err) {
+      console.error(`Invalid base64 for chunk ${chunkId} in regular handler`);
+      return;
+    }
+
+    const submission = {
+      clientId: 'regular-handler', // anonymous (or could be replaced by actual sender if known)
+      result_base64: result,
+      processingTime,
+      reportedChecksum: reportedChecksum,
+      serverChecksum: checksumData.serverChecksum,
+      byteLength: checksumData.byteLength
+    };
+
+    parent.processingTimes.push({ clientId: submission.clientId, chunkId, timeMs: processingTime });
+
+    const verifyRes = verifyAndRecordChunkSubmission(parent, store, cd, submission, cd.chunkOrderIndex, ADMIN_K_PARAMETER);
+
+    if (verifyRes.verified) {
+      console.log(`Regular chunk ${chunkId} VERIFIED by K=${ADMIN_K_PARAMETER} (checksum ${verifyRes.winningChecksum.slice(0,8)}…) ` +
+                  `(${store.completedChunksData.size}/${store.expectedChunks})`);
+    }
+
+    // If all chunks done, assemble
+    if (!parent.finalResult && store.completedChunksData.size === store.expectedChunks) {
+      parent.status = 'aggregating';
+      parent.finalResult = Array.from(Buffer.concat(
+        Array.from({ length: store.expectedChunks }, (_, i) => store.completedChunksData.get(i))
+      ));
+      parent.status = 'complete';
+      parent.completedAt = Date.now();
+      io.emit('workload:complete', {
+        id: parentId,
+        label: parent.label,
+        finalResult: parent.finalResult
+      });
+      saveCustomWorkloads();
+      broadcastCustomWorkloadList();
+    } else {
+      saveCustomWorkloads();
+      broadcastCustomWorkloadList();
+    }
   }
 
   socket.on('workload:busy', ({ id, reason }) => {

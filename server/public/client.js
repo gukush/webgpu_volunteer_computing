@@ -13,6 +13,33 @@ const state = {
   statistics: { processingTime: 0 }
 };
 
+// === NEW: checksum helpers (browser) ===
+async function sha256HexFromU8(u8) {
+  const view = u8.buffer.slice(u8.byteOffset, u8.byteOffset + u8.byteLength);
+  const digest = await crypto.subtle.digest('SHA-256', view);
+  return Array.from(new Uint8Array(digest)).map(b => b.toString(16).padStart(2, '0')).join('');
+}
+function base64ToU8(b64) {
+  const s = atob(b64);
+  const u8 = new Uint8Array(s.length);
+  for (let i = 0; i < s.length; i++) u8[i] = s.charCodeAt(i);
+  return u8;
+}
+async function checksumBase64(b64) {
+  return sha256HexFromU8(base64ToU8(b64));
+}
+async function checksumMatrixRowsFloat32LE(rows) {
+  const r = rows.length, c = r ? rows[0].length : 0;
+  const buf = new ArrayBuffer(r * c * 4);
+  const view = new DataView(buf);
+  let o = 0;
+  for (let i = 0; i < r; i++) {
+    const row = rows[i];
+    for (let j = 0; j < c; j++) { view.setFloat32(o, row[j], true); o += 4; }
+  }
+  return sha256HexFromU8(new Uint8Array(buf));
+}
+
 // Enhanced: Multi-framework state tracking
 const frameworkState = {
   webgpu: { supported: false, device: null, adapterInfo: null },
@@ -541,10 +568,12 @@ function bindWorkloadListener() {
     (async () => {
       try {
         const { result, processingTime } = await executeFrameworkKernel(meta);
+        const reportedChecksum = await checksumBase64(result);
         socket.emit('workload:done', {
           id: meta.id,
           result,
-          processingTime
+          processingTime,
+          reportedChecksum
         });
       } catch (err) {
         console.error(`[FRAMEWORK] ${framework} workload failed`, err);
@@ -976,10 +1005,14 @@ socket.on('task:assign', async task => {
   if (state.isComputingMatrix || state.isComputingWgsl || state.isComputingChunk) return;
   try {
     const out = await processMatrixTask(task);
+    // === NEW: include reportedChecksum for matrix rows ===
+    const reportedChecksum = await checksumMatrixRowsFloat32LE(out.result);
     socket.emit('task:complete', {
       assignmentId: task.assignmentId,
       taskId: task.id,
-      ...out
+      result: out.result,
+      processingTime: out.processingTime,
+      reportedChecksum
     });
   } catch {}
 });
@@ -1084,6 +1117,9 @@ socket.on('workload:chunk_assign', async chunk => {
       eventData.metadata = chunk.metadata;
     }
 
+    // === NEW: include per-chunk reportedChecksum ===
+    eventData.reportedChecksum = await checksumBase64(result.result);
+
     socket.emit(eventName, eventData);
 
   } catch (err) {
@@ -1147,6 +1183,7 @@ socket.on('workloads:list_update', all => {
   });
 });
 
+// Duplicate 'workload:new' path (non-bindWorkloadListener) — keep in sync with above.
 socket.on('workload:new', async meta => {
   console.log(`[HEADLESS] Received WGSL workload: ${meta.id}, label: ${meta.label}`);
   if (meta.isChunkParent) return;
@@ -1219,7 +1256,10 @@ socket.on('workload:new', async meta => {
     const dt = performance.now() - t0;
     logTaskActivity(`WGSL done in ${dt.toFixed(0)}ms, ${resultBytes.length} bytes`);
     const resultBase64 = btoa(String.fromCharCode(...resultBytes));
-    socket.emit('workload:done', { id: meta.id, result: resultBase64, processingTime: dt });
+
+    // === NEW: include reportedChecksum for whole-workload ===
+    const reportedChecksum = await checksumBase64(resultBase64);
+    socket.emit('workload:done', { id: meta.id, result: resultBase64, processingTime: dt, reportedChecksum });
   } catch (err) {
     logTaskActivity(`WGSL error: ${err.message}`, 'error');
     socket.emit('workload:error', { id: meta.id, message: err.message });
