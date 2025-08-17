@@ -1,0 +1,6 @@
+server/certificates/*
+
+!server/certificates/.gitkeep
+
+server/custom_tasks.json
+*.txt
