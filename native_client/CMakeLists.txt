@@ -258,6 +258,12 @@ if(HAVE_VULKAN)
     message(STATUS "Created target: vulkan_client")
 endif()
 
+target_compile_definitions(cuda_client    PRIVATE HAVE_CUDA=1   CLIENT_CUDA=1)
+target_compile_definitions(opencl_client  PRIVATE HAVE_OPENCL=1 CLIENT_OPENCL=1)
+target_compile_definitions(vulkan_client  PRIVATE HAVE_VULKAN=1 CLIENT_VULKAN=1)
+target_compile_definitions(universal_client PRIVATE ${UNIVERSAL_DEFS} CLIENT_UNIVERSAL=1)
+
+
 # Universal client that can be built with all available frameworks
 if(HAVE_CUDA OR HAVE_OPENCL OR HAVE_VULKAN)
     set(UNIVERSAL_SOURCES ${COMMON_SOURCES})
