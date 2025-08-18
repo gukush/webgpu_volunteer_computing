@@ -30,6 +30,43 @@ if(ENABLE_CUDA)
     endif()
 endif()
 
+if(NOT TARGET CUDA::nvrtc)
+  message(STATUS "CUDA::nvrtc target not found — attempting manual nvrtc detection")
+
+  # likely CUDA install prefixes on this machine
+  set(_cuda_hint_paths
+    $ENV{CUDA_HOME}
+    /usr/local/cuda-13
+    /usr/local/cuda
+    /usr
+    /usr/local
+  )
+
+  # find nvrtc header (nvrtc.h)
+  find_path(NVRTC_INCLUDE_DIR nvrtc.h
+    HINTS ${_cuda_hint_paths}
+    PATH_SUFFIXES include include/cuda include/x86_64-linux-gnu/include
+  )
+
+  # find nvrtc library (try sonames and generic name)
+  find_library(NVRTC_LIBRARY NAMES nvrtc nvrtc.so nvrtc.so.13 nvrtc.so.12
+    HINTS ${_cuda_hint_paths}
+    PATH_SUFFIXES lib lib64 targets/x86_64-linux/lib lib/x86_64-linux-gnu
+  )
+
+  if(NVRTC_LIBRARY AND NVRTC_INCLUDE_DIR)
+    message(STATUS "Found nvrtc: ${NVRTC_LIBRARY}; include: ${NVRTC_INCLUDE_DIR}")
+    # create an IMPORTED target so other code can link to CUDA::nvrtc as usual
+    add_library(CUDA::nvrtc SHARED IMPORTED)
+    set_target_properties(CUDA::nvrtc PROPERTIES
+      IMPORTED_LOCATION "${NVRTC_LIBRARY}"
+      INTERFACE_INCLUDE_DIRECTORIES "${NVRTC_INCLUDE_DIR}"
+    )
+  else()
+    message(WARNING "nvrtc library or header not found; CUDA NVRTC functionality will be unavailable.")
+  endif()
+endif()
+
 # Optional: OpenCL support
 option(ENABLE_OPENCL "Enable OpenCL support" ON)
 if(ENABLE_OPENCL)
