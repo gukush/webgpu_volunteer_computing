@@ -94,32 +94,51 @@ if(HAVE_CUDA AND NOT TARGET CUDA::nvrtc)
     endif()
 endif()
 
-# Optional: OpenCL support
+# Optional: OpenCL support - WORKING VERSION
 option(ENABLE_OPENCL "Enable OpenCL support" ON)
 if(ENABLE_OPENCL)
-    find_package(OpenCL QUIET)
-    if(OpenCL_FOUND)
+    # Look for OpenCL headers in common locations
+    find_path(OPENCL_INCLUDE_DIR CL/cl.h
+        PATHS
+        /usr/local/cuda-11.8/targets/x86_64-linux/include
+        /usr/local/cuda/include
+        /usr/include
+        /usr/local/include
+        /opt/AMDAPPSDK-3.0/include
+    )
+
+    # Find the OpenCL library that -lOpenCL would link to
+    find_library(OPENCL_LIBRARY_PATH NAMES OpenCL
+        PATHS
+        /usr/lib/x86_64-linux-gnu
+        /usr/lib
+        /usr/local/lib
+        /lib/x86_64-linux-gnu
+        /opt/AMDAPPSDK-3.0/lib/x86_64
+    )
+
+    message(STATUS "OpenCL detection:")
+    message(STATUS "  Headers: ${OPENCL_INCLUDE_DIR}")
+    message(STATUS "  Library: ${OPENCL_LIBRARY_PATH}")
+
+    if(OPENCL_INCLUDE_DIR AND OPENCL_LIBRARY_PATH)
         message(STATUS "OpenCL found - enabling OpenCL executor")
         set(HAVE_OPENCL ON)
+
+        # Create a simple OpenCL target that mimics successful compilation
+        add_library(SimpleOpenCL INTERFACE)
+        target_include_directories(SimpleOpenCL INTERFACE ${OPENCL_INCLUDE_DIR})
+        target_link_libraries(SimpleOpenCL INTERFACE ${OPENCL_LIBRARY_PATH})
+
     else()
         message(WARNING "OpenCL not found - disabling OpenCL executor")
+        message(WARNING "  Looked for CL/cl.h in standard locations")
+        message(WARNING "  Looked for libOpenCL in standard locations")
         set(HAVE_OPENCL OFF)
     endif()
-endif()
-
-# Fix OpenCL::OpenCL target if missing
-if(HAVE_OPENCL AND NOT TARGET OpenCL::OpenCL)
-    if(DEFINED OpenCL_LIBRARY AND OpenCL_LIBRARY)
-        message(STATUS "Creating imported target OpenCL::OpenCL -> ${OpenCL_LIBRARY}")
-        add_library(OpenCL::OpenCL UNKNOWN IMPORTED)
-        set_target_properties(OpenCL::OpenCL PROPERTIES
-            IMPORTED_LOCATION "${OpenCL_LIBRARY}"
-            INTERFACE_INCLUDE_DIRECTORIES "${OpenCL_INCLUDE_DIR}"
-        )
-    else()
-        message(WARNING "OpenCL library not provided; OpenCL executor will be disabled")
-        set(HAVE_OPENCL OFF)
-    endif()
+else()
+    message(STATUS "OpenCL support disabled by user")
+    set(HAVE_OPENCL OFF)
 endif()
 
 # Optional: Vulkan support
@@ -161,84 +180,8 @@ set(COMMON_SOURCES
     common/base64.cpp
 )
 
-# FIXED: Function to create executables for each framework
-function(create_framework_executable framework_name sources link_libs compile_defs)
-    add_executable(${framework_name}_client
-        main.cpp
-        ${COMMON_SOURCES}
-        ${sources}
-    )
-
-    # Base libraries that all targets need
-    set(BASE_LIBS
-        Boost::system
-        Boost::url
-        OpenSSL::SSL
-        OpenSSL::Crypto
-        nlohmann_json::nlohmann_json
-        Threads::Threads
-    )
-
-    # FIXED: Properly handle the link_libs parameter
-    # Convert string to list if needed
-    if(link_libs)
-        string(REPLACE ";" " " link_libs_str "${link_libs}")
-        separate_arguments(framework_libs UNIX_COMMAND "${link_libs_str}")
-    else()
-        set(framework_libs "")
-    endif()
-
-    target_link_libraries(${framework_name}_client
-        PRIVATE
-        ${BASE_LIBS}
-        ${framework_libs}
-    )
-
-    target_compile_definitions(${framework_name}_client PRIVATE ${compile_defs})
-
-    # Set output directory
-    set_target_properties(${framework_name}_client PROPERTIES
-        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
-    )
-
-    message(STATUS "Created target: ${framework_name}_client with libs: ${framework_libs}")
-endfunction()
-
-# CUDA Client
-if(HAVE_CUDA)
-    # FIXED: Pass libraries as a list, not a string
-    set(CUDA_LIBS CUDA::cuda_driver CUDA::nvrtc CUDA::cudart)
-    create_framework_executable("cuda"
-        "cuda/cuda_executor.cpp"
-        "${CUDA_LIBS}"
-        "HAVE_CUDA=1"
-    )
-endif()
-
-# OpenCL Client
-if(HAVE_OPENCL)
-    # FIXED: Pass libraries as a list, not a string
-    set(OPENCL_LIBS OpenCL::OpenCL)
-    create_framework_executable("opencl"
-        "opencl/opencl_executor.cpp"
-        "${OPENCL_LIBS}"
-        "HAVE_OPENCL=1"
-    )
-endif()
-
-# Vulkan Client
-if(HAVE_VULKAN)
-    set(VULKAN_LIBS Vulkan::Vulkan)
-    create_framework_executable("vulkan"
-        "vulkan/vulkan_executor.cpp"
-        "${VULKAN_LIBS}"
-        "HAVE_VULKAN=1"
-    )
-endif()
-
-# Universal client that can be built with all available frameworks
-set(UNIVERSAL_SOURCES ${COMMON_SOURCES})
-set(UNIVERSAL_LIBS
+# Base libraries that all targets need
+set(BASE_LIBS
     Boost::system
     Boost::url
     OpenSSL::SSL
@@ -246,45 +189,112 @@ set(UNIVERSAL_LIBS
     nlohmann_json::nlohmann_json
     Threads::Threads
 )
-set(UNIVERSAL_DEFS "")
 
+# CUDA Client
 if(HAVE_CUDA)
-    list(APPEND UNIVERSAL_SOURCES cuda/cuda_executor.cpp)
-    list(APPEND UNIVERSAL_LIBS CUDA::cuda_driver CUDA::nvrtc CUDA::cudart)
-    list(APPEND UNIVERSAL_DEFS HAVE_CUDA=1)
+    add_executable(cuda_client
+        main.cpp
+        ${COMMON_SOURCES}
+        cuda/cuda_executor.cpp
+    )
+
+    target_link_libraries(cuda_client PRIVATE
+        ${BASE_LIBS}
+        CUDA::cuda_driver
+        CUDA::nvrtc
+        CUDA::cudart
+    )
+
+    target_compile_definitions(cuda_client PRIVATE HAVE_CUDA=1)
+
+    set_target_properties(cuda_client PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
+    )
+
+    message(STATUS "Created target: cuda_client")
 endif()
 
+# OpenCL Client - WORKING VERSION
 if(HAVE_OPENCL)
-    list(APPEND UNIVERSAL_SOURCES opencl/opencl_executor.cpp)
-    list(APPEND UNIVERSAL_LIBS OpenCL::OpenCL)
-    list(APPEND UNIVERSAL_DEFS HAVE_OPENCL=1)
+    add_executable(opencl_client
+        main.cpp
+        ${COMMON_SOURCES}
+        opencl/opencl_executor.cpp
+    )
+
+    target_link_libraries(opencl_client PRIVATE
+        ${BASE_LIBS}
+        SimpleOpenCL  # Use our working OpenCL target
+    )
+
+    target_compile_definitions(opencl_client PRIVATE HAVE_OPENCL=1)
+
+    set_target_properties(opencl_client PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
+    )
+
+    message(STATUS "Created target: opencl_client")
 endif()
 
+# Vulkan Client
 if(HAVE_VULKAN)
-    list(APPEND UNIVERSAL_SOURCES vulkan/vulkan_executor.cpp)
-    list(APPEND UNIVERSAL_LIBS Vulkan::Vulkan)
-    list(APPEND UNIVERSAL_DEFS HAVE_VULKAN=1)
+    add_executable(vulkan_client
+        main.cpp
+        ${COMMON_SOURCES}
+        vulkan/vulkan_executor.cpp
+    )
+
+    target_link_libraries(vulkan_client PRIVATE
+        ${BASE_LIBS}
+        Vulkan::Vulkan
+    )
+
+    target_compile_definitions(vulkan_client PRIVATE HAVE_VULKAN=1)
+
+    set_target_properties(vulkan_client PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
+    )
+
+    message(STATUS "Created target: vulkan_client")
 endif()
 
-# Only create universal client if at least one framework is available
+# Universal client that can be built with all available frameworks
 if(HAVE_CUDA OR HAVE_OPENCL OR HAVE_VULKAN)
+    set(UNIVERSAL_SOURCES ${COMMON_SOURCES})
+    set(UNIVERSAL_LIBS ${BASE_LIBS})
+    set(UNIVERSAL_DEFS "")
+
+    if(HAVE_CUDA)
+        list(APPEND UNIVERSAL_SOURCES cuda/cuda_executor.cpp)
+        list(APPEND UNIVERSAL_LIBS CUDA::cuda_driver CUDA::nvrtc CUDA::cudart)
+        list(APPEND UNIVERSAL_DEFS HAVE_CUDA=1)
+    endif()
+
+    if(HAVE_OPENCL)
+        list(APPEND UNIVERSAL_SOURCES opencl/opencl_executor.cpp)
+        list(APPEND UNIVERSAL_LIBS SimpleOpenCL)
+        list(APPEND UNIVERSAL_DEFS HAVE_OPENCL=1)
+    endif()
+
+    if(HAVE_VULKAN)
+        list(APPEND UNIVERSAL_SOURCES vulkan/vulkan_executor.cpp)
+        list(APPEND UNIVERSAL_LIBS Vulkan::Vulkan)
+        list(APPEND UNIVERSAL_DEFS HAVE_VULKAN=1)
+    endif()
+
     add_executable(universal_client
         main.cpp
         ${UNIVERSAL_SOURCES}
     )
 
-    target_link_libraries(universal_client
-        PRIVATE
-        ${UNIVERSAL_LIBS}
-    )
-
+    target_link_libraries(universal_client PRIVATE ${UNIVERSAL_LIBS})
     target_compile_definitions(universal_client PRIVATE ${UNIVERSAL_DEFS})
 
     set_target_properties(universal_client PROPERTIES
         RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
     )
 
-    message(STATUS "Created target: universal_client with libs: ${UNIVERSAL_LIBS}")
+    message(STATUS "Created target: universal_client")
 else()
     message(WARNING "No compute frameworks found - no executables will be built")
 endif()
@@ -294,6 +304,10 @@ message(STATUS "=== Build Summary ===")
 message(STATUS "CUDA Support: ${HAVE_CUDA}")
 message(STATUS "OpenCL Support: ${HAVE_OPENCL}")
 message(STATUS "Vulkan Support: ${HAVE_VULKAN}")
+if(HAVE_OPENCL)
+    message(STATUS "OpenCL Include: ${OPENCL_INCLUDE_DIR}")
+    message(STATUS "OpenCL Library: ${OPENCL_LIBRARY_PATH}")
+endif()
 message(STATUS "====================")
 
 # Installation rules
@@ -316,7 +330,8 @@ if(HAVE_VULKAN)
 endif()
 
 if(INSTALL_TARGETS)
-    install(TARGETS ${INSTALL_TARGETS}
-        DESTINATION bin
-    )
+    install(TARGETS ${INSTALL_TARGETS} DESTINATION bin)
+    message(STATUS "Will install: ${INSTALL_TARGETS}")
+else()
+    message(STATUS "No targets to install")
 endif()
