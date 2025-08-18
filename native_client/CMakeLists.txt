@@ -80,6 +80,22 @@ if(ENABLE_OPENCL)
     endif()
 endif()
 
+
+if(OpenCL_FOUND)
+  message(STATUS "OpenCL found: ${OpenCL_LIBRARY}; include: ${OpenCL_INCLUDE_DIR}")
+
+  if(TARGET OpenCL::OpenCL)
+    message(STATUS "Using imported target OpenCL::OpenCL")
+  endif()
+
+  # fallback: add include directory globally so headers like <CL/cl.h> resolve
+  if(DEFINED OpenCL_INCLUDE_DIR AND OpenCL_INCLUDE_DIR)
+    include_directories(BEFORE "${OpenCL_INCLUDE_DIR}")
+  endif()
+else()
+  message(WARNING "OpenCL not found (headers or lib); OpenCL targets will be disabled")
+endif()
+
 # Optional: Vulkan support
 option(ENABLE_VULKAN "Enable Vulkan support" ON)
 if(ENABLE_VULKAN)
