@@ -134,6 +134,24 @@ endfunction()
 # Find threads (required for std::thread)
 find_package(Threads REQUIRED)
 
+
+if(HAVE_CUDA)
+  # common CUDA include locations (adjust if needed)
+  foreach(_p
+      $ENV{CUDA_HOME}
+      /usr/local/cuda-13/targets/x86_64-linux/include
+      /usr/local/cuda-13/include
+      /usr/local/cuda/include
+  )
+    if(_p AND EXISTS "${_p}")
+      message(STATUS "Adding CUDA include dir: ${_p}")
+      include_directories(BEFORE "${_p}")
+      break()
+    endif()
+  endforeach()
+endif()
+
+
 # CUDA Client
 if(HAVE_CUDA)
     create_framework_executable("cuda"

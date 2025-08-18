@@ -4,6 +4,7 @@
 // #include "vulkan/vulkan_executor.hpp"  // Would be implemented similarly
 
 #include <iostream>
+#include <fstream>
 #include <memory>
 #include <signal.h>
 
@@ -32,19 +33,19 @@ int main(int argc, char* argv[]) {
         printUsage(argv[0]);
         return 1;
     }
-    
+
     std::string framework = argv[1];
     std::string serverUrl = "wss://localhost:3000";
     int deviceId = 0;
     std::string configFile;
-    
+
     // Parse command line arguments
     for (int i = 2; i < argc; i += 2) {
         if (i + 1 >= argc) break;
-        
+
         std::string arg = argv[i];
         std::string value = argv[i + 1];
-        
+
         if (arg == "--url") {
             serverUrl = value;
         } else if (arg == "--device") {
@@ -53,10 +54,10 @@ int main(int argc, char* argv[]) {
             configFile = value;
         }
     }
-    
+
     // Create framework executor
     std::unique_ptr<IFrameworkExecutor> executor;
-    
+
     if (framework == "cuda") {
         executor = std::make_unique<CudaExecutor>(deviceId);
     } else if (framework == "opencl") {
@@ -70,7 +71,7 @@ int main(int argc, char* argv[]) {
         printUsage(argv[0]);
         return 1;
     }
-    
+
     // Initialize executor
     json config;
     if (!configFile.empty()) {
@@ -81,28 +82,28 @@ int main(int argc, char* argv[]) {
         }
     }
     config["deviceId"] = deviceId;
-    
+
     if (!executor->initialize(config)) {
         std::cerr << "Failed to initialize " << framework << " executor" << std::endl;
         return 1;
     }
-    
+
     // Create and start client
     globalClient = std::make_unique<FrameworkClient>(std::move(executor));
-    
+
     // Setup signal handling
     signal(SIGINT, signalHandler);
     signal(SIGTERM, signalHandler);
-    
+
     std::cout << "Connecting to server: " << serverUrl << std::endl;
-    
+
     if (!globalClient->connect(serverUrl)) {
         std::cerr << "Failed to connect to server" << std::endl;
         return 1;
     }
-    
+
     std::cout << "Connected! Starting event loop..." << std::endl;
     globalClient->run();
-    
+
     return 0;
 }
