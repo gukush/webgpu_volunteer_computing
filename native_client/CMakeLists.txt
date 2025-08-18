@@ -178,12 +178,22 @@ message(STATUS "Vulkan Support: ${HAVE_VULKAN}")
 message(STATUS "====================")
 
 # Installation rules
+set(INSTALL_TARGETS universal_client)
+
+if(HAVE_CUDA)
+    list(APPEND INSTALL_TARGETS cuda_client)
+endif()
+
+if(HAVE_OPENCL)
+    list(APPEND INSTALL_TARGETS opencl_client)
+endif()
+
+if(HAVE_VULKAN)
+    list(APPEND INSTALL_TARGETS vulkan_client)
+endif()
+
 if(HAVE_CUDA OR HAVE_OPENCL OR HAVE_VULKAN)
-    install(TARGETS
-        ${HAVE_CUDA AND "cuda_client" OR ""}
-        ${HAVE_OPENCL AND "opencl_client" OR ""}
-        ${HAVE_VULKAN AND "vulkan_client" OR ""}
-        universal_client
+    install(TARGETS ${INSTALL_TARGETS}
         DESTINATION bin
     )
 endif()
