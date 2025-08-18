@@ -205,7 +205,7 @@ if(HAVE_CUDA)
         CUDA::cudart
     )
 
-    target_compile_definitions(cuda_client PRIVATE HAVE_CUDA=1)
+    target_compile_definitions(cuda_client PRIVATE HAVE_CUDA=1  CLIENT_CUDA=1)
 
     set_target_properties(cuda_client PROPERTIES
         RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
@@ -227,7 +227,7 @@ if(HAVE_OPENCL)
         SimpleOpenCL  # Use our working OpenCL target
     )
 
-    target_compile_definitions(opencl_client PRIVATE HAVE_OPENCL=1)
+    target_compile_definitions(opencl_client PRIVATE HAVE_OPENCL=1  CLIENT_OPENCL=1)
 
     set_target_properties(opencl_client PROPERTIES
         RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
@@ -249,7 +249,7 @@ if(HAVE_VULKAN)
         Vulkan::Vulkan
     )
 
-    target_compile_definitions(vulkan_client PRIVATE HAVE_VULKAN=1)
+    target_compile_definitions(vulkan_client PRIVATE HAVE_VULKAN=1  CLIENT_VULKAN=1)
 
     set_target_properties(vulkan_client PROPERTIES
         RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
@@ -258,10 +258,8 @@ if(HAVE_VULKAN)
     message(STATUS "Created target: vulkan_client")
 endif()
 
-target_compile_definitions(cuda_client    PRIVATE HAVE_CUDA=1   CLIENT_CUDA=1)
-target_compile_definitions(opencl_client  PRIVATE HAVE_OPENCL=1 CLIENT_OPENCL=1)
-target_compile_definitions(vulkan_client  PRIVATE HAVE_VULKAN=1 CLIENT_VULKAN=1)
-target_compile_definitions(universal_client PRIVATE ${UNIVERSAL_DEFS} CLIENT_UNIVERSAL=1)
+
+
 
 
 # Universal client that can be built with all available frameworks
@@ -294,7 +292,7 @@ if(HAVE_CUDA OR HAVE_OPENCL OR HAVE_VULKAN)
     )
 
     target_link_libraries(universal_client PRIVATE ${UNIVERSAL_LIBS})
-    target_compile_definitions(universal_client PRIVATE ${UNIVERSAL_DEFS})
+    target_compile_definitions(universal_client PRIVATE ${UNIVERSAL_DEFS}   CLIENT_UNIVERSAL=1)
 
     set_target_properties(universal_client PROPERTIES
         RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
@@ -319,21 +317,31 @@ message(STATUS "====================")
 # Installation rules
 set(INSTALL_TARGETS "")
 
+#    target_compile_definitions(universal_client PRIVATE ${UNIVERSAL_DEFS} )
+#    target_compile_definitions(cuda_client    PRIVATE HAVE_CUDA=1   CLIENT_CUDA=1)
+#        target_compile_definitions(opencl_client  PRIVATE HAVE_OPENCL=1 CLIENT_OPENCL=1)
+#            target_compile_definitions(vulkan_client  PRIVATE HAVE_VULKAN=1 CLIENT_VULKAN=1)
 if(HAVE_CUDA OR HAVE_OPENCL OR HAVE_VULKAN)
+
     list(APPEND INSTALL_TARGETS universal_client)
 endif()
 
 if(HAVE_CUDA)
+
     list(APPEND INSTALL_TARGETS cuda_client)
 endif()
 
 if(HAVE_OPENCL)
+
     list(APPEND INSTALL_TARGETS opencl_client)
 endif()
 
 if(HAVE_VULKAN)
+
     list(APPEND INSTALL_TARGETS vulkan_client)
 endif()
+
+
 
 if(INSTALL_TARGETS)
     install(TARGETS ${INSTALL_TARGETS} DESTINATION bin)
