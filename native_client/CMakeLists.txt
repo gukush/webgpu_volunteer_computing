@@ -12,7 +12,7 @@ if(DEFINED ENV{VCPKG_ROOT} AND NOT DEFINED CMAKE_TOOLCHAIN_FILE)
 endif()
 
 # Find required packages via vcpkg
-find_package(Boost REQUIRED COMPONENTS system)
+find_package(Boost REQUIRED COMPONENTS system url)
 find_package(OpenSSL REQUIRED)
 find_package(nlohmann_json CONFIG REQUIRED)
 
@@ -28,6 +28,34 @@ if(ENABLE_CUDA)
         message(WARNING "CUDA not found - disabling CUDA executor")
         set(HAVE_CUDA OFF)
     endif()
+endif()
+
+if(NOT TARGET CUDA::cudart)
+  # Try to locate libcudart
+  find_library(CUDART_LIBRARY NAMES cudart libcudart PATHS
+    /usr/local/cuda/lib64
+    /usr/local/cuda-*/targets/x86_64-linux/lib
+    /usr/local/cuda-*/lib64
+    NO_DEFAULT_PATH
+  )
+
+  # also pick up common cuda include path
+  find_path(CUDART_INCLUDE_DIR cuda_runtime.h PATHS
+    /usr/local/cuda/include
+    /usr/local/cuda-*/targets/x86_64-linux/include
+    NO_DEFAULT_PATH
+  )
+
+  if(CUDART_LIBRARY)
+    message(STATUS "Creating imported target CUDA::cudart -> ${CUDART_LIBRARY}")
+    add_library(CUDA::cudart UNKNOWN IMPORTED)
+    set_target_properties(CUDA::cudart PROPERTIES
+      IMPORTED_LOCATION "${CUDART_LIBRARY}"
+      INTERFACE_INCLUDE_DIRECTORIES "${CUDART_INCLUDE_DIR}"
+    )
+  else()
+    message(WARNING "Could not find libcudart; CUDA runtime functions may link-fail")
+  endif()
 endif()
 
 if(NOT TARGET CUDA::nvrtc)
@@ -80,6 +108,19 @@ if(ENABLE_OPENCL)
     endif()
 endif()
 
+if(NOT TARGET OpenCL::OpenCL)
+  if(DEFINED OpenCL_LIBRARY AND OpenCL_LIBRARY)
+    message(STATUS "Creating imported target OpenCL::OpenCL -> ${OpenCL_LIBRARY}")
+    add_library(OpenCL::OpenCL UNKNOWN IMPORTED)
+    set_target_properties(OpenCL::OpenCL PROPERTIES
+      IMPORTED_LOCATION "${OpenCL_LIBRARY}"
+      INTERFACE_INCLUDE_DIRECTORIES "${OpenCL_INCLUDE_DIR}"
+    )
+  else()
+    message(WARNING "OpenCL library not provided; OpenCL executor will be disabled")
+  endif()
+endif()
+
 
 if(OpenCL_FOUND)
   message(STATUS "OpenCL found: ${OpenCL_LIBRARY}; include: ${OpenCL_INCLUDE_DIR}")
@@ -130,6 +171,7 @@ function(create_framework_executable framework_name sources link_libs compile_de
     target_link_libraries(${framework_name}_client
         PRIVATE
         Boost::system
+        Boost::url
         OpenSSL::SSL
         OpenSSL::Crypto
         nlohmann_json::nlohmann_json
@@ -167,12 +209,15 @@ if(HAVE_CUDA)
   endforeach()
 endif()
 
+if(HAVE_CUDA)
+    list(APPEND UNIVERSAL_LIBS CUDA::cuda_driver CUDA::nvrtc CUDA::cudart)
+endif()
 
 # CUDA Client
 if(HAVE_CUDA)
     create_framework_executable("cuda"
         "cuda/cuda_executor.cpp"
-        "CUDA::cuda_driver;CUDA::nvrtc"
+        "CUDA::cuda_driver;CUDA::nvrtc;CUDA::cudart"
         "HAVE_CUDA=1"
     )
 endif()
@@ -197,7 +242,7 @@ endif()
 
 # Universal client that can be built with all available frameworks
 set(UNIVERSAL_SOURCES ${COMMON_SOURCES})
-set(UNIVERSAL_LIBS Boost::system OpenSSL::SSL OpenSSL::Crypto nlohmann_json::nlohmann_json ${CMAKE_THREAD_LIBS_INIT})
+set(UNIVERSAL_LIBS Boost::system Boost::url OpenSSL::SSL OpenSSL::Crypto nlohmann_json::nlohmann_json ${CMAKE_THREAD_LIBS_INIT})
 set(UNIVERSAL_DEFS "")
 
 if(HAVE_CUDA)

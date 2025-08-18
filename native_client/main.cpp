@@ -59,11 +59,17 @@ int main(int argc, char* argv[]) {
     std::unique_ptr<IFrameworkExecutor> executor;
 
     if (framework == "cuda") {
-        executor = std::make_unique<CudaExecutor>(deviceId);
+        #ifdef HAVE_CUDA
+            executor = std::make_unique<CudaExecutor>(deviceId);
+        #endif
     } else if (framework == "opencl") {
-        executor = std::make_unique<OpenCLExecutor>();
+        #ifdef HAVE_OPENCL
+            executor = std::make_unique<OpenCLExecutor>();
+        #endif
     } else if (framework == "vulkan") {
-        // executor = std::make_unique<VulkanExecutor>();
+        #ifdef HAVE_VULKAN
+            //executor = std::make_unique<VulkanExecutor>();
+        #endif
         std::cerr << "Vulkan support not implemented yet" << std::endl;
         return 1;
     } else {
