@@ -143,7 +143,11 @@ void FrameworkClient::handleWorkloadAssignment(const json& data) {
         task.framework = data["framework"];
         task.kernel = data["kernel"];
         task.entry = data["entry"];
-        task.workgroupCount = data["workgroupCount"];
+        if (data.contains("workgroupCount") && data["workgroupCount"].is_array()) {
+            task.workgroupCount = data["workgroupCount"].get<std::vector<int>>();
+        } else {
+            task.workgroupCount.clear();
+        }
         task.bindLayout = data["bindLayout"];
         task.outputSize = data["outputSize"];
         task.compilationOptions = data.value("compilationOptions", json::object());
