@@ -9,7 +9,7 @@
 
 // Base64 utilities
 #include "base64.hpp"
-#include "json.hpp"
+#include <nlohmann/json.hpp>
 #include "websocket_client.hpp"
 
 using json = nlohmann::json;
@@ -56,10 +56,10 @@ private:
     std::string clientId;
     bool connected = false;
     bool busy = false;
-    
+
     // Task tracking
     std::map<std::string, TaskData> activeTasks;
-    
+
     // Handlers
     void onConnected();
     void onDisconnected();
@@ -68,15 +68,15 @@ private:
     void handleChunkAssignment(const json& data);
     void sendResult(const TaskData& task, const TaskResult& result);
     void sendError(const TaskData& task, const std::string& error);
-    
+
 public:
     FrameworkClient(std::unique_ptr<IFrameworkExecutor> exec);
     ~FrameworkClient();
-    
+
     bool connect(const std::string& url);
     void disconnect();
     void run(); // Main event loop
-    
+
     // Status
     bool isConnected() const { return connected; }
     bool isBusy() const { return busy; }
@@ -120,7 +120,7 @@ add_executable(cuda_client
 
 target_link_libraries(cuda_client
     ${Boost_LIBRARIES}
-    OpenSSL::SSL 
+    OpenSSL::SSL
     OpenSSL::Crypto
     CUDA::cuda_driver
     CUDA::nvrtc
@@ -129,7 +129,7 @@ target_link_libraries(cuda_client
 
 add_executable(opencl_client
     main.cpp
-    common/framework_client.cpp  
+    common/framework_client.cpp
     common/websocket_client.cpp
     opencl/opencl_executor.cpp
 )
@@ -137,7 +137,7 @@ add_executable(opencl_client
 target_link_libraries(opencl_client
     ${Boost_LIBRARIES}
     OpenSSL::SSL
-    OpenSSL::Crypto 
+    OpenSSL::Crypto
     OpenCL::OpenCL
     pthread
 )
