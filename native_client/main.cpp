@@ -1,24 +1,29 @@
-#include "common/framework_client.hpp"
-#include "cuda/cuda_executor.hpp"
-#include "opencl/opencl_executor.hpp"
-// #include "vulkan/vulkan_executor.hpp"  // Would be implemented similarly
+#if defined(HAVE_CUDA) && (defined(CLIENT_CUDA) || defined(CLIENT_UNIVERSAL))
+  #include "cuda/cuda_executor.hpp"
+#endif
+#if defined(HAVE_OPENCL) && (defined(CLIENT_OPENCL) || defined(CLIENT_UNIVERSAL))
+  #include "opencl/opencl_executor.hpp"
+#endif
+#if defined(HAVE_VULKAN) && (defined(CLIENT_VULKAN) || defined(CLIENT_UNIVERSAL))
+  #include "vulkan/vulkan_executor.hpp"
+#endif
 
 #include <iostream>
 #include <fstream>
 #include <memory>
-#include <signal.h>
+#include <csignal>
+#include <nlohmann/json.hpp>
+using nlohmann::json;
 
 std::unique_ptr<FrameworkClient> globalClient;
 
 void signalHandler(int signum) {
     std::cout << "\nReceived signal " << signum << ", shutting down..." << std::endl;
-    if (globalClient) {
-        globalClient->disconnect();
-    }
-    exit(signum);
+    if (globalClient) globalClient->disconnect();
+    std::exit(signum);
 }
 
-void printUsage(const char* programName) {
+static void printUsage(const char* programName) {
     std::cout << "Usage: " << programName << " <framework> [options]\n"
               << "Frameworks: cuda, opencl, vulkan\n"
               << "Options:\n"
@@ -29,87 +34,79 @@ void printUsage(const char* programName) {
 }
 
 int main(int argc, char* argv[]) {
-    if (argc < 2) {
-        printUsage(argv[0]);
-        return 1;
-    }
+    if (argc < 2) { printUsage(argv[0]); return 1; }
 
     std::string framework = argv[1];
     std::string serverUrl = "wss://localhost:3000";
     int deviceId = 0;
     std::string configFile;
 
-    // Parse command line arguments
-    for (int i = 2; i < argc; i += 2) {
-        if (i + 1 >= argc) break;
-
-        std::string arg = argv[i];
-        std::string value = argv[i + 1];
-
-        if (arg == "--url") {
-            serverUrl = value;
-        } else if (arg == "--device") {
-            deviceId = std::stoi(value);
-        } else if (arg == "--config") {
-            configFile = value;
-        }
+    for (int i = 2; i + 1 < argc; i += 2) {
+        std::string arg = argv[i], value = argv[i + 1];
+        if (arg == "--url") serverUrl = value;
+        else if (arg == "--device") deviceId = std::stoi(value);
+        else if (arg == "--config") configFile = value;
     }
 
     // Create framework executor
     std::unique_ptr<IFrameworkExecutor> executor;
 
     if (framework == "cuda") {
-        #ifdef HAVE_CUDA
-            executor = std::make_unique<CudaExecutor>(deviceId);
-        #endif
-    } else if (framework == "opencl") {
-        #ifdef HAVE_OPENCL
-            executor = std::make_unique<OpenCLExecutor>();
-        #endif
-    } else if (framework == "vulkan") {
-        #ifdef HAVE_VULKAN
-            //executor = std::make_unique<VulkanExecutor>();
-        #endif
-        std::cerr << "Vulkan support not implemented yet" << std::endl;
+    #if defined(HAVE_CUDA)
+        executor = std::make_unique<CudaExecutor>(deviceId);
+    #else
+        std::cerr << "This binary was built without CUDA support.\n";
         return 1;
-    } else {
-        std::cerr << "Unknown framework: " << framework << std::endl;
+    #endif
+    }
+    else if (framework == "opencl") {
+    #if defined(HAVE_OPENCL)
+        executor = std::make_unique<OpenCLExecutor>();
+    #else
+        std::cerr << "This binary was built without OpenCL support.\n";
+        return 1;
+    #endif
+    }
+    else if (framework == "vulkan") {
+    #if defined(HAVE_VULKAN)
+        // TODO
+        std::cerr << "Vulkan support not implemented yet.\n";
+        return 1;
+    #else
+        std::cerr << "This binary was built without Vulkan support.\n";
+        return 1;
+    #endif
+    }
+    else {
+        std::cerr << "Unknown framework: " << framework << "\n";
         printUsage(argv[0]);
         return 1;
     }
 
-    // Initialize executor
+    if (!executor) { std::cerr << "No executor created (internal error).\n"; return 1; }
+
+    // Load config
     json config;
     if (!configFile.empty()) {
-        // Load config file
         std::ifstream configStream(configFile);
-        if (configStream.is_open()) {
-            configStream >> config;
-        }
+        if (configStream.is_open()) configStream >> config;
     }
     config["deviceId"] = deviceId;
 
     if (!executor->initialize(config)) {
-        std::cerr << "Failed to initialize " << framework << " executor" << std::endl;
+        std::cerr << "Failed to initialize " << framework << " executor\n";
         return 1;
     }
 
-    // Create and start client
+    // Client
     globalClient = std::make_unique<FrameworkClient>(std::move(executor));
-
-    // Setup signal handling
-    signal(SIGINT, signalHandler);
-    signal(SIGTERM, signalHandler);
+    std::signal(SIGINT,  signalHandler);
+    std::signal(SIGTERM, signalHandler);
 
     std::cout << "Connecting to server: " << serverUrl << std::endl;
-
-    if (!globalClient->connect(serverUrl)) {
-        std::cerr << "Failed to connect to server" << std::endl;
-        return 1;
-    }
+    if (!globalClient->connect(serverUrl)) { std::cerr << "Failed to connect to server\n"; return 1; }
 
     std::cout << "Connected! Starting event loop..." << std::endl;
     globalClient->run();
-
     return 0;
 }
