@@ -220,7 +220,11 @@ void FrameworkClient::handleChunkAssignment(const json& data) {
         task.framework = data["framework"];
         task.kernel = data["wgsl"]; // Legacy field name
         task.entry = data["entry"];
-        task.workgroupCount = data["workgroupCount"];
+        if (data.contains("workgroupCount") && data["workgroupCount"].is_array()) {
+            task.workgroupCount = data["workgroupCount"].get<std::vector<int>>();
+        } else {
+            task.workgroupCount.clear();
+        }
         task.bindLayout = data["bindLayout"];
         task.outputSize = data.value("outputSize", 1024); // Estimate for chunks
         task.chunkUniforms = data["chunkUniforms"];
