@@ -69,9 +69,7 @@ int main(int argc, char* argv[]) {
     }
     else if (framework == "vulkan") {
     #if defined(HAVE_VULKAN)
-        // TODO
-        std::cerr << "Vulkan support not implemented yet.\n";
-        return 1;
+        executor = std::make_unique<VulkanExecutor>();
     #else
         std::cerr << "This binary was built without Vulkan support.\n";
         return 1;

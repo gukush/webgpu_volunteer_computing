@@ -61,7 +61,7 @@ endif()
 
 # Fix CUDA::nvrtc target if missing
 if(HAVE_CUDA AND NOT TARGET CUDA::nvrtc)
-    message(STATUS "CUDA::nvrtc target not found — attempting manual nvrtc detection")
+    message(STATUS "CUDA::nvrtc target not found â€" attempting manual nvrtc detection")
 
     set(_cuda_hint_paths
         $ENV{CUDA_HOME}
@@ -146,11 +146,52 @@ option(ENABLE_VULKAN "Enable Vulkan support" ON)
 if(ENABLE_VULKAN)
     find_package(Vulkan QUIET)
     if(Vulkan_FOUND)
-        message(STATUS "Vulkan found - enabling Vulkan executor")
-        set(HAVE_VULKAN ON)
+        # Try to find shaderc for runtime shader compilation
+        find_package(unofficial-shaderc CONFIG QUIET)
+        if(unofficial-shaderc_FOUND)
+            message(STATUS "Vulkan and shaderc found - enabling Vulkan executor")
+            set(HAVE_VULKAN ON)
+            set(HAVE_SHADERC ON)
+        else()
+            # Try to find shaderc manually
+            find_path(SHADERC_INCLUDE_DIR shaderc/shaderc.hpp
+                PATHS
+                /usr/include
+                /usr/local/include
+                /opt/vulkan-sdk/include
+                $ENV{VULKAN_SDK}/include
+            )
+
+            find_library(SHADERC_LIBRARY NAMES shaderc_shared shaderc
+                PATHS
+                /usr/lib
+                /usr/local/lib
+                /opt/vulkan-sdk/lib
+                $ENV{VULKAN_SDK}/lib
+            )
+
+            if(SHADERC_INCLUDE_DIR AND SHADERC_LIBRARY)
+                message(STATUS "Vulkan and shaderc found manually - enabling Vulkan executor")
+                set(HAVE_VULKAN ON)
+                set(HAVE_SHADERC ON)
+
+                # Create shaderc target
+                add_library(shaderc_shared SHARED IMPORTED)
+                set_target_properties(shaderc_shared PROPERTIES
+                    IMPORTED_LOCATION "${SHADERC_LIBRARY}"
+                    INTERFACE_INCLUDE_DIRECTORIES "${SHADERC_INCLUDE_DIR}"
+                )
+            else()
+                message(WARNING "Vulkan found but shaderc not found - disabling Vulkan executor")
+                message(WARNING "  Install shaderc development libraries for Vulkan support")
+                set(HAVE_VULKAN OFF)
+                set(HAVE_SHADERC OFF)
+            endif()
+        endif()
     else()
         message(WARNING "Vulkan not found - disabling Vulkan executor")
         set(HAVE_VULKAN OFF)
+        set(HAVE_SHADERC OFF)
     endif()
 endif()
 
@@ -244,10 +285,16 @@ if(HAVE_VULKAN)
         vulkan/vulkan_executor.cpp
     )
 
-    target_link_libraries(vulkan_client PRIVATE
-        ${BASE_LIBS}
-        Vulkan::Vulkan
-    )
+    set(VULKAN_LIBS ${BASE_LIBS} Vulkan::Vulkan)
+
+    # Add shaderc library
+    if(unofficial-shaderc_FOUND)
+        list(APPEND VULKAN_LIBS unofficial::shaderc::shaderc)
+    else()
+        list(APPEND VULKAN_LIBS shaderc_shared)
+    endif()
+
+    target_link_libraries(vulkan_client PRIVATE ${VULKAN_LIBS})
 
     target_compile_definitions(vulkan_client PRIVATE HAVE_VULKAN=1  CLIENT_VULKAN=1)
 
@@ -257,10 +304,6 @@ if(HAVE_VULKAN)
 
     message(STATUS "Created target: vulkan_client")
 endif()
-
-
-
-
 
 # Universal client that can be built with all available frameworks
 if(HAVE_CUDA OR HAVE_OPENCL OR HAVE_VULKAN)
@@ -284,6 +327,13 @@ if(HAVE_CUDA OR HAVE_OPENCL OR HAVE_VULKAN)
         list(APPEND UNIVERSAL_SOURCES vulkan/vulkan_executor.cpp)
         list(APPEND UNIVERSAL_LIBS Vulkan::Vulkan)
         list(APPEND UNIVERSAL_DEFS HAVE_VULKAN=1)
+
+        # Add shaderc to universal client
+        if(unofficial-shaderc_FOUND)
+            list(APPEND UNIVERSAL_LIBS unofficial::shaderc::shaderc)
+        else()
+            list(APPEND UNIVERSAL_LIBS shaderc_shared)
+        endif()
     endif()
 
     add_executable(universal_client
@@ -308,6 +358,9 @@ message(STATUS "=== Build Summary ===")
 message(STATUS "CUDA Support: ${HAVE_CUDA}")
 message(STATUS "OpenCL Support: ${HAVE_OPENCL}")
 message(STATUS "Vulkan Support: ${HAVE_VULKAN}")
+if(HAVE_VULKAN)
+    message(STATUS "Shaderc Support: ${HAVE_SHADERC}")
+endif()
 if(HAVE_OPENCL)
     message(STATUS "OpenCL Include: ${OPENCL_INCLUDE_DIR}")
     message(STATUS "OpenCL Library: ${OPENCL_LIBRARY_PATH}")
@@ -317,31 +370,21 @@ message(STATUS "====================")
 # Installation rules
 set(INSTALL_TARGETS "")
 
-#    target_compile_definitions(universal_client PRIVATE ${UNIVERSAL_DEFS} )
-#    target_compile_definitions(cuda_client    PRIVATE HAVE_CUDA=1   CLIENT_CUDA=1)
-#        target_compile_definitions(opencl_client  PRIVATE HAVE_OPENCL=1 CLIENT_OPENCL=1)
-#            target_compile_definitions(vulkan_client  PRIVATE HAVE_VULKAN=1 CLIENT_VULKAN=1)
 if(HAVE_CUDA OR HAVE_OPENCL OR HAVE_VULKAN)
-
     list(APPEND INSTALL_TARGETS universal_client)
 endif()
 
 if(HAVE_CUDA)
-
     list(APPEND INSTALL_TARGETS cuda_client)
 endif()
 
 if(HAVE_OPENCL)
-
     list(APPEND INSTALL_TARGETS opencl_client)
 endif()
 
 if(HAVE_VULKAN)
-
     list(APPEND INSTALL_TARGETS vulkan_client)
 endif()
-
-
 
 if(INSTALL_TARGETS)
     install(TARGETS ${INSTALL_TARGETS} DESTINATION bin)
