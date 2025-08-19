@@ -1,0 +1,67 @@
+# docker/client/Dockerfile
+# Multi-stage build: build with vcpkg + CMake, then ship a slim runtime
+ARG UBUNTU_VERSION=22.04
+FROM ubuntu:${UBUNTU_VERSION} AS build
+
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential cmake git curl unzip zip tar pkg-config ninja-build ca-certificates \
+    python3 \
+    libvulkan1 mesa-vulkan-drivers \
+    ocl-icd-opencl-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install vcpkg
+ENV VCPKG_ROOT=/opt/vcpkg
+RUN git clone --depth=1 https://github.com/microsoft/vcpkg.git ${VCPKG_ROOT} \
+ && ${VCPKG_ROOT}/bootstrap-vcpkg.sh -disableMetrics
+
+ARG VCPKG_TRIPLET=x64-linux
+
+# Install only what we need — rely on system libvulkan loader
+RUN ${VCPKG_ROOT}/vcpkg install --triplet=${VCPKG_TRIPLET} \
+    boost-system \
+    boost-url \
+    boost-beast \
+    openssl \
+    nlohmann-json \
+    shaderc \
+    vulkan-headers
+
+# Build client
+WORKDIR /src
+COPY . /src
+
+ARG BUILD_TYPE=Release
+RUN cmake -S . -B build \
+    -G Ninja \
+    -DCMAKE_BUILD_TYPE=${BUILD_TYPE} \
+    -DCMAKE_TOOLCHAIN_FILE=${VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake \
+    -DVCPKG_TARGET_TRIPLET=${VCPKG_TRIPLET} \
+    -DVulkan_INCLUDE_DIR=${VCPKG_ROOT}/installed/${VCPKG_TRIPLET}/include \
+    -DVulkan_LIBRARY=/lib/x86_64-linux-gnu/libvulkan.so.1 \
+    -DOPENCL_INCLUDE_DIR=/usr/include \
+    -DOPENCL_LIBRARY_PATH=/usr/lib/x86_64-linux-gnu/libOpenCL.so \
+    -DENABLE_CUDA=OFF \
+ && cmake --build build --parallel \
+ && cmake --install build --prefix /opt/mfc
+
+# Runtime stage
+FROM ubuntu:${UBUNTU_VERSION} AS runtime
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates \
+    libstdc++6 \
+    libvulkan1 mesa-vulkan-drivers \
+    ocl-icd-libopencl1 \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=build /opt/mfc /opt/mfc
+COPY --from=build /opt/vcpkg/installed /opt/vcpkg/installed
+ENV LD_LIBRARY_PATH=/opt/vcpkg/installed/${VCPKG_TRIPLET}/lib:/opt/vcpkg/installed/${VCPKG_TRIPLET}/lib/manual-link:${LD_LIBRARY_PATH}
+
+WORKDIR /opt/mfc/bin
+
+ENV FRAMEWORK=vulkan
+ENV SERVER_URL=https://localhost:3000
+ENTRYPOINT ["/bin/sh", "-lc", "exec ./${FRAMEWORK}_client --server ${SERVER_URL}"]

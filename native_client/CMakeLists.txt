@@ -11,6 +11,11 @@ if(DEFINED ENV{VCPKG_ROOT} AND NOT DEFINED CMAKE_TOOLCHAIN_FILE)
         CACHE STRING "")
 endif()
 
+option(ENABLE_CUDA "Enable CUDA support" OFF)
+if (ENABLE_CUDA)
+  enable_language(CUDA)
+endif()
+
 # Find required packages via vcpkg
 find_package(Boost REQUIRED COMPONENTS system url)
 find_package(OpenSSL REQUIRED)
@@ -61,7 +66,7 @@ endif()
 
 # Fix CUDA::nvrtc target if missing
 if(HAVE_CUDA AND NOT TARGET CUDA::nvrtc)
-    message(STATUS "CUDA::nvrtc target not found â€" attempting manual nvrtc detection")
+    message(STATUS "CUDA::nvrtc target not found attempting manual nvrtc detection")
 
     set(_cuda_hint_paths
         $ENV{CUDA_HOME}

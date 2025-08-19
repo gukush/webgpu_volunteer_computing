@@ -4,6 +4,9 @@
 #include <vector>
 #include <memory>
 
+// NOTE: This header replaces the previous include path "../common/framework_client.hpp".
+// If your tree uses a different layout, adjust the include accordingly.
+
 class VulkanExecutor : public IFrameworkExecutor {
 private:
     VkInstance instance = VK_NULL_HANDLE;
@@ -12,32 +15,30 @@ private:
     VkQueue computeQueue = VK_NULL_HANDLE;
     VkCommandPool commandPool = VK_NULL_HANDLE;
     VkDescriptorPool descriptorPool = VK_NULL_HANDLE;
+    VkPipelineCache pipelineCache = VK_NULL_HANDLE;
     uint32_t computeQueueFamilyIndex = 0;
     bool initialized = false;
 
-    // Device properties for capabilities
+    // Cached device properties/memory properties
     VkPhysicalDeviceProperties deviceProperties{};
     VkPhysicalDeviceMemoryProperties memoryProperties{};
 
-    struct CompiledShader {
-        VkShaderModule shaderModule = VK_NULL_HANDLE;
-        VkPipeline computePipeline = VK_NULL_HANDLE;
-        VkPipelineLayout pipelineLayout = VK_NULL_HANDLE;
-        VkDescriptorSetLayout descriptorSetLayout = VK_NULL_HANDLE;
-    };
-
-    std::map<std::string, CompiledShader> shaderCache;
-
-    bool createInstance();
-    bool selectPhysicalDevice();
+    // Helpers
+    bool createInstance(bool enableValidation, bool enableDebugUtils);
+    bool pickPhysicalDevice();
     bool createLogicalDevice();
-    bool compileShader(const std::string& source, const std::string& entryPoint,
-                      const json& compileOpts, CompiledShader& result);
+    bool createCommandPool();
+    bool createDescriptorPool();
+    void destroyInstance();
+    void destroyDeviceObjects();
 
-    // Helper methods for buffer management
-    uint32_t findMemoryType(uint32_t typeFilter, VkMemoryPropertyFlags properties);
+    // Shader compilation
+    bool compileGLSLtoSPIRV(const std::string& glsl, std::vector<uint32_t>& spirv, std::string& error) const;
+
+    // Buffer helpers
+    uint32_t findMemoryType(uint32_t typeFilter, VkMemoryPropertyFlags properties) const;
     bool createBuffer(VkDeviceSize size, VkBufferUsageFlags usage,
-                     VkMemoryPropertyFlags properties, VkBuffer& buffer, VkDeviceMemory& bufferMemory);
+                      VkMemoryPropertyFlags properties, VkBuffer& buffer, VkDeviceMemory& bufferMemory) const;
 
 public:
     VulkanExecutor();
