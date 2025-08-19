@@ -1,4 +1,4 @@
-// server.js - Complete Enhanced Version (modified for checksum + strict K-of-N verification)
+// server.js - Complete Enhanced Version with Multi-Input/Output Support
 import express from 'express';
 import fs from 'fs';
 import path from 'path';
@@ -46,6 +46,24 @@ function tallyKByChecksum(submissions, expectedByteLength, k) {
     if (voters.size >= k) return { ok: true, winningChecksum: chk, voters };
   }
   return { ok: false };
+}
+
+// NEW: Handle multi-result checksums (concatenate all outputs for per-chunk verification)
+function checksumFromResults(results) {
+  // results is array of base64 strings
+  if (!Array.isArray(results)) {
+    results = [results]; // Backward compatibility
+  }
+
+  const buffers = results.map(b64 => Buffer.from(b64, 'base64'));
+  const combinedBuf = Buffer.concat(buffers);
+
+  return {
+    serverChecksum: sha256Hex(combinedBuf),
+    byteLength: combinedBuf.length,
+    buffer: combinedBuf,
+    buffers: buffers // Keep individual buffers for assembly
+  };
 }
 
 function checksumFromBase64(base64) {
@@ -171,7 +189,14 @@ function loadCustomWorkloads() {
         workload.results = workload.results || [];
         workload.dispatchesMade = workload.dispatchesMade || 0;
         workload.activeAssignments = new Set(workload.activeAssignments || []);
-        workload.chunkOutputSize = workload.chunkOutputSize || workload.outputSize;
+
+        // NEW: Handle backward compatibility for output sizes
+        if (!workload.outputSizes && workload.outputSize) {
+          workload.outputSizes = [workload.outputSize];
+        }
+        if (!workload.chunkOutputSizes && workload.chunkOutputSize) {
+          workload.chunkOutputSizes = [workload.chunkOutputSize];
+        }
 
         customWorkloads.set(workload.id, workload);
       });
@@ -263,7 +288,7 @@ app.post('/api/workloads/advanced', async (req, res) => {
         dispatchesMade: 0,
         submissions: [],
         activeAssignments: new Set(),
-        verified_result_base64: null
+        verified_results: null // Will be array of base64 strings
       })),
       completedChunksData: new Map(),
       expectedChunks: result.plan.totalChunks,
@@ -451,11 +476,13 @@ app.post('/api/workloads', (req, res) => {
     workgroupCount,
     bindLayout,
     input,
-    outputSize,
+    outputSize, // Backward compatibility
+    outputSizes, // NEW: Array of output sizes
     chunkable = false,
     inputChunkProcessingType = 'elements',
     inputChunkSize,
-    chunkOutputSize,
+    chunkOutputSize, // Backward compatibility
+    chunkOutputSizes, // NEW: Array of chunk output sizes
     inputElementSizeBytes = 4,
     outputAggregationMethod = 'concatenate',
     compilationOptions = {}
@@ -468,16 +495,69 @@ app.post('/api/workloads', (req, res) => {
   }
 
   const kernelCode = kernel || wgsl;
-  if (!kernelCode || !workgroupCount || !outputSize) {
+  if (!kernelCode || !workgroupCount) {
     return res.status(400).json({
-      error: 'Missing required fields: kernel/wgsl, workgroupCount, outputSize'
+      error: 'Missing required fields: kernel/wgsl, workgroupCount'
     });
   }
 
-  if (chunkable && (!chunkOutputSize || chunkOutputSize <= 0)) {
+  // NEW: Handle output sizes (backward compatibility)
+  let finalOutputSizes = outputSizes;
+  if (!finalOutputSizes && outputSize) {
+    finalOutputSizes = [outputSize];
+  }
+  if (!finalOutputSizes || finalOutputSizes.length === 0) {
     return res.status(400).json({
-      error: 'chunkOutputSize is required and must be > 0 for chunkable workloads'
+      error: 'outputSizes (or outputSize for backward compatibility) is required'
     });
+  }
+
+  // NEW: Validate max inputs/outputs
+  if (finalOutputSizes.length > 3) {
+    return res.status(400).json({
+      error: 'Maximum 3 outputs supported'
+    });
+  }
+
+  // NEW: Parse inputs if provided
+  let parsedInputs = {};
+  if (input) {
+    try {
+      // Try to parse as JSON (multi-input format)
+      if (typeof input === 'string' && input.startsWith('{')) {
+        parsedInputs = JSON.parse(input);
+      } else {
+        // Single input (backward compatibility)
+        parsedInputs = { input: input };
+      }
+    } catch (e) {
+      parsedInputs = { input: input }; // Fallback to single input
+    }
+  }
+
+  // NEW: Validate max inputs
+  if (Object.keys(parsedInputs).length > 4) {
+    return res.status(400).json({
+      error: 'Maximum 4 inputs supported'
+    });
+  }
+
+  if (chunkable) {
+    // NEW: Handle chunk output sizes (backward compatibility)
+    let finalChunkOutputSizes = chunkOutputSizes;
+    if (!finalChunkOutputSizes && chunkOutputSize) {
+      finalChunkOutputSizes = [chunkOutputSize];
+    }
+    if (!finalChunkOutputSizes || finalChunkOutputSizes.length === 0) {
+      return res.status(400).json({
+        error: 'chunkOutputSizes (or chunkOutputSize for backward compatibility) is required for chunkable workloads'
+      });
+    }
+    if (finalChunkOutputSizes.length !== finalOutputSizes.length) {
+      return res.status(400).json({
+        error: 'chunkOutputSizes must match number of outputs'
+      });
+    }
   }
 
   const effectiveBindLayout = bindLayout || SUPPORTED_FRAMEWORKS[framework].defaultBindLayout;
@@ -492,8 +572,8 @@ app.post('/api/workloads', (req, res) => {
     entry,
     workgroupCount,
     bindLayout: effectiveBindLayout,
-    input,
-    outputSize,
+    input: Object.keys(parsedInputs).length > 0 ? JSON.stringify(parsedInputs) : undefined,
+    outputSizes: finalOutputSizes, // NEW: Array
     status: 'queued',
     results: [],
     processingTimes: [],
@@ -501,13 +581,17 @@ app.post('/api/workloads', (req, res) => {
     chunkable,
     inputChunkProcessingType,
     inputChunkSize,
-    chunkOutputSize,
+    chunkOutputSizes: chunkable ? (chunkOutputSizes || [chunkOutputSize]) : undefined, // NEW: Array
     inputElementSizeBytes,
     outputAggregationMethod,
     isChunkParent: chunkable,
     dispatchesMade: 0,
     activeAssignments: new Set(),
-    compilationOptions
+    compilationOptions,
+
+    // Backward compatibility fields
+    outputSize: finalOutputSizes[0],
+    chunkOutputSize: chunkable ? (chunkOutputSizes?.[0] || chunkOutputSize) : undefined
   };
 
   if (framework === 'cuda' && !compilationOptions.deviceId) {
@@ -526,7 +610,7 @@ app.post('/api/workloads', (req, res) => {
 
   saveCustomWorkloads();
   broadcastCustomWorkloadList();
-  console.log(`🔡 ${framework.toUpperCase()} workload ${id} (${workloadMeta.label}) queued.`);
+  console.log(`📡 ${framework.toUpperCase()} workload ${id} (${workloadMeta.label}) queued.`);
   res.json({ ok: true, id, message: `${framework.toUpperCase()} workload "${workloadMeta.label}" queued.` });
 });
 
@@ -567,7 +651,7 @@ app.post('/api/workloads/startQueued', (req, res) => {
           cd.dispatchesMade = 0;
           cd.submissions = [];
           cd.activeAssignments.clear();
-          cd.verified_result_base64 = null;
+          cd.verified_results = null;
         });
         io.emit('workload:parent_started', { id: wl.id, label: wl.label, status: wl.status });
         activatedChunkParents++;
@@ -636,8 +720,25 @@ function prepareAndQueueChunks(parentWorkload) {
     customWorkloadChunks.delete(parentId);
   }
 
-  const inputData = Buffer.from(parentWorkload.input || '', 'base64');
+  // NEW: Parse input data (single or multi-input)
+  let parsedInputs = {};
+  if (parentWorkload.input) {
+    try {
+      if (typeof parentWorkload.input === 'string' && parentWorkload.input.startsWith('{')) {
+        parsedInputs = JSON.parse(parentWorkload.input);
+      } else {
+        parsedInputs = { input: parentWorkload.input };
+      }
+    } catch (e) {
+      parsedInputs = { input: parentWorkload.input };
+    }
+  }
+
+  // Calculate chunk info based on the first input (or assume empty if no inputs)
+  const firstInputKey = Object.keys(parsedInputs)[0];
+  const inputData = firstInputKey ? Buffer.from(parsedInputs[firstInputKey], 'base64') : Buffer.alloc(0);
   const totalInputBytes = inputData.length;
+
   let actualChunkSizeBytes;
   if (parentWorkload.inputChunkProcessingType === 'elements') {
     actualChunkSizeBytes = parentWorkload.inputChunkSize * parentWorkload.inputElementSizeBytes;
@@ -659,8 +760,8 @@ function prepareAndQueueChunks(parentWorkload) {
     expectedChunks: numChunks,
     status: 'awaiting_start',
     aggregationMethod: parentWorkload.outputAggregationMethod,
-    finalOutputSize: parentWorkload.outputSize,
-    chunkOutputSize: parentWorkload.chunkOutputSize
+    finalOutputSizes: parentWorkload.outputSizes, // NEW: Array
+    chunkOutputSizes: parentWorkload.chunkOutputSizes // NEW: Array
   };
 
   for (let i = 0; i < numChunks; i++) {
@@ -669,7 +770,13 @@ function prepareAndQueueChunks(parentWorkload) {
     const currentChunkByteLength = Math.min(actualChunkSizeBytes, totalInputBytes - byteOffset);
     if (currentChunkByteLength <= 0) continue;
 
-    const chunkInputDataSlice = inputData.slice(byteOffset, byteOffset + currentChunkByteLength);
+    // NEW: Create input chunks for all inputs
+    const chunkInputs = {};
+    for (const [inputName, inputBase64] of Object.entries(parsedInputs)) {
+      const inputBuffer = Buffer.from(inputBase64, 'base64');
+      const chunkInputSlice = inputBuffer.slice(byteOffset, byteOffset + currentChunkByteLength);
+      chunkInputs[inputName] = chunkInputSlice.toString('base64');
+    }
 
     const chunkDef = {
       parentId,
@@ -682,14 +789,15 @@ function prepareAndQueueChunks(parentWorkload) {
       entry: parentWorkload.entry,
       workgroupCount: parentWorkload.workgroupCount,
       bindLayout: parentWorkload.bindLayout,
-      outputSize: parentWorkload.chunkOutputSize,
-      inputData: chunkInputDataSlice.toString('base64'),
+      outputSizes: parentWorkload.chunkOutputSizes, // NEW: Array for this chunk
+      inputData: Object.keys(chunkInputs).length === 1 ? Object.values(chunkInputs)[0] : JSON.stringify(chunkInputs), // Backward compatibility
+      inputs: Object.keys(chunkInputs).length > 1 ? Object.values(chunkInputs) : [Object.values(chunkInputs)[0] || ''], // NEW: Array for client
       chunkUniforms: {},
       dispatchesMade: 0,
       submissions: [],
       activeAssignments: new Set(),
       assignedClients: new Set(),
-      verified_result_base64: null,
+      verified_results: null, // Will be array of base64 strings
       compilationOptions: parentWorkload.compilationOptions
     };
 
@@ -706,7 +814,7 @@ function prepareAndQueueChunks(parentWorkload) {
   }
 
   customWorkloadChunks.set(parentId, chunksForParent);
-  console.log(`Workload ${parentId}: Prepared ${chunksForParent.allChunkDefs.length} chunks with output size ${parentWorkload.chunkOutputSize} each.`);
+  console.log(`Workload ${parentId}: Prepared ${chunksForParent.allChunkDefs.length} chunks with ${parentWorkload.outputSizes?.length || 1} outputs each.`);
   return { success: true };
 }
 
@@ -879,7 +987,7 @@ function assignCustomChunkToAvailableClients() {
       for (const cd of store.allChunkDefs) {
         if (
           cd.status !== 'completed' &&
-          !cd.verified_result_base64 &&
+          !cd.verified_results &&
           cd.dispatchesMade < ADMIN_K_PARAMETER &&
           !cd.assignedClients.has(clientId)
         ) {
@@ -895,11 +1003,14 @@ function assignCustomChunkToAvailableClients() {
             ...cd,
             framework: parent.framework,
             compilationOptions: parent.compilationOptions,
-            enhanced: parent.enhanced
+            enhanced: parent.enhanced,
+            // NEW: Send inputs and outputSizes as arrays
+            inputs: cd.inputs || [cd.inputData || ''],
+            outputSizes: cd.outputSizes || [cd.outputSize]
           };
 
           client.socket.emit('workload:chunk_assign', taskData);
-          console.log(`Assigned ${parent.framework} chunk ${cd.chunkId} to ${clientId}`);
+          console.log(`Assigned ${parent.framework} chunk ${cd.chunkId} to ${clientId} (${cd.inputs?.length || 1} inputs, ${cd.outputSizes?.length || 1} outputs)`);
           break;
         }
       }
@@ -930,9 +1041,26 @@ function tryDispatchNonChunkedWorkloads() {
         client.isBusyWithNonChunkedWGSL = true;
         console.log(`Dispatching ${wl.framework} workload ${wl.label} to ${clientId}`);
 
+        // NEW: Parse inputs for non-chunked workloads
+        let parsedInputs = {};
+        if (wl.input) {
+          try {
+            if (typeof wl.input === 'string' && wl.input.startsWith('{')) {
+              parsedInputs = JSON.parse(wl.input);
+            } else {
+              parsedInputs = { input: wl.input };
+            }
+          } catch (e) {
+            parsedInputs = { input: wl.input };
+          }
+        }
+
         const taskData = {
           ...wl,
-          compilationOptions: wl.compilationOptions
+          compilationOptions: wl.compilationOptions,
+          // NEW: Send as arrays for consistency
+          inputs: Object.values(parsedInputs),
+          outputSizes: wl.outputSizes || [wl.outputSize]
         };
 
         client.socket.emit('workload:new', taskData);
@@ -966,7 +1094,7 @@ function handleClientDisconnect(clientId) {
           cd.assignedTo = null;
           cd.assignedAt = null;
         }
-        if (!cd.verified_result_base64 && cd.activeAssignments.size === 0 && cd.status === 'active') {
+        if (!cd.verified_results && cd.activeAssignments.size === 0 && cd.status === 'active') {
           cd.status = 'queued';
         }
       }
@@ -1123,8 +1251,6 @@ io.on('connection', socket => {
       verified = !!finalData;
     }
 
-    // (old 'counts' loop removed — we now rely on the checksum tally)
-
     if (verified) {
       const ok = processMatrixTaskResult(taskId, finalData, contributors.slice(0, ADMIN_K_PARAMETER));
       if (ok) {
@@ -1139,7 +1265,7 @@ io.on('connection', socket => {
     }
   });
 
-  socket.on('workload:done', ({ id, result, processingTime, reportedChecksum }) => {
+  socket.on('workload:done', ({ id, result, results, processingTime, reportedChecksum }) => {
     const wl = customWorkloads.get(id);
     if (!wl || wl.isChunkParent) {
       socket.emit('workload:error', { id, message: 'Invalid workload ID or is chunk parent.' });
@@ -1150,21 +1276,28 @@ io.on('connection', socket => {
 
     wl.activeAssignments.delete(socket.id);
 
-    const { serverChecksum, byteLength } = checksumFromBase64(result);
+    // NEW: Handle single result or array of results
+    let finalResults = results || [result];
+    if (!Array.isArray(finalResults)) {
+      finalResults = [finalResults];
+    }
+
+    const checksumData = checksumFromResults(finalResults);
     wl.results.push({
       clientId: socket.id,
-      result, // base64 payload
+      results: finalResults, // NEW: Array of results
+      result: finalResults[0], // Backward compatibility
       submissionTime: Date.now(),
       processingTime,
       // NEW fields
-      reportedChecksum: reportedChecksum, // from payload
-      serverChecksum,
-      byteLength
+      reportedChecksum: reportedChecksum,
+      serverChecksum: checksumData.serverChecksum,
+      byteLength: checksumData.byteLength
     });
     wl.processingTimes.push({ clientId: socket.id, timeMs: processingTime });
 
-    // Verify by checksum with K unique voters; also check size if wl.outputSize exists
-    const expected = wl.outputSize; // may be undefined
+    // Verify by checksum with K unique voters; also check size if outputSizes exists
+    const expectedSize = wl.outputSizes ? wl.outputSizes.reduce((a, b) => a + b, 0) : wl.outputSize;
     const tally = tallyKByChecksum(
       wl.results.map(r => ({
         clientId: r.clientId,
@@ -1172,27 +1305,33 @@ io.on('connection', socket => {
         reportedChecksum: r.reportedChecksum,
         byteLength: r.byteLength
       })),
-      expected,
+      expectedSize,
       ADMIN_K_PARAMETER
     );
 
     if (tally.ok) {
       const winner = wl.results.find(r => r.serverChecksum === tally.winningChecksum);
       wl.status = 'complete';
-      wl.finalResult = Array.from(Buffer.from(winner.result, 'base64'));
+      wl.finalResults = winner.results; // NEW: Array
+      wl.finalResult = Array.from(Buffer.concat(winner.results.map(r => Buffer.from(r, 'base64')))); // Concatenated for backward compatibility
       wl.completedAt = Date.now();
-      console.log(`✅ WGSL workload ${id} VERIFIED & COMPLETE.`);
-      io.emit('workload:complete', { id, label: wl.label, finalResult: wl.finalResult });
+      console.log(`✅ ${wl.framework} workload ${id} VERIFIED & COMPLETE.`);
+      io.emit('workload:complete', {
+        id,
+        label: wl.label,
+        finalResults: wl.finalResults, // NEW: Array
+        finalResult: wl.finalResult // Backward compatibility
+      });
     } else {
       wl.status = 'processing';
-      console.log(`WGSL ${id}: ${wl.results.length} submissions, awaiting ${ADMIN_K_PARAMETER}.`);
+      console.log(`${wl.framework} ${id}: ${wl.results.length} submissions, awaiting ${ADMIN_K_PARAMETER}.`);
     }
     saveCustomWorkloads();
     broadcastCustomWorkloadList();
   });
 
   // Enhanced: Handle enhanced chunk completion
-  socket.on('workload:chunk_done_enhanced', ({ parentId, chunkId, result, processingTime, strategy, metadata, reportedChecksum }) => {
+  socket.on('workload:chunk_done_enhanced', ({ parentId, chunkId, results, result, processingTime, strategy, metadata, reportedChecksum }) => {
     const client = matrixState.clients.get(socket.id);
     if (client) client.isBusyWithCustomChunk = false;
 
@@ -1207,10 +1346,16 @@ io.on('connection', socket => {
         return;
       }
 
+      // NEW: Handle single result or array of results
+      let finalResults = results || [result];
+      if (!Array.isArray(finalResults)) {
+        finalResults = [finalResults];
+      }
+
       // Compute server checksum and record submission, then try to verify using shared helper.
       let checksumData;
       try {
-        checksumData = checksumFromBase64(result);
+        checksumData = checksumFromResults(finalResults);
       } catch (err) {
         console.error(`Enhanced chunk ${chunkId} from ${socket.id} invalid base64`);
         return;
@@ -1218,7 +1363,7 @@ io.on('connection', socket => {
 
       const submission = {
         clientId: socket.id,
-        result_base64: result,
+        results: finalResults, // NEW: Array
         processingTime,
         reportedChecksum: reportedChecksum,
         serverChecksum: checksumData.serverChecksum,
@@ -1229,12 +1374,12 @@ io.on('connection', socket => {
 
       // If verification succeeded, hand the verified chunk to chunkingManager for its assembly logic.
       if (verifyRes.verified) {
-        // Use the verified_result_base64 as the canonical chunk payload
-        const verifiedBase64 = cd.verified_result_base64;
+        // Use the verified_results as the canonical chunk payload
+        const verifiedResults = cd.verified_results;
         const assemblyResult = chunkingManager.handleChunkCompletion(
           parentId,
           chunkId,
-          verifiedBase64,
+          verifiedResults,
           processingTime
         );
 
@@ -1278,11 +1423,11 @@ io.on('connection', socket => {
       }
     } else {
       // Fall back to regular chunk processing
-      handleRegularChunkCompletion(parentId, chunkId, result, processingTime, reportedChecksum);
+      handleRegularChunkCompletion(parentId, chunkId, results || [result], processingTime, reportedChecksum);
     }
   });
 
-  socket.on('workload:chunk_done', ({ parentId, chunkId, chunkOrderIndex, result, processingTime, reportedChecksum }) => {
+  socket.on('workload:chunk_done', ({ parentId, chunkId, chunkOrderIndex, results, result, processingTime, reportedChecksum }) => {
     const client = matrixState.clients.get(socket.id);
     if (client) client.isBusyWithCustomChunk = false;
     const parent = customWorkloads.get(parentId);
@@ -1290,14 +1435,20 @@ io.on('connection', socket => {
     if (!parent || !store) return;
 
     const cd = store.allChunkDefs.find(c => c.chunkId === chunkId);
-    if (!cd || cd.verified_result_base64 || cd.status === 'completed') return;
+    if (!cd || cd.verified_results || cd.status === 'completed') return;
 
     cd.activeAssignments.delete(socket.id);
+
+    // NEW: Handle single result or array of results
+    let finalResults = results || [result];
+    if (!Array.isArray(finalResults)) {
+      finalResults = [finalResults];
+    }
 
     // Validate base64 and compute checksum
     let checksumData;
     try {
-      checksumData = checksumFromBase64(result);
+      checksumData = checksumFromResults(finalResults);
     } catch (err) {
       console.error(`Invalid base64 for chunk ${chunkId} from ${socket.id}`);
       return;
@@ -1305,11 +1456,12 @@ io.on('connection', socket => {
 
     const submission = {
       clientId: socket.id,
-      result_base64: result,
+      results: finalResults, // NEW: Array
       processingTime,
       reportedChecksum: reportedChecksum,
       serverChecksum: checksumData.serverChecksum,
-      byteLength: checksumData.byteLength
+      byteLength: checksumData.byteLength,
+      buffers: checksumData.buffers // Individual buffers for assembly
     };
 
     parent.processingTimes.push({ clientId: socket.id, chunkId, timeMs: processingTime });
@@ -1329,15 +1481,37 @@ io.on('connection', socket => {
     ) {
       console.log(`All chunks for ${parentId} verified, aggregating...`);
       parent.status = 'aggregating';
-      parent.finalResult = Array.from(Buffer.concat(
-        Array.from({ length: store.expectedChunks }, (_, i) => store.completedChunksData.get(i))
-      ));
+
+      // NEW: Handle multi-output aggregation
+      if (parent.outputSizes && parent.outputSizes.length > 1) {
+        // Multi-output: aggregate by output index
+        const finalOutputs = {};
+        for (let outputIdx = 0; outputIdx < parent.outputSizes.length; outputIdx++) {
+          const outputBuffers = [];
+          for (let chunkIdx = 0; chunkIdx < store.expectedChunks; chunkIdx++) {
+            const chunkBuffers = store.completedChunksData.get(chunkIdx);
+            if (chunkBuffers && chunkBuffers[outputIdx]) {
+              outputBuffers.push(chunkBuffers[outputIdx]);
+            }
+          }
+          finalOutputs[`output_${outputIdx}`] = Buffer.concat(outputBuffers);
+        }
+        parent.finalOutputs = finalOutputs; // NEW: Object with named outputs
+        parent.finalResult = Array.from(Buffer.concat(Object.values(finalOutputs))); // Concatenated for backward compatibility
+      } else {
+        // Single output: concatenate all chunks
+        parent.finalResult = Array.from(Buffer.concat(
+          Array.from({ length: store.expectedChunks }, (_, i) => store.completedChunksData.get(i))
+        ));
+      }
+
       parent.status = 'complete';
       parent.completedAt = Date.now();
       io.emit('workload:complete', {
         id: parentId,
         label: parent.label,
-        finalResult: parent.finalResult
+        finalResult: parent.finalResult,
+        finalOutputs: parent.finalOutputs // NEW: Multi-output results
       });
 
       saveCustomWorkloads();
@@ -1350,7 +1524,7 @@ io.on('connection', socket => {
 
   function verifyAndRecordChunkSubmission(parent, store, cd, submission, chunkOrderIndex, k) {
     // defensive early return if already verified
-    if (cd.verified_result_base64) {
+    if (cd.verified_results) {
       return { verified: true, winningChecksum: cd._winningChecksum || null, winnerSubmission: null };
     }
 
@@ -1361,7 +1535,11 @@ io.on('connection', socket => {
     if (!dup) cd.submissions.push(submission);
 
     // compute expected size: prefer per-chunk descriptor, fallback to parent-level hint
-    const expectedSize = (cd.outputSize != null) ? cd.outputSize : parent.chunkOutputSize;
+    const expectedSize = (cd.outputSizes && cd.outputSizes.length > 0)
+      ? cd.outputSizes.reduce((a, b) => a + b, 0)
+      : (parent.chunkOutputSizes && parent.chunkOutputSizes.length > 0)
+        ? parent.chunkOutputSizes.reduce((a, b) => a + b, 0)
+        : parent.chunkOutputSize;
 
     // run the generic tally routine
     const tallyResult = tallyKByChecksum(
@@ -1384,7 +1562,7 @@ io.on('connection', socket => {
     const winningChecksum = tallyResult.winningChecksum;
 
     // Avoid race: if another request verified between our tally and now, respect it.
-    if (cd.verified_result_base64) {
+    if (cd.verified_results) {
       return { verified: true, winningChecksum: cd._winningChecksum || winningChecksum, winnerSubmission: null };
     }
 
@@ -1395,32 +1573,31 @@ io.on('connection', socket => {
       return { verified: false, winningChecksum: null, winnerSubmission: null };
     }
 
-    // mark verified, persist winner base64 and store buffer for assembly
-    cd.verified_result_base64 = winner.result_base64;
+    // mark verified, persist winner results and store buffers for assembly
+    cd.verified_results = winner.results; // NEW: Array of results
     cd.status = 'completed';
     cd._winningChecksum = winningChecksum; // keep for debugging / idempotence
 
-    // store buffer for assembly at the chunkOrderIndex
+    // store buffers for assembly at the chunkOrderIndex
     if (!store.completedChunksData) store.completedChunksData = new Map();
-    store.completedChunksData.set(chunkOrderIndex, Buffer.from(winner.result_base64, 'base64'));
+    store.completedChunksData.set(chunkOrderIndex, winner.buffers || winner.results.map(r => Buffer.from(r, 'base64')));
 
     return { verified: true, winningChecksum, winnerSubmission: winner };
   }
 
-
-  function handleRegularChunkCompletion(parentId, chunkId, result, processingTime, reportedChecksum) {
+  function handleRegularChunkCompletion(parentId, chunkId, results, processingTime, reportedChecksum) {
     // Default regular chunk completion path uses the same verification helper.
     const parent = customWorkloads.get(parentId);
     const store = customWorkloadChunks.get(parentId);
     if (!parent || !store) return;
 
     const cd = store.allChunkDefs.find(c => c.chunkId === chunkId);
-    if (!cd || cd.verified_result_base64 || cd.status === 'completed') return;
+    if (!cd || cd.verified_results || cd.status === 'completed') return;
 
     // Validate base64 and compute checksum
     let checksumData;
     try {
-      checksumData = checksumFromBase64(result);
+      checksumData = checksumFromResults(results);
     } catch (err) {
       console.error(`Invalid base64 for chunk ${chunkId} in regular handler`);
       return;
@@ -1428,11 +1605,12 @@ io.on('connection', socket => {
 
     const submission = {
       clientId: 'regular-handler', // anonymous (or could be replaced by actual sender if known)
-      result_base64: result,
+      results: results, // NEW: Array
       processingTime,
       reportedChecksum: reportedChecksum,
       serverChecksum: checksumData.serverChecksum,
-      byteLength: checksumData.byteLength
+      byteLength: checksumData.byteLength,
+      buffers: checksumData.buffers
     };
 
     parent.processingTimes.push({ clientId: submission.clientId, chunkId, timeMs: processingTime });
@@ -1448,7 +1626,7 @@ io.on('connection', socket => {
     if (!parent.finalResult && store.completedChunksData.size === store.expectedChunks) {
       parent.status = 'aggregating';
       parent.finalResult = Array.from(Buffer.concat(
-        Array.from({ length: store.expectedChunks }, (_, i) => store.completedChunksData.get(i))
+        Array.from({ length: store.expectedChunks }, (_, i) => Buffer.concat(store.completedChunksData.get(i) || []))
       ));
       parent.status = 'complete';
       parent.completedAt = Date.now();
@@ -1536,7 +1714,7 @@ io.on('connection', socket => {
             cd.dispatchesMade = 0;
             cd.submissions = [];
             cd.activeAssignments.clear();
-            cd.verified_result_base64 = null;
+            cd.verified_results = null;
           });
           console.log(`Activated chunk parent ${wl.id} with ${store.allChunkDefs.length} chunks.`);
           activatedChunkParents++;

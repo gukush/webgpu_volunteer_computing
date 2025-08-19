@@ -27,6 +27,31 @@ private:
     bool compileKernel(const std::string& source, const std::string& entryPoint,
                       const json& compileOpts, CompiledKernel& result);
 
+    struct BufferSet {
+        std::vector<cl_mem> inputBuffers;
+        std::vector<cl_mem> outputBuffers;
+
+        void clear() {
+            for (auto buf : inputBuffers) {
+                if (buf) clReleaseMemObject(buf);
+            }
+            for (auto buf : outputBuffers) {
+                if (buf) clReleaseMemObject(buf);
+            }
+            inputBuffers.clear();
+            outputBuffers.clear();
+        }
+
+        ~BufferSet() {
+            clear();
+        }
+    };
+
+    bool createInputBuffers(const TaskData& task, BufferSet& buffers);
+    bool createOutputBuffers(const TaskData& task, BufferSet& buffers);
+    bool setKernelArguments(cl_kernel kernel, const BufferSet& buffers, const TaskData& task);
+    bool readOutputBuffers(const BufferSet& buffers, const TaskData& task, TaskResult& result);
+
 public:
     OpenCLExecutor();
     ~OpenCLExecutor() override;

@@ -1,5 +1,5 @@
 // strategies/base/BaseChunkingStrategy.js
-// Base class for all chunking strategies
+// Base class for all chunking strategies with multi-input/output support
 
 export class BaseChunkingStrategy {
   constructor(name) {
@@ -12,6 +12,50 @@ export class BaseChunkingStrategy {
    * @returns {Object} - { valid: boolean, error?: string }
    */
   validateWorkload(workload) {
+    // NEW: Validate multi-input/output constraints
+    const schema = this.defineInputSchema();
+
+    if (workload.input) {
+      const parsedInputs = this.parseMultipleInputs(workload.input, schema);
+      const inputKeys = Object.keys(parsedInputs);
+
+      // Check max inputs
+      if (inputKeys.length > 4) {
+        return {
+          valid: false,
+          error: `Maximum 4 inputs supported, got ${inputKeys.length}`
+        };
+      }
+
+      // Check input names match schema
+      const schemaInputNames = schema.inputs.map(inp => inp.name);
+      for (const inputName of inputKeys) {
+        if (!schemaInputNames.includes(inputName)) {
+          return {
+            valid: false,
+            error: `Input '${inputName}' not defined in schema. Expected: ${schemaInputNames.join(', ')}`
+          };
+        }
+      }
+    }
+
+    // Check output sizes if provided
+    if (workload.outputSizes) {
+      if (workload.outputSizes.length > 3) {
+        return {
+          valid: false,
+          error: `Maximum 3 outputs supported, got ${workload.outputSizes.length}`
+        };
+      }
+
+      if (workload.outputSizes.length !== schema.outputs.length) {
+        return {
+          valid: false,
+          error: `Output sizes length (${workload.outputSizes.length}) doesn't match schema outputs (${schema.outputs.length})`
+        };
+      }
+    }
+
     return { valid: true };
   }
 
@@ -27,7 +71,7 @@ export class BaseChunkingStrategy {
           type: 'storage_buffer',
           binding: 0,
           elementType: 'f32',
-          chunking: 'parallel'
+          chunking: 'parallel' // 'parallel' for chunked, 'replicate' for full copy
         }
       ],
       outputs: [
@@ -47,7 +91,17 @@ export class BaseChunkingStrategy {
    * @returns {Object} - Execution plan
    */
   planExecution(workload) {
-    throw new Error(`${this.name}: planExecution must be implemented by subclass`);
+    const schema = this.defineInputSchema();
+    return {
+      strategy: this.name,
+      totalChunks: 1,
+      schema: schema,
+      metadata: {
+        inputData: workload.input,
+        outputSizes: workload.outputSizes || [workload.outputSize]
+      },
+      assemblyStrategy: this.name.replace('_chunking', '_assembly').replace('chunking', 'assembly')
+    };
   }
 
   /**
@@ -56,7 +110,44 @@ export class BaseChunkingStrategy {
    * @returns {Array} - Array of chunk descriptors
    */
   createChunkDescriptors(plan) {
-    throw new Error(`${this.name}: createChunkDescriptors must be implemented by subclass`);
+    const schema = plan.schema;
+    const parsedInputs = this.parseMultipleInputs(plan.metadata.inputData, schema);
+
+    const descriptors = [];
+    for (let chunkIndex = 0; chunkIndex < plan.totalChunks; chunkIndex++) {
+      // Create inputs array for this chunk
+      const inputChunks = this.chunkInputs(schema, parsedInputs, chunkIndex, plan.totalChunks, plan.metadata);
+
+      // Compute output sizes for this chunk
+      const outputSizes = this.computeChunkOutputSizes(schema, plan.metadata, chunkIndex, plan.totalChunks);
+
+      descriptors.push({
+        chunkId: `${this.name}-${chunkIndex}`,
+        chunkIndex,
+        parentId: plan.parentId,
+
+        framework: 'webgpu',
+        kernel: plan.metadata.customShader || this.getDefaultShader(),
+        entry: 'main',
+        workgroupCount: this.computeWorkgroupCount(chunkIndex, plan),
+
+        inputs: inputChunks, // NEW: Array of base64 strings
+        outputSizes: outputSizes, // NEW: Array of output sizes
+
+        // Backward compatibility
+        inputData: inputChunks[0] || '',
+        outputSize: outputSizes[0] || 0,
+
+        uniforms: this.computeChunkUniforms(chunkIndex, plan),
+
+        assemblyMetadata: {
+          chunkIndex,
+          strategy: this.name
+        }
+      });
+    }
+
+    return descriptors;
   }
 
   /**
@@ -114,6 +205,8 @@ export class BaseChunkingStrategy {
    * @returns {Object} - Parsed inputs by name
    */
   parseMultipleInputs(inputData, schema) {
+    if (!inputData) return {};
+
     // Handle JSON format: {"input_a": "base64...", "input_b": "base64..."}
     if (typeof inputData === 'string' && inputData.startsWith('{')) {
       try {
@@ -133,6 +226,44 @@ export class BaseChunkingStrategy {
   }
 
   /**
+   * Create input chunks for all inputs based on chunking strategy
+   * @param {Object} schema - Input schema
+   * @param {Object} parsedInputs - Parsed inputs by name
+   * @param {number} chunkIndex - Index of this chunk
+   * @param {number} totalChunks - Total number of chunks
+   * @param {Object} chunkingParams - Strategy-specific parameters
+   * @returns {Array} - Array of base64 strings (one per input)
+   */
+  chunkInputs(schema, parsedInputs, chunkIndex, totalChunks, chunkingParams = {}) {
+    const inputChunks = [];
+
+    for (const inputDef of schema.inputs) {
+      const inputData = parsedInputs[inputDef.name];
+
+      if (!inputData) {
+        // Input not provided, add empty string
+        inputChunks.push('');
+        continue;
+      }
+
+      if (inputDef.chunking === 'parallel') {
+        // Chunk this input
+        const chunkedData = this.chunkInput(inputData, chunkIndex, totalChunks, chunkingParams);
+        inputChunks.push(chunkedData);
+      } else if (inputDef.chunking === 'replicate' || inputDef.chunking === 'none') {
+        // Replicate full input to all chunks
+        inputChunks.push(inputData);
+      } else {
+        // Default to parallel chunking
+        const chunkedData = this.chunkInput(inputData, chunkIndex, totalChunks, chunkingParams);
+        inputChunks.push(chunkedData);
+      }
+    }
+
+    return inputChunks;
+  }
+
+  /**
    * Extract a chunk of data from an input based on chunking strategy
    * @param {string|Buffer} inputData - The input data
    * @param {number} chunkIndex - Index of this chunk
@@ -148,5 +279,63 @@ export class BaseChunkingStrategy {
     const end = Math.min(start + chunkSize, buffer.length);
 
     return buffer.slice(start, end).toString('base64');
+  }
+
+  /**
+   * Compute output sizes for a specific chunk
+   * @param {Object} schema - Output schema
+   * @param {Object} metadata - Plan metadata
+   * @param {number} chunkIndex - Index of this chunk
+   * @param {number} totalChunks - Total number of chunks
+   * @returns {Array} - Array of output sizes for this chunk
+   */
+  computeChunkOutputSizes(schema, metadata, chunkIndex, totalChunks) {
+    // Default: use provided chunk output sizes or divide total by chunks
+    const outputSizes = metadata.chunkOutputSizes || metadata.outputSizes;
+
+    if (outputSizes) {
+      return outputSizes;
+    }
+
+    // Fallback: divide total output size by number of chunks
+    const totalOutputSizes = metadata.outputSizes || [metadata.outputSize || 0];
+    return totalOutputSizes.map(size => Math.ceil(size / totalChunks));
+  }
+
+  /**
+   * Compute workgroup count for a specific chunk
+   * @param {number} chunkIndex - Index of this chunk
+   * @param {Object} plan - Execution plan
+   * @returns {Array} - [x, y, z] workgroup count
+   */
+  computeWorkgroupCount(chunkIndex, plan) {
+    // Default workgroup count
+    return [1, 1, 1];
+  }
+
+  /**
+   * Compute uniforms for a specific chunk
+   * @param {number} chunkIndex - Index of this chunk
+   * @param {Object} plan - Execution plan
+   * @returns {Object} - Uniform values
+   */
+  computeChunkUniforms(chunkIndex, plan) {
+    return {
+      chunkIndex: chunkIndex,
+      totalChunks: plan.totalChunks
+    };
+  }
+
+  /**
+   * Get default shader for this strategy
+   * @returns {string} - Shader code
+   */
+  getDefaultShader() {
+    return `
+      @compute @workgroup_size(64, 1, 1)
+      fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
+        // Default shader - implement in subclass
+      }
+    `;
   }
 }

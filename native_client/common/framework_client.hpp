@@ -22,20 +22,42 @@ struct TaskData {
     std::string entry;
     std::vector<int> workgroupCount;
     std::string bindLayout;
-    std::vector<uint8_t> inputData;
-    size_t outputSize;
+
+    // NEW: Multi-input support
+    std::vector<std::vector<uint8_t>> inputData; // Multiple inputs
+    std::vector<size_t> outputSizes; // Multiple output sizes
+
+    // Legacy single input/output (for backward compatibility)
+    std::vector<uint8_t> legacyInputData;
+    size_t legacyOutputSize;
+
     json compilationOptions;
     json chunkUniforms;
     bool isChunk = false;
     std::string chunkId;
     int chunkOrderIndex = -1;
+
+    // Helper methods
+    bool hasMultipleInputs() const { return inputData.size() > 1; }
+    bool hasMultipleOutputs() const { return outputSizes.size() > 1; }
+    size_t getInputCount() const { return std::max(inputData.size(), legacyInputData.empty() ? 0 : 1); }
+    size_t getOutputCount() const { return std::max(outputSizes.size(), legacyOutputSize > 0 ? 1 : 0); }
 };
 
 struct TaskResult {
-    std::vector<uint8_t> outputData;
+    // NEW: Multi-output support
+    std::vector<std::vector<uint8_t>> outputData; // Multiple outputs
+
+    // Legacy single output (for backward compatibility)
+    std::vector<uint8_t> legacyOutputData;
+
     double processingTime;
     bool success;
     std::string errorMessage;
+
+    // Helper methods
+    bool hasMultipleOutputs() const { return outputData.size() > 1; }
+    size_t getOutputCount() const { return std::max(outputData.size(), legacyOutputData.empty() ? 0 : 1); }
 };
 
 class IFrameworkExecutor {
@@ -68,6 +90,10 @@ private:
     void handleChunkAssignment(const json& data);
     void sendResult(const TaskData& task, const TaskResult& result);
     void sendError(const TaskData& task, const std::string& error);
+
+    // NEW: Helper methods for multi-input/output
+    TaskData parseTaskData(const json& data, bool isChunk = false);
+    std::vector<std::vector<uint8_t>> decodeInputs(const json& data);
 
 public:
     FrameworkClient(std::unique_ptr<IFrameworkExecutor> exec);

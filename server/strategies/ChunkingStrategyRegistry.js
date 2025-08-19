@@ -1,5 +1,5 @@
 // strategies/ChunkingStrategyRegistry.js
-// Registry for managing all chunking and assembly strategies
+// Registry for managing all chunking and assembly strategies with multi-input/output support
 
 import { BaseChunkingStrategy } from './base/BaseChunkingStrategy.js';
 import { BaseAssemblyStrategy } from './base/BaseAssemblyStrategy.js';
@@ -203,6 +203,7 @@ export class ChunkingStrategyRegistry {
 
     // Register built-in shader templates
     this.registerShaderTemplate('linear_process', this.getLinearProcessShader());
+    this.registerShaderTemplate('multi_buffer_process', this.getMultiBufferProcessShader());
   }
 
   /**
@@ -238,28 +239,96 @@ export class ChunkingStrategyRegistry {
       }
     `;
   }
+
+  /**
+   * NEW: Get multi-buffer processing shader template
+   * @returns {string} - WGSL shader code for multi-input/output
+   */
+  getMultiBufferProcessShader() {
+    return `
+      struct MultiBufferParams {
+          element_count: u32,
+          operation_type: u32,
+      };
+
+      @group(0) @binding(0) var<uniform> params: MultiBufferParams;
+      @group(0) @binding(1) var<storage, read> input_a: array<f32>;
+      @group(0) @binding(2) var<storage, read> input_b: array<f32>;
+      @group(0) @binding(3) var<storage, read_write> output_sum: array<f32>;
+      @group(0) @binding(4) var<storage, read_write> output_product: array<f32>;
+
+      @compute @workgroup_size(64, 1, 1)
+      fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
+          let index = global_id.x;
+          if (index >= params.element_count) {
+              return;
+          }
+
+          let a = input_a[index];
+          let b = input_b[index];
+
+          // Output 0: sum
+          output_sum[index] = a + b;
+
+          // Output 1: product
+          output_product[index] = a * b;
+      }
+    `;
+  }
 }
 
-// Built-in Linear Chunking Strategy
+// Built-in Linear Chunking Strategy (Updated for Multi-Input/Output)
 class LinearChunkingStrategy extends BaseChunkingStrategy {
   constructor() {
     super('linear');
   }
 
+  /**
+   * Define schema for linear processing
+   */
+  defineInputSchema() {
+    return {
+      inputs: [
+        {
+          name: 'input',
+          type: 'storage_buffer',
+          binding: 1,
+          elementType: 'f32',
+          chunking: 'parallel'
+        }
+      ],
+      outputs: [
+        {
+          name: 'output',
+          type: 'storage_buffer',
+          binding: 2,
+          elementType: 'f32'
+        }
+      ]
+    };
+  }
+
   planExecution(workload) {
     const { elementSize = 4, chunkSize = 1024 } = workload.metadata;
-    const inputBuffer = Buffer.from(workload.input, 'base64');
+    const schema = this.defineInputSchema();
+    const parsedInputs = this.parseMultipleInputs(workload.input, schema);
+
+    // Calculate based on first input
+    const firstInputKey = Object.keys(parsedInputs)[0];
+    const inputBuffer = firstInputKey ? Buffer.from(parsedInputs[firstInputKey], 'base64') : Buffer.alloc(0);
     const totalElements = inputBuffer.length / elementSize;
     const totalChunks = Math.ceil(totalElements / chunkSize);
 
     return {
       strategy: this.name,
       totalChunks,
+      schema: schema,
       metadata: {
         elementSize,
         chunkSize,
         totalElements,
-        inputBuffer
+        inputData: workload.input,
+        outputSizes: workload.outputSizes || [totalElements * elementSize]
       },
       assemblyStrategy: 'linear_assembly',
       shaderTemplate: workload.metadata.shaderTemplate || 'linear_process'
@@ -267,7 +336,9 @@ class LinearChunkingStrategy extends BaseChunkingStrategy {
   }
 
   createChunkDescriptors(plan) {
-    const { elementSize, chunkSize, totalElements, inputBuffer } = plan.metadata;
+    const { elementSize, chunkSize, totalElements } = plan.metadata;
+    const schema = plan.schema;
+    const parsedInputs = this.parseMultipleInputs(plan.metadata.inputData, schema);
     const descriptors = [];
 
     for (let chunkIndex = 0; chunkIndex < plan.totalChunks; chunkIndex++) {
@@ -275,10 +346,11 @@ class LinearChunkingStrategy extends BaseChunkingStrategy {
       const endElement = Math.min((chunkIndex + 1) * chunkSize, totalElements);
       const actualChunkSize = endElement - startElement;
 
-      const chunkData = inputBuffer.slice(
-        startElement * elementSize,
-        endElement * elementSize
-      );
+      // Create input chunks
+      const inputChunks = this.chunkInputs(schema, parsedInputs, chunkIndex, plan.totalChunks, plan.metadata);
+
+      // Compute output sizes
+      const outputSizes = this.computeChunkOutputSizes(schema, plan.metadata, chunkIndex, plan.totalChunks);
 
       descriptors.push({
         chunkId: `linear-${chunkIndex}`,
@@ -290,8 +362,13 @@ class LinearChunkingStrategy extends BaseChunkingStrategy {
         entry: 'main',
         workgroupCount: [Math.ceil(actualChunkSize / 64), 1, 1],
 
-        inputData: chunkData.toString('base64'),
-        outputSize: actualChunkSize * elementSize,
+        // NEW: Multi-input/output support
+        inputs: inputChunks,
+        outputSizes: outputSizes,
+
+        // Backward compatibility
+        inputData: inputChunks[0] || '',
+        outputSize: outputSizes[0] || 0,
 
         uniforms: {
           start_element: startElement,
@@ -310,16 +387,48 @@ class LinearChunkingStrategy extends BaseChunkingStrategy {
     return descriptors;
   }
 
+  /**
+   * Linear chunking: divide input data evenly
+   */
+  chunkInput(inputData, chunkIndex, totalChunks, chunkingParams = {}) {
+    const { elementSize = 4 } = chunkingParams;
+    const buffer = Buffer.from(inputData, 'base64');
+    const totalElements = buffer.length / elementSize;
+    const elementsPerChunk = Math.ceil(totalElements / totalChunks);
+
+    const startElement = chunkIndex * elementsPerChunk;
+    const endElement = Math.min((chunkIndex + 1) * elementsPerChunk, totalElements);
+
+    const startByte = startElement * elementSize;
+    const endByte = endElement * elementSize;
+
+    return buffer.slice(startByte, endByte).toString('base64');
+  }
+
   getDefaultShader() {
-    // Return the linear processing shader template
     return new ChunkingStrategyRegistry().getLinearProcessShader();
   }
 }
 
-// Built-in Linear Assembly Strategy
+// Built-in Linear Assembly Strategy (Updated for Multi-Output)
 class LinearAssemblyStrategy extends BaseAssemblyStrategy {
   constructor() {
     super('linear_assembly');
+  }
+
+  /**
+   * Get default schema for linear assembly
+   */
+  getDefaultSchema() {
+    return {
+      outputs: [
+        {
+          name: 'output',
+          type: 'storage_buffer',
+          elementType: 'f32'
+        }
+      ]
+    };
   }
 
   assembleResults(completedChunks, plan) {
@@ -333,19 +442,27 @@ class LinearAssemblyStrategy extends BaseAssemblyStrategy {
     }
 
     try {
+      const schema = plan.schema || this.getDefaultSchema();
       const sortedChunks = this.sortChunks(completedChunks);
-      const result = this.concatenateResults(sortedChunks);
 
-      return {
-        success: true,
-        data: result.toString('base64'),
-        metadata: this.createAssemblyMetadata(plan, sortedChunks)
-      };
+      // NEW: Handle both single and multi-output
+      if (schema.outputs.length > 1) {
+        return this.assembleMultipleOutputs(sortedChunks, plan, schema);
+      } else {
+        return this.assembleSingleOutput(sortedChunks, plan, schema);
+      }
     } catch (error) {
       return {
         success: false,
-        error: `Assembly failed: ${error.message}`
+        error: `Linear assembly failed: ${error.message}`
       };
     }
+  }
+
+  /**
+   * Assembly single output by concatenation
+   */
+  assembleSingleOutputBuffers(buffers, plan, outputDef) {
+    return Buffer.concat(buffers);
   }
 }

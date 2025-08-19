@@ -1,5 +1,5 @@
 // strategies/EnhancedChunkingManager.js
-// Main manager for enhanced chunking with pluggable strategies
+// Main manager for enhanced chunking with pluggable strategies and multi-input/output support
 
 import { ChunkingStrategyRegistry } from './ChunkingStrategyRegistry.js';
 import { v4 as uuidv4 } from 'uuid';
@@ -27,7 +27,7 @@ export class EnhancedChunkingManager {
         };
       }
 
-      // Validate the workload
+      // Validate the workload (now includes multi-input/output validation)
       const validation = chunkingStrategy.validateWorkload(workload);
       if (!validation.valid) {
         return {
@@ -36,9 +36,18 @@ export class EnhancedChunkingManager {
         };
       }
 
-      // Plan the execution
+      // Plan the execution (now includes schema information)
       const plan = chunkingStrategy.planExecution(workload);
       plan.parentId = workload.id;
+
+      // NEW: Validate schema constraints
+      const schemaValidation = this.validateSchema(plan.schema, workload);
+      if (!schemaValidation.valid) {
+        return {
+          success: false,
+          error: schemaValidation.error
+        };
+      }
 
       // Check for multi-phase execution
       if (plan.executionModel === 'iterative_refinement') {
@@ -47,6 +56,15 @@ export class EnhancedChunkingManager {
 
       // Create chunk descriptors for single-phase execution
       const chunkDescriptors = chunkingStrategy.createChunkDescriptors(plan);
+
+      // NEW: Validate chunk descriptors for multi-input/output compatibility
+      const descriptorValidation = this.validateChunkDescriptors(chunkDescriptors, plan.schema);
+      if (!descriptorValidation.valid) {
+        return {
+          success: false,
+          error: descriptorValidation.error
+        };
+      }
 
       return {
         success: true,
@@ -61,6 +79,132 @@ export class EnhancedChunkingManager {
         error: `Chunking failed: ${error.message}`
       };
     }
+  }
+
+  /**
+   * NEW: Validate schema constraints for multi-input/output
+   * @param {Object} schema - Input/output schema
+   * @param {Object} workload - Original workload
+   * @returns {Object} - Validation result
+   */
+  validateSchema(schema, workload) {
+    if (!schema) {
+      return { valid: true }; // Schema is optional
+    }
+
+    // Validate input limits
+    if (schema.inputs && schema.inputs.length > 4) {
+      return {
+        valid: false,
+        error: `Schema defines ${schema.inputs.length} inputs, maximum 4 supported`
+      };
+    }
+
+    // Validate output limits
+    if (schema.outputs && schema.outputs.length > 3) {
+      return {
+        valid: false,
+        error: `Schema defines ${schema.outputs.length} outputs, maximum 3 supported`
+      };
+    }
+
+    // Validate input names are unique
+    if (schema.inputs) {
+      const inputNames = schema.inputs.map(inp => inp.name);
+      const uniqueNames = new Set(inputNames);
+      if (inputNames.length !== uniqueNames.size) {
+        return {
+          valid: false,
+          error: 'Schema input names must be unique'
+        };
+      }
+    }
+
+    // Validate output names are unique
+    if (schema.outputs) {
+      const outputNames = schema.outputs.map(out => out.name);
+      const uniqueNames = new Set(outputNames);
+      if (outputNames.length !== uniqueNames.size) {
+        return {
+          valid: false,
+          error: 'Schema output names must be unique'
+        };
+      }
+    }
+
+    // Validate binding indices don't conflict
+    if (schema.inputs && schema.outputs) {
+      const allBindings = [
+        ...schema.inputs.map(inp => inp.binding),
+        ...schema.outputs.map(out => out.binding)
+      ].filter(binding => binding !== undefined);
+
+      const uniqueBindings = new Set(allBindings);
+      if (allBindings.length !== uniqueBindings.size) {
+        return {
+          valid: false,
+          error: 'Schema binding indices must be unique'
+        };
+      }
+    }
+
+    return { valid: true };
+  }
+
+  /**
+   * NEW: Validate chunk descriptors for multi-input/output compatibility
+   * @param {Array} chunkDescriptors - Generated chunk descriptors
+   * @param {Object} schema - Input/output schema
+   * @returns {Object} - Validation result
+   */
+  validateChunkDescriptors(chunkDescriptors, schema) {
+    for (const descriptor of chunkDescriptors) {
+      // Validate inputs array
+      if (descriptor.inputs) {
+        if (!Array.isArray(descriptor.inputs)) {
+          return {
+            valid: false,
+            error: `Chunk ${descriptor.chunkId} inputs must be an array`
+          };
+        }
+
+        if (schema && schema.inputs && descriptor.inputs.length !== schema.inputs.length) {
+          return {
+            valid: false,
+            error: `Chunk ${descriptor.chunkId} has ${descriptor.inputs.length} inputs, schema expects ${schema.inputs.length}`
+          };
+        }
+      }
+
+      // Validate output sizes array
+      if (descriptor.outputSizes) {
+        if (!Array.isArray(descriptor.outputSizes)) {
+          return {
+            valid: false,
+            error: `Chunk ${descriptor.chunkId} outputSizes must be an array`
+          };
+        }
+
+        if (schema && schema.outputs && descriptor.outputSizes.length !== schema.outputs.length) {
+          return {
+            valid: false,
+            error: `Chunk ${descriptor.chunkId} has ${descriptor.outputSizes.length} output sizes, schema expects ${schema.outputs.length}`
+          };
+        }
+
+        // Validate all output sizes are positive
+        for (let i = 0; i < descriptor.outputSizes.length; i++) {
+          if (!Number.isInteger(descriptor.outputSizes[i]) || descriptor.outputSizes[i] <= 0) {
+            return {
+              valid: false,
+              error: `Chunk ${descriptor.chunkId} output size ${i} must be a positive integer`
+            };
+          }
+        }
+      }
+    }
+
+    return { valid: true };
   }
 
   /**
@@ -88,6 +232,12 @@ export class EnhancedChunkingManager {
 
       // Create chunk descriptors for this phase
       const phaseChunks = strategy.createPhaseChunkDescriptors(plan, phase, globalState);
+
+      // NEW: Validate phase chunks for multi-input/output
+      const phaseValidation = this.validateChunkDescriptors(phaseChunks, plan.schema);
+      if (!phaseValidation.valid) {
+        throw new Error(`Phase ${phase.phaseId} validation failed: ${phaseValidation.error}`);
+      }
 
       // Execute all chunks in this phase in parallel
       const phaseResults = await this.executePhaseChunks(phaseChunks, workload.id);
@@ -131,16 +281,26 @@ export class EnhancedChunkingManager {
       let completedChunks = 0;
 
       // Set up completion handler for this phase
-      const phaseCompletionHandler = (chunkId, result, processingTime) => {
+      const phaseCompletionHandler = (chunkId, results, processingTime) => {
         const chunkDesc = chunkDescriptors.find(desc => desc.chunkId === chunkId);
         if (!chunkDesc) return;
 
+        // NEW: Handle multi-result format
+        let finalResults = results;
+        if (!Array.isArray(finalResults)) {
+          finalResults = [finalResults];
+        }
+
         results.set(chunkId, {
           chunkId,
-          result,
+          results: finalResults, // NEW: Always store as array
+          result: finalResults[0], // Backward compatibility
           processingTime,
           assemblyMetadata: chunkDesc.assemblyMetadata,
-          metadata: { arraySize: chunkDesc.uniforms?.array_size }
+          metadata: {
+            arraySize: chunkDesc.uniforms?.array_size,
+            outputCount: finalResults.length
+          }
         });
 
         completedChunks++;
@@ -172,34 +332,47 @@ export class EnhancedChunkingManager {
    * Handle completion of a chunk (called by server)
    * @param {string} parentId - Parent workload ID
    * @param {string} chunkId - Chunk ID
-   * @param {string} result - Chunk result
+   * @param {string|Array} result - Chunk result(s)
    * @param {number} processingTime - Processing time
    * @returns {Object} - Assembly result if complete
    */
   handleChunkCompletion(parentId, chunkId, result, processingTime) {
+    // NEW: Handle both single result and multi-result formats
+    let results = result;
+    if (!Array.isArray(results)) {
+      results = [results];
+    }
+
     // Handle iterative workload chunk completion
     const handler = this.phaseCompletionHandlers.get(parentId);
     if (handler) {
-      handler(chunkId, result, processingTime);
+      handler(chunkId, results, processingTime);
       return { success: true, status: 'phase_in_progress' };
     }
 
     // Handle regular chunked workload completion
-    return this.handleRegularChunkCompletion(parentId, chunkId, result, processingTime);
+    return this.handleRegularChunkCompletion(parentId, chunkId, results, processingTime);
   }
 
   /**
    * Handle completion of a regular (non-iterative) chunk
    * @param {string} parentId - Parent workload ID
    * @param {string} chunkId - Chunk ID
-   * @param {string} result - Chunk result
+   * @param {Array} results - Chunk results (array)
    * @param {number} processingTime - Processing time
    * @returns {Object} - Assembly result
    */
-  handleRegularChunkCompletion(parentId, chunkId, result, processingTime) {
+  handleRegularChunkCompletion(parentId, chunkId, results, processingTime) {
     // This would integrate with the existing chunk completion logic
-    // For now, return a placeholder
-    return { success: true, status: 'chunk_completed' };
+    // The server will handle the actual assembly using the assembly strategy
+
+    console.log(`Chunk ${chunkId} completed with ${results.length} outputs`);
+
+    return {
+      success: true,
+      status: 'chunk_completed',
+      outputCount: results.length
+    };
   }
 
   /**
@@ -220,7 +393,21 @@ export class EnhancedChunkingManager {
    * @returns {Float32Array} - Parsed array
    */
   parseInitialArray(inputData, metadata) {
-    const buffer = Buffer.from(inputData, 'base64');
+    // NEW: Handle multi-input format
+    let actualInputData = inputData;
+
+    if (typeof inputData === 'string' && inputData.startsWith('{')) {
+      try {
+        const parsedInputs = JSON.parse(inputData);
+        // Use the first input for array parsing
+        const firstInputKey = Object.keys(parsedInputs)[0];
+        actualInputData = parsedInputs[firstInputKey];
+      } catch (e) {
+        console.warn('Failed to parse multi-input JSON, using as single input');
+      }
+    }
+
+    const buffer = Buffer.from(actualInputData, 'base64');
     return new Float32Array(buffer.buffer);
   }
 

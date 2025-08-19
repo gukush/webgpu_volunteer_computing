@@ -367,10 +367,12 @@ TaskResult VulkanExecutor::executeTask(const TaskData& task) {
 
         // Buffers
         if (hasInput) {
-            VK_CHECK(createBuffer(task.inputData.size(),
+            if(!createBuffer(task.inputData.size(),
                                   VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
                                   VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
-                                  inputBuffer, inputMem));
+                                  inputBuffer, inputMem)) {
+                                    throw std::runtime_error("Failed to create input buffer");
+                                  }
             // Map & write input
             void* p = nullptr;
             VkResult mapRes = vkMapMemory(device, inputMem, 0, task.inputData.size(), 0, &p);
@@ -380,10 +382,12 @@ TaskResult VulkanExecutor::executeTask(const TaskData& task) {
         }
 
         if (task.outputSize == 0) throw std::runtime_error("outputSize must be > 0");
-        VK_CHECK(createBuffer(task.outputSize,
-                              VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
-                              VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
-                              outputBuffer, outputMem));
+        if (!createBuffer(task.outputSize,
+                  VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+                  VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                  outputBuffer, outputMem)) {
+                throw std::runtime_error("Failed to create output buffer");
+            }
 
         // Allocate descriptor set
         VkDescriptorSetLayout layouts[1] = { descriptorSetLayout };
@@ -463,12 +467,13 @@ TaskResult VulkanExecutor::executeTask(const TaskData& task) {
         void* mapped = nullptr;
         VkResult mapRes = vkMapMemory(device, outputMem, 0, task.outputSize, 0, &mapped);
         if (mapRes != VK_SUCCESS || !mapped) throw std::runtime_error("vkMapMemory failed for output buffer");
-        result.output.assign(reinterpret_cast<uint8_t*>(mapped), reinterpret_cast<uint8_t*>(mapped) + task.outputSize);
+        auto* b = static_cast<uint8_t*>(mapped);
+        result.outputData.assign(b, b + task.outputSize);
         vkUnmapMemory(device, outputMem);
 
         result.success = true;
         auto end = std::chrono::high_resolution_clock::now();
-        result.computeTimeMs = std::chrono::duration_cast<std::chrono::milliseconds>(end - startTime).count();
+        // TODO: fix time measurement result.computeTimeMs = std::chrono::duration_cast<std::chrono::milliseconds>(end - startTime).count();
         result.errorMessage.clear();
     } catch (const std::exception& e) {
         result.success = false;

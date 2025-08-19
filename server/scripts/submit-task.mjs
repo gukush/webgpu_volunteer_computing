@@ -22,13 +22,13 @@ Multi-Framework Volunteer Computing Task Submission
 Usage:
   # Traditional commands
   node submit-task.mjs matrix --size <int> --chunk <int> [--host <url>]
-  node submit-task.mjs compute --framework <fw> --kernel <file> --label <name> --workgroups <x,y,z> --output-size <bytes> [options...]
-  node submit-task.mjs wgsl --wgsl <file.wgsl> --label <name> --workgroups <x,y,z> --output-size <bytes> [options...]
+  node submit-task.mjs compute --framework <fw> --kernel <file> --label <name> --workgroups <x,y,z> --output-sizes <bytes1,bytes2> [options...]
+  node submit-task.mjs wgsl --wgsl <file.wgsl> --label <name> --workgroups <x,y,z> --output-sizes <bytes> [options...]
 
   # Enhanced commands (new)
   node submit-task.mjs compute-advanced --framework <fw> --kernel <file> --chunking <strategy> --assembly <strategy> --metadata <json> [options...]
   node submit-task.mjs matrix-tiled --size <int> --tile-size <int> [--label <name>]
-  node submit-task.mjs sort --algorithm <alg> --array-size <int> [--chunk-size <int>] [--input <file>]
+  node submit-task.mjs sort --algorithm <alg> --array-size <int> [--chunk-size <int>] [--inputs <file>]
   node submit-task.mjs strategy-upload --type <chunking|assembly> --name <name> --file <strategy.js>
   node submit-task.mjs strategies-list
   node submit-task.mjs frameworks
@@ -41,6 +41,13 @@ Usage:
 Frameworks:
   ${Object.keys(SUPPORTED_FRAMEWORKS).join(', ')}
 
+Multi-Input/Output Options:
+  --inputs <inputs.json>     Multi-input JSON file: {"input_a": "./path_a.bin", "input_b": "./path_b.bin"}
+  --input <file>             Single input file (backward compatibility)
+  --output-sizes <n1,n2,n3>  Comma-separated output sizes (up to 3 outputs)
+  --output-size <n>          Single output size (backward compatibility)
+  --chunk-output-sizes <n1,n2,n3>  Per-chunk output sizes (for chunkable workloads)
+
 Enhanced Compute Options:
   --framework <framework>     Computing framework (required)
   --kernel <file>            Kernel source file (required)
@@ -48,7 +55,6 @@ Enhanced Compute Options:
   --assembly <strategy>      Assembly strategy name or .js file (required)
   --metadata <json>          Strategy-specific metadata (required)
   --label <name>             Human-readable label
-  --input <file>             Input data file (binary, required for chunking)
   --compilation-opts <json>  Framework-specific options
 
 Built-in Strategies:
@@ -61,6 +67,15 @@ Sorting Algorithms:
   sample     - Sample sort (good for very large arrays)
 
 Examples:
+  # Multi-input/output compute workload
+  node submit-task.mjs compute \\
+    --framework webgpu \\
+    --kernel ./multi_buffer.wgsl \\
+    --inputs ./inputs.json \\
+    --output-sizes 4096,2048,1024 \\
+    --workgroups 64,1,1 \\
+    --label "Multi-Buffer Processing"
+
   # Enhanced tiled matrix multiplication
   node submit-task.mjs matrix-tiled --size 1024 --tile-size 64 --label "Large Matrix"
 
@@ -74,31 +89,14 @@ Examples:
     --chunking image_tiled \\
     --assembly image_tiled_assembly \\
     --metadata '{"imageWidth": 1920, "imageHeight": 1080, "tileSize": 128}' \\
-    --input ./image_data.bin \\
+    --inputs ./inputs.json \\
     --label "Image Blur Processing"
-
-  # Multi-framework support
-  node submit-task.mjs compute-advanced \\
-    --framework cuda \\
-    --kernel ./fluid_sim.cu \\
-    --chunking ./custom_chunking.js \\
-    --assembly ./custom_assembly.js \\
-    --metadata '{"gridSize": 512, "timeSteps": 100}' \\
-    --input ./initial_conditions.bin \\
-    --compilation-opts '{"deviceId": 0, "computeCapability": "7.5"}'
-
-  # Iterative sorting
-  node submit-task.mjs sort --algorithm bitonic --array-size 2048 --chunk-size 64
-
-  # List available strategies and frameworks
-  node submit-task.mjs strategies-list
-  node submit-task.mjs frameworks
 
 Chunking Options (traditional):
   --chunkable                Enable input chunking
   --chunk-type <type>        Chunking type: elements|bytes
   --chunk-size <n>           Size per chunk
-  --chunk-output-size <bytes> Output size per chunk (required for chunking)
+  --chunk-output-sizes <bytes1,bytes2> Output sizes per chunk (required for chunking)
   --elem-size <bytes>        Element size in bytes (for element chunking)
   --agg <method>             Output aggregation method: concatenate
 `);
@@ -254,6 +252,79 @@ async function generateTestData(arraySize, outputFile, dataType = 'float32') {
   return buffer;
 }
 
+// NEW: Helper to load multiple inputs
+async function loadInputs(args) {
+  let inputJson = {};
+
+  if (args.inputs) {
+    // Multi-input JSON format
+    try {
+      const inputsConfigPath = path.resolve(args.inputs);
+      const inputsConfig = JSON.parse(await fs.readFile(inputsConfigPath, 'utf8'));
+
+      for (const [name, filePath] of Object.entries(inputsConfig)) {
+        if (filePath) {
+          const buf = await fs.readFile(path.resolve(filePath));
+          inputJson[name] = buf.toString('base64');
+        }
+      }
+    } catch (err) {
+      console.error(`Failed to load inputs from ${args.inputs}: ${err.message}`);
+      process.exit(1);
+    }
+  } else if (args.input) {
+    // Backward compatibility: single input
+    try {
+      const buf = await fs.readFile(path.resolve(args.input));
+      inputJson['input'] = buf.toString('base64');
+    } catch (err) {
+      console.error(`Failed to load input from ${args.input}: ${err.message}`);
+      process.exit(1);
+    }
+  }
+
+  return inputJson;
+}
+
+// NEW: Helper to parse output sizes
+function parseOutputSizes(args) {
+  let outputSizes = [];
+
+  if (args['output-sizes']) {
+    outputSizes = args['output-sizes'].split(',').filter(Boolean).map(n => parseInt(n, 10));
+  } else if (args['output-size']) {
+    // Backward compatibility
+    outputSizes = [parseInt(args['output-size'], 10)];
+  }
+
+  // Validate sizes
+  if (outputSizes.some(n => !Number.isInteger(n) || n <= 0)) {
+    console.error('All output sizes must be positive integers');
+    process.exit(1);
+  }
+
+  if (outputSizes.length > 3) {
+    console.error('Maximum 3 outputs supported');
+    process.exit(1);
+  }
+
+  return outputSizes;
+}
+
+// NEW: Helper to parse chunk output sizes
+function parseChunkOutputSizes(args) {
+  if (!args['chunk-output-sizes']) return [];
+
+  const sizes = args['chunk-output-sizes'].split(',').filter(Boolean).map(n => parseInt(n, 10));
+
+  if (sizes.some(n => !Number.isInteger(n) || n <= 0)) {
+    console.error('All chunk output sizes must be positive integers');
+    process.exit(1);
+  }
+
+  return sizes;
+}
+
 async function main() {
   const [, , cmd, ...rest] = process.argv;
   const args = parseArgs(rest);
@@ -261,7 +332,7 @@ async function main() {
 
   if (!cmd || args.help || args.h) return printHelp();
 
-  // Traditional commands
+  // Traditional commands (unchanged)
   if (cmd === 'matrix') {
     const size = parseInt(args.size, 10);
     const chunk = parseInt(args.chunk, 10);
@@ -391,11 +462,6 @@ async function main() {
       process.exit(1);
     }
 
-    if (!args.input) {
-      console.error('compute-advanced: --input <file> is required for advanced chunked workloads');
-      process.exit(1);
-    }
-
     const kernel = await readKernelFile(args.kernel, framework);
     const metadata = await parseJSON(args.metadata, 'metadata');
     const compilationOptions = await parseJSON(args['compilation-opts'], 'compilation options');
@@ -403,20 +469,10 @@ async function main() {
     const chunkingStrategy = await resolveStrategy(args.chunking, 'chunking', base);
     const assemblyStrategy = await resolveStrategy(args.assembly, 'assembly', base);
 
-    // Handle different input formats
-    let inputData;
-    try {
-      if (args.input.endsWith('.json')) {
-        // Multi-input JSON format
-        const inputContent = await fs.readFile(path.resolve(args.input), 'utf8');
-        inputData = inputContent;
-      } else {
-        // Binary input file
-        const inputBuffer = await fs.readFile(path.resolve(args.input));
-        inputData = inputBuffer.toString('base64');
-      }
-    } catch (err) {
-      console.error(`Failed to read input file ${args.input}: ${err.message}`);
+    // Load inputs
+    const inputJson = await loadInputs(args);
+    if (Object.keys(inputJson).length === 0) {
+      console.error('compute-advanced: at least one input is required (use --inputs or --input)');
       process.exit(1);
     }
 
@@ -428,7 +484,7 @@ async function main() {
       chunkingStrategy,
       assemblyStrategy,
       framework,
-      input: inputData,
+      input: JSON.stringify(inputJson),
       metadata: {
         ...metadata,
         customShader: kernel,
@@ -479,14 +535,15 @@ async function main() {
       process.exit(1);
     }
 
+    const inputJson = await loadInputs(args);
     let inputData;
-    if (args.input) {
-      const buf = await fs.readFile(path.resolve(args.input));
-      inputData = buf.toString('base64');
+
+    if (Object.keys(inputJson).length > 0) {
+      inputData = JSON.stringify(inputJson);
     } else {
       console.log('No input file provided, generating random test data...');
       const testBuffer = await generateTestData(arraySize, `test_array_${arraySize}.bin`);
-      inputData = testBuffer.toString('base64');
+      inputData = JSON.stringify({ input: testBuffer.toString('base64') });
     }
 
     const strategyMap = {
@@ -538,9 +595,10 @@ async function main() {
       process.exit(1);
     }
 
-    const outputSize = parseInt(args['output-size'], 10);
-    if (!Number.isInteger(outputSize) || outputSize <= 0) {
-      console.error('compute: --output-size is required and must be > 0');
+    // NEW: Parse multiple output sizes
+    const outputSizes = parseOutputSizes(args);
+    if (outputSizes.length === 0) {
+      console.error('compute: --output-sizes or --output-size is required');
       process.exit(1);
     }
 
@@ -556,11 +614,8 @@ async function main() {
     const bindLayout = args.bind || defaultBindLayouts[framework];
     const compilationOptions = await parseCompilationOptions(args['compilation-opts']);
 
-    let inputBase64 = undefined;
-    if (args.input) {
-      const buf = await fs.readFile(path.resolve(args.input));
-      inputBase64 = buf.toString('base64');
-    }
+    // NEW: Load inputs
+    const inputJson = await loadInputs(args);
 
     const payload = {
       label,
@@ -569,28 +624,33 @@ async function main() {
       entry,
       workgroupCount: workgroups,
       bindLayout,
-      outputSize,
-      input: inputBase64,
+      outputSizes, // NEW: Array instead of single outputSize
+      input: Object.keys(inputJson).length > 0 ? JSON.stringify(inputJson) : undefined,
       chunkable: !!args.chunkable,
       compilationOptions
     };
 
     if (args.chunkable) {
-      // Validate chunk output size is provided for chunking
-      const chunkOutputSize = parseInt(args['chunk-output-size'], 10);
-      if (!Number.isInteger(chunkOutputSize) || chunkOutputSize <= 0) {
-        console.error('compute: --chunk-output-size is required for chunkable workloads and must be > 0');
+      // NEW: Validate chunk output sizes
+      const chunkOutputSizes = parseChunkOutputSizes(args);
+      if (chunkOutputSizes.length === 0) {
+        console.error('compute: --chunk-output-sizes is required for chunkable workloads');
+        process.exit(1);
+      }
+
+      if (chunkOutputSizes.length !== outputSizes.length) {
+        console.error('compute: --chunk-output-sizes must match number of outputs');
         process.exit(1);
       }
 
       payload.inputChunkProcessingType = args['chunk-type'] || 'elements';
       payload.inputChunkSize = parseInt(args['chunk-size'] || '1024', 10);
-      payload.chunkOutputSize = chunkOutputSize;
+      payload.chunkOutputSizes = chunkOutputSizes; // NEW: Array
       payload.inputElementSizeBytes = parseInt(args['elem-size'] || '4', 10);
       payload.outputAggregationMethod = args.agg || 'concatenate';
 
-      if (!args.input) {
-        console.error('compute: --input is required for chunkable workloads');
+      if (Object.keys(inputJson).length === 0) {
+        console.error('compute: at least one input is required for chunkable workloads');
         process.exit(1);
       }
     }
@@ -620,18 +680,17 @@ async function main() {
       process.exit(1);
     }
 
-    const outputSize = parseInt(args['output-size'], 10);
-    if (!Number.isInteger(outputSize) || outputSize <= 0) {
-      console.error('wgsl: --output-size is required and must be > 0');
+    // NEW: Parse output sizes for backward compatibility
+    const outputSizes = parseOutputSizes(args);
+    if (outputSizes.length === 0) {
+      console.error('wgsl: --output-sizes or --output-size is required');
       process.exit(1);
     }
 
     const bindLayout = args.bind || 'storage-in-storage-out';
-    let inputBase64 = undefined;
-    if (args.input) {
-      const buf = await fs.readFile(path.resolve(args.input));
-      inputBase64 = buf.toString('base64');
-    }
+
+    // NEW: Load inputs
+    const inputJson = await loadInputs(args);
 
     const payload = {
       label,
@@ -641,22 +700,22 @@ async function main() {
       entry,
       workgroupCount: workgroups,
       bindLayout,
-      outputSize,
-      input: inputBase64,
+      outputSizes, // NEW: Array
+      input: Object.keys(inputJson).length > 0 ? JSON.stringify(inputJson) : undefined,
       chunkable: !!args.chunkable
     };
 
     if (args.chunkable) {
-      // Also validate chunk output size for legacy WGSL command
-      const chunkOutputSize = parseInt(args['chunk-output-size'], 10);
-      if (!Number.isInteger(chunkOutputSize) || chunkOutputSize <= 0) {
-        console.error('wgsl: --chunk-output-size is required for chunkable workloads and must be > 0');
+      // NEW: Handle chunk output sizes for legacy WGSL command
+      const chunkOutputSizes = parseChunkOutputSizes(args);
+      if (chunkOutputSizes.length === 0) {
+        console.error('wgsl: --chunk-output-sizes is required for chunkable workloads');
         process.exit(1);
       }
 
       payload.inputChunkProcessingType = args['chunk-type'] || 'elements';
       payload.inputChunkSize = parseInt(args['chunk-size'] || '1024', 10);
-      payload.chunkOutputSize = chunkOutputSize;
+      payload.chunkOutputSizes = chunkOutputSizes; // NEW: Array
       payload.inputElementSizeBytes = parseInt(args['elem-size'] || '4', 10);
       payload.outputAggregationMethod = args.agg || 'concatenate';
     }

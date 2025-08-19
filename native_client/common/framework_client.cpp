@@ -1,5 +1,7 @@
 #include "framework_client.hpp"
 #include <iostream>
+#include <thread>
+#include <chrono>
 #include <boost/url.hpp>
 
 FrameworkClient::FrameworkClient(std::unique_ptr<IFrameworkExecutor> exec)
@@ -123,6 +125,91 @@ void FrameworkClient::onMessage(const std::string& message) {
     }
 }
 
+std::vector<std::vector<uint8_t>> FrameworkClient::decodeInputs(const json& data) {
+    std::vector<std::vector<uint8_t>> inputs;
+
+    // NEW: Check for multi-input format first
+    if (data.contains("inputs") && data["inputs"].is_array()) {
+        // Multi-input format: ["base64_1", "base64_2", ...]
+        for (const auto& inputBase64 : data["inputs"]) {
+            if (inputBase64.is_string() && !inputBase64.get<std::string>().empty()) {
+                inputs.push_back(base64_decode(inputBase64.get<std::string>()));
+            } else {
+                inputs.push_back(std::vector<uint8_t>()); // Empty input
+            }
+        }
+    } else if (data.contains("input") && !data["input"].is_null()) {
+        // Legacy single input format
+        std::string inputBase64 = data["input"];
+        if (!inputBase64.empty()) {
+            inputs.push_back(base64_decode(inputBase64));
+        }
+    } else if (data.contains("inputData") && !data["inputData"].is_null()) {
+        // Chunk format single input
+        std::string inputBase64 = data["inputData"];
+        if (!inputBase64.empty()) {
+            inputs.push_back(base64_decode(inputBase64));
+        }
+    }
+
+    return inputs;
+}
+
+TaskData FrameworkClient::parseTaskData(const json& data, bool isChunk) {
+    TaskData task;
+
+    if (isChunk) {
+        task.id = data["chunkId"];
+        task.parentId = data["parentId"];
+        task.chunkId = data["chunkId"];
+        task.chunkOrderIndex = data.value("chunkOrderIndex", -1);
+        task.isChunk = true;
+    } else {
+        task.id = data["id"];
+    }
+
+    task.framework = data["framework"];
+    task.kernel = data.contains("kernel") ? data["kernel"].get<std::string>() : data["wgsl"].get<std::string>();
+    task.entry = data["entry"];
+    task.bindLayout = data["bindLayout"];
+    task.compilationOptions = data.value("compilationOptions", json::object());
+
+    if (isChunk) {
+        task.chunkUniforms = data.value("chunkUniforms", json::object());
+    }
+
+    // Parse workgroup count
+    if (data.contains("workgroupCount") && data["workgroupCount"].is_array()) {
+        task.workgroupCount = data["workgroupCount"].get<std::vector<int>>();
+    } else {
+        task.workgroupCount = {1, 1, 1}; // Default
+    }
+
+    // NEW: Parse multi-input data
+    task.inputData = decodeInputs(data);
+
+    // NEW: Parse multi-output sizes
+    if (data.contains("outputSizes") && data["outputSizes"].is_array()) {
+        task.outputSizes = data["outputSizes"].get<std::vector<size_t>>();
+    } else if (data.contains("outputSize")) {
+        // Legacy single output
+        task.outputSizes = {data["outputSize"].get<size_t>()};
+    } else {
+        // Default output size
+        task.outputSizes = {1024};
+    }
+
+    // Set legacy fields for backward compatibility
+    if (!task.inputData.empty()) {
+        task.legacyInputData = task.inputData[0];
+    }
+    if (!task.outputSizes.empty()) {
+        task.legacyOutputSize = task.outputSizes[0];
+    }
+
+    return task;
+}
+
 void FrameworkClient::handleWorkloadAssignment(const json& data) {
     if (busy) {
         // Send busy response
@@ -138,25 +225,7 @@ void FrameworkClient::handleWorkloadAssignment(const json& data) {
     }
 
     try {
-        TaskData task;
-        task.id = data["id"];
-        task.framework = data["framework"];
-        task.kernel = data["kernel"];
-        task.entry = data["entry"];
-        if (data.contains("workgroupCount") && data["workgroupCount"].is_array()) {
-            task.workgroupCount = data["workgroupCount"].get<std::vector<int>>();
-        } else {
-            task.workgroupCount.clear();
-        }
-        task.bindLayout = data["bindLayout"];
-        task.outputSize = data["outputSize"];
-        task.compilationOptions = data.value("compilationOptions", json::object());
-
-        // Decode input data if present
-        if (data.contains("input") && !data["input"].is_null()) {
-            std::string inputBase64 = data["input"];
-            task.inputData = base64_decode(inputBase64);
-        }
+        TaskData task = parseTaskData(data, false);
 
         // Check framework compatibility
         if (task.framework != executor->getFrameworkName()) {
@@ -174,7 +243,8 @@ void FrameworkClient::handleWorkloadAssignment(const json& data) {
         busy = true;
         activeTasks[task.id] = task;
 
-        std::cout << "Executing " << task.framework << " workload: " << task.id << std::endl;
+        std::cout << "Executing " << task.framework << " workload: " << task.id
+                  << " (" << task.getInputCount() << " inputs, " << task.getOutputCount() << " outputs)" << std::endl;
 
         // Execute in separate thread to avoid blocking
         std::thread([this, task]() {
@@ -214,47 +284,50 @@ void FrameworkClient::handleChunkAssignment(const json& data) {
     }
 
     try {
-        TaskData task;
-        task.id = data["chunkId"];
-        task.parentId = data["parentId"];
-        task.framework = data["framework"];
-        task.kernel = data["wgsl"]; // Legacy field name
-        task.entry = data["entry"];
-        if (data.contains("workgroupCount") && data["workgroupCount"].is_array()) {
-            task.workgroupCount = data["workgroupCount"].get<std::vector<int>>();
-        } else {
-            task.workgroupCount.clear();
-        }
-        task.bindLayout = data["bindLayout"];
-        task.outputSize = data.value("outputSize", 1024); // Estimate for chunks
-        task.chunkUniforms = data["chunkUniforms"];
-        task.isChunk = true;
-        task.chunkId = data["chunkId"];
-        task.chunkOrderIndex = data["chunkOrderIndex"];
-
-        // Decode chunk input data
-        std::string inputBase64 = data["inputData"];
-        task.inputData = base64_decode(inputBase64);
+        TaskData task = parseTaskData(data, true);
 
         busy = true;
         activeTasks[task.id] = task;
 
-        std::cout << "Executing chunk: " << task.chunkId << std::endl;
+        std::cout << "Executing chunk: " << task.chunkId
+                  << " (" << task.getInputCount() << " inputs, " << task.getOutputCount() << " outputs)" << std::endl;
 
         // Execute in separate thread
         std::thread([this, task]() {
             TaskResult result = executor->executeTask(task);
 
             if (result.success) {
+                json responseData = {
+                    {"parentId", task.parentId},
+                    {"chunkId", task.chunkId},
+                    {"chunkOrderIndex", task.chunkOrderIndex},
+                    {"processingTime", result.processingTime}
+                };
+
+                // NEW: Send multi-output results
+                if (result.hasMultipleOutputs()) {
+                    json resultsArray = json::array();
+                    for (const auto& output : result.outputData) {
+                        resultsArray.push_back(base64_encode(output));
+                    }
+                    responseData["results"] = resultsArray;
+
+                    // Also send single result for backward compatibility
+                    if (!result.outputData.empty()) {
+                        responseData["result"] = base64_encode(result.outputData[0]);
+                    }
+                } else {
+                    // Single output (legacy format)
+                    if (!result.outputData.empty()) {
+                        responseData["result"] = base64_encode(result.outputData[0]);
+                    } else if (!result.legacyOutputData.empty()) {
+                        responseData["result"] = base64_encode(result.legacyOutputData);
+                    }
+                }
+
                 json response = {
                     {"type", "workload:chunk_done"},
-                    {"data", {
-                        {"parentId", task.parentId},
-                        {"chunkId", task.chunkId},
-                        {"chunkOrderIndex", task.chunkOrderIndex},
-                        {"result", base64_encode(result.outputData)},
-                        {"processingTime", result.processingTime}
-                    }}
+                    {"data", responseData}
                 };
                 wsClient->send("42" + response.dump());
             } else {
@@ -290,17 +363,40 @@ void FrameworkClient::handleChunkAssignment(const json& data) {
 
 void FrameworkClient::sendResult(const TaskData& task, const TaskResult& result) {
     if (result.success) {
+        json responseData = {
+            {"id", task.id},
+            {"processingTime", result.processingTime}
+        };
+
+        // NEW: Send multi-output results
+        if (result.hasMultipleOutputs()) {
+            json resultsArray = json::array();
+            for (const auto& output : result.outputData) {
+                resultsArray.push_back(base64_encode(output));
+            }
+            responseData["results"] = resultsArray;
+
+            // Also send single result for backward compatibility
+            if (!result.outputData.empty()) {
+                responseData["result"] = base64_encode(result.outputData[0]);
+            }
+        } else {
+            // Single output (legacy format)
+            if (!result.outputData.empty()) {
+                responseData["result"] = base64_encode(result.outputData[0]);
+            } else if (!result.legacyOutputData.empty()) {
+                responseData["result"] = base64_encode(result.legacyOutputData);
+            }
+        }
+
         json response = {
             {"type", "workload:done"},
-            {"data", {
-                {"id", task.id},
-                {"result", base64_encode(result.outputData)},
-                {"processingTime", result.processingTime}
-            }}
+            {"data", responseData}
         };
         wsClient->send("42" + response.dump());
+
         std::cout << "Workload " << task.id << " completed in "
-                  << result.processingTime << "ms" << std::endl;
+                  << result.processingTime << "ms (" << result.getOutputCount() << " outputs)" << std::endl;
     } else {
         sendError(task, result.errorMessage);
     }
