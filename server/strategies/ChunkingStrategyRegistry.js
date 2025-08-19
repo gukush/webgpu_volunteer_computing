@@ -3,6 +3,11 @@
 
 import { BaseChunkingStrategy } from './base/BaseChunkingStrategy.js';
 import { BaseAssemblyStrategy } from './base/BaseAssemblyStrategy.js';
+
+// NEW: Import matrix tiled strategies
+import MatrixTiledChunkingStrategy from './MatrixTiledChunkingStrategy.js';
+import MatrixTiledAssemblyStrategy from './MatrixTiledAssemblyStrategy.js';
+
 import vm from 'vm';
 import { fileURLToPath } from 'url';
 import path from 'path';
@@ -194,16 +199,26 @@ export class ChunkingStrategyRegistry {
   }
 
   /**
-   * Initialize built-in strategies
+   * UPDATED: Initialize built-in strategies including matrix tiled
    */
   initializeBuiltInStrategies() {
     // Linear chunking strategy
     this.registerChunkingStrategy(new LinearChunkingStrategy());
     this.registerAssemblyStrategy(new LinearAssemblyStrategy());
 
+    // NEW: Matrix tiled strategies
+    this.registerChunkingStrategy(new MatrixTiledChunkingStrategy());
+    this.registerAssemblyStrategy(new MatrixTiledAssemblyStrategy());
+
     // Register built-in shader templates
     this.registerShaderTemplate('linear_process', this.getLinearProcessShader());
     this.registerShaderTemplate('multi_buffer_process', this.getMultiBufferProcessShader());
+
+    // NEW: Matrix-specific shader templates
+    this.registerShaderTemplate('matrix_multiply_tiled', this.getMatrixMultiplyTiledShader());
+    this.registerShaderTemplate('matrix_tile_extract', this.getMatrixTileExtractShader());
+
+    console.log(`Initialized ${this.chunkingStrategies.size} chunking strategies and ${this.assemblyStrategies.size} assembly strategies`);
   }
 
   /**
@@ -241,7 +256,7 @@ export class ChunkingStrategyRegistry {
   }
 
   /**
-   * NEW: Get multi-buffer processing shader template
+   * Get multi-buffer processing shader template
    * @returns {string} - WGSL shader code for multi-input/output
    */
   getMultiBufferProcessShader() {
@@ -272,6 +287,104 @@ export class ChunkingStrategyRegistry {
 
           // Output 1: product
           output_product[index] = a * b;
+      }
+    `;
+  }
+
+  /**
+   * NEW: Get matrix multiply tiled shader template
+   * @returns {string} - WGSL shader code for tiled matrix multiplication
+   */
+  getMatrixMultiplyTiledShader() {
+    return `
+      struct TileParams {
+          matrix_n: u32,
+          tile_start_row: u32,
+          tile_start_col: u32,
+          tile_rows: u32,
+          tile_cols: u32,
+          tile_size: u32,
+      }
+
+      @group(0) @binding(0) var<uniform> params: TileParams;
+      @group(0) @binding(1) var<storage, read> input_data: array<f32>;
+      @group(0) @binding(2) var<storage, read_write> tile_output: array<f32>;
+
+      @compute @workgroup_size(16, 16, 1)
+      fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
+          let n = params.matrix_n;
+          let local_row = global_id.x;
+          let local_col = global_id.y;
+
+          if (local_row >= params.tile_rows || local_col >= params.tile_cols) {
+              return;
+          }
+
+          let global_row = params.tile_start_row + local_row;
+          let global_col = params.tile_start_col + local_col;
+
+          if (global_row >= n || global_col >= n) {
+              return;
+          }
+
+          // Input layout from server: [matrix_size_header, A_data..., B_data...]
+          let header_size = 1u;
+          let a_offset = header_size;
+          let b_offset = header_size + n * n;
+
+          var sum = 0.0;
+          for (var k = 0u; k < n; k = k + 1u) {
+              let a_val = input_data[a_offset + global_row * n + k];
+              let b_val = input_data[b_offset + k * n + global_col];
+              sum = sum + a_val * b_val;
+          }
+
+          let output_index = local_row * params.tile_cols + local_col;
+          tile_output[output_index] = sum;
+      }
+    `;
+  }
+
+  /**
+   * NEW: Get matrix tile extraction shader template
+   * @returns {string} - WGSL shader code for extracting matrix tiles
+   */
+  getMatrixTileExtractShader() {
+    return `
+      struct TileParams {
+          matrix_n: u32,
+          tile_start_row: u32,
+          tile_start_col: u32,
+          tile_rows: u32,
+          tile_cols: u32,
+          tile_size: u32,
+      }
+
+      @group(0) @binding(0) var<uniform> params: TileParams;
+      @group(0) @binding(1) var<storage, read> input_data: array<f32>;
+      @group(0) @binding(2) var<storage, read_write> tile_output: array<f32>;
+
+      @compute @workgroup_size(16, 16, 1)
+      fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
+          let local_row = global_id.x;
+          let local_col = global_id.y;
+
+          if (local_row >= params.tile_rows || local_col >= params.tile_cols) {
+              return;
+          }
+
+          let global_row = params.tile_start_row + local_row;
+          let global_col = params.tile_start_col + local_col;
+
+          if (global_row >= params.matrix_n || global_col >= params.matrix_n) {
+              return;
+          }
+
+          // Simple tile extraction from matrix
+          let input_index = global_row * params.matrix_n + global_col;
+          let output_index = local_row * params.tile_cols + local_col;
+
+          tile_output[output_index] = input_data[input_index];
       }
     `;
   }
@@ -362,7 +475,7 @@ class LinearChunkingStrategy extends BaseChunkingStrategy {
         entry: 'main',
         workgroupCount: [Math.ceil(actualChunkSize / 64), 1, 1],
 
-        // NEW: Multi-input/output support
+        // Multi-input/output support
         inputs: inputChunks,
         outputSizes: outputSizes,
 
@@ -445,7 +558,7 @@ class LinearAssemblyStrategy extends BaseAssemblyStrategy {
       const schema = plan.schema || this.getDefaultSchema();
       const sortedChunks = this.sortChunks(completedChunks);
 
-      // NEW: Handle both single and multi-output
+      // Handle both single and multi-output
       if (schema.outputs.length > 1) {
         return this.assembleMultipleOutputs(sortedChunks, plan, schema);
       } else {

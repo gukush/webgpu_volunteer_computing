@@ -252,6 +252,51 @@ async function generateTestData(arraySize, outputFile, dataType = 'float32') {
   return buffer;
 }
 
+// FIXED: Helper to pack two matrices into combined format expected by matrix tiled strategy
+function packCombinedMatrices(size, A, B) {
+  // Create buffer: [size_header, A_data..., B_data...]
+  const buf = new ArrayBuffer(4 + size * size * 8); // 4 bytes header + 2 matrices
+  const view = new DataView(buf);
+
+  // Write size header
+  view.setUint32(0, size, true);
+
+  // Write matrix A
+  const aOffset = 4;
+  for (let i = 0; i < size; i++) {
+    for (let j = 0; j < size; j++) {
+      view.setFloat32(aOffset + (i * size + j) * 4, A[i][j], true);
+    }
+  }
+
+  // Write matrix B
+  const bOffset = 4 + size * size * 4;
+  for (let i = 0; i < size; i++) {
+    for (let j = 0; j < size; j++) {
+      view.setFloat32(bOffset + (i * size + j) * 4, B[i][j], true);
+    }
+  }
+
+  return Buffer.from(buf).toString('base64');
+}
+
+// Helper function to pack a single matrix
+function packSingleMatrix(size, matrix) {
+  const buf = new ArrayBuffer(4 + size * size * 4);  // size + matrix data
+  const view = new DataView(buf);
+  view.setUint32(0, size, true);
+
+  let offset = 4;
+  for (let i = 0; i < size; i++) {
+    for (let j = 0; j < size; j++) {
+      view.setFloat32(offset, matrix[i][j], true);
+      offset += 4;
+    }
+  }
+
+  return Buffer.from(buf).toString('base64');
+}
+
 // NEW: Helper to load multiple inputs
 async function loadInputs(args) {
   let inputJson = {};
@@ -333,17 +378,7 @@ async function main() {
   if (!cmd || args.help || args.h) return printHelp();
 
   // Traditional commands (unchanged)
-  if (cmd === 'matrix') {
-    const size = parseInt(args.size, 10);
-    const chunk = parseInt(args.chunk, 10);
-    if (!Number.isInteger(size) || !Number.isInteger(chunk)) {
-      console.error('matrix: --size and --chunk are required integers');
-      process.exit(1);
-    }
-    const out = await postJSON(`${base}/api/matrix/start`, { matrixSize: size, chunkSize: chunk });
-    console.log(JSON.stringify(out, null, 2));
-    return;
-  }
+  if (cmd === 'matrix') { console.error('Deprecated. Use matrix-tiled (advanced path).'); process.exit(1); }
 
   if (cmd === 'set-k') {
     const k = parseInt(args.k, 10);
@@ -356,10 +391,11 @@ async function main() {
     return;
   }
 
-  // Enhanced: Matrix tiled computation
+  // FIXED: Matrix tiled computation
   if (cmd === 'matrix-tiled') {
     const size = parseInt(args.size, 10);
     const tileSize = parseInt(args['tile-size'], 10);
+    const label = args.label || `Tiled Matrix ${size}×${size} (${tileSize}×${tileSize} tiles)`;
 
     if (!Number.isInteger(size) || !Number.isInteger(tileSize)) {
       console.error('matrix-tiled: --size and --tile-size are required integers');
@@ -371,13 +407,29 @@ async function main() {
       process.exit(1);
     }
 
-    const label = args.label || `Tiled Matrix ${size}×${size} (${tileSize}×${tileSize} tiles)`;
+    // Generate random matrices
+    const A = Array.from({length:size}, () => Array.from({length:size}, () => Math.random()));
+    const B = Array.from({length:size}, () => Array.from({length:size}, () => Math.random()));
 
-    const out = await postJSON(`${base}/api/matrix/tiled-advanced`, {
-      matrixSize: size,
-      tileSize: tileSize,
-      label: label
-    });
+    // FIXED: Pack matrices into combined format expected by the strategy
+    const combinedMatricesBuffer = packCombinedMatrices(size, A, B);
+
+    // FIXED: Create single input using the schema-expected name 'input'
+    const inputsJson = {
+      input: combinedMatricesBuffer
+    };
+
+    const payload = {
+      label,
+      framework: 'webgpu',
+      chunkingStrategy: 'matrix_tiled',
+      assemblyStrategy: 'matrix_tiled_assembly',
+      metadata: { matrixSize: size, tileSize },
+      input: JSON.stringify(inputsJson),  // Single input with combined matrices
+      outputSizes: [size * size * 4]  // Result matrix size in bytes
+    };
+
+    const out = await postJSON(`${base}/api/workloads/advanced`, payload);
     console.log(JSON.stringify(out, null, 2));
     return;
   }
@@ -570,160 +622,10 @@ async function main() {
     return;
   }
 
-  if (cmd === 'compute') {
-    const framework = args.framework;
-    if (!framework) {
-      console.error('compute: --framework is required');
-      console.error(`Supported frameworks: ${Object.keys(SUPPORTED_FRAMEWORKS).join(', ')}`);
-      process.exit(1);
-    }
-
-    await validateFramework(framework);
-
-    if (!args.kernel) {
-      console.error('compute: --kernel <file> is required');
-      process.exit(1);
-    }
-
-    const kernel = await readKernelFile(args.kernel, framework);
-    const label = args.label || path.basename(args.kernel);
-    const entry = args.entry || SUPPORTED_FRAMEWORKS[framework].defaultEntry;
-    const workgroups = (args.workgroups || '1,1,1').split(',').map(x => parseInt(x, 10));
-
-    if (workgroups.length !== 3 || workgroups.some(n => !Number.isInteger(n) || n <= 0)) {
-      console.error('compute: --workgroups must be like "64,1,1"');
-      process.exit(1);
-    }
-
-    // NEW: Parse multiple output sizes
-    const outputSizes = parseOutputSizes(args);
-    if (outputSizes.length === 0) {
-      console.error('compute: --output-sizes or --output-size is required');
-      process.exit(1);
-    }
-
-    // Framework-specific bind layout defaults
-    const defaultBindLayouts = {
-      webgpu: 'storage-in-storage-out',
-      webgl: 'webgl-transform-feedback',
-      cuda: 'cuda-global-memory',
-      opencl: 'opencl-global-memory',
-      vulkan: 'vulkan-storage-buffer'
-    };
-
-    const bindLayout = args.bind || defaultBindLayouts[framework];
-    const compilationOptions = await parseCompilationOptions(args['compilation-opts']);
-
-    // NEW: Load inputs
-    const inputJson = await loadInputs(args);
-
-    const payload = {
-      label,
-      framework,
-      kernel,
-      entry,
-      workgroupCount: workgroups,
-      bindLayout,
-      outputSizes, // NEW: Array instead of single outputSize
-      input: Object.keys(inputJson).length > 0 ? JSON.stringify(inputJson) : undefined,
-      chunkable: !!args.chunkable,
-      compilationOptions
-    };
-
-    if (args.chunkable) {
-      // NEW: Validate chunk output sizes
-      const chunkOutputSizes = parseChunkOutputSizes(args);
-      if (chunkOutputSizes.length === 0) {
-        console.error('compute: --chunk-output-sizes is required for chunkable workloads');
-        process.exit(1);
-      }
-
-      if (chunkOutputSizes.length !== outputSizes.length) {
-        console.error('compute: --chunk-output-sizes must match number of outputs');
-        process.exit(1);
-      }
-
-      payload.inputChunkProcessingType = args['chunk-type'] || 'elements';
-      payload.inputChunkSize = parseInt(args['chunk-size'] || '1024', 10);
-      payload.chunkOutputSizes = chunkOutputSizes; // NEW: Array
-      payload.inputElementSizeBytes = parseInt(args['elem-size'] || '4', 10);
-      payload.outputAggregationMethod = args.agg || 'concatenate';
-
-      if (Object.keys(inputJson).length === 0) {
-        console.error('compute: at least one input is required for chunkable workloads');
-        process.exit(1);
-      }
-    }
-
-    const out = await postJSON(`${base}/api/workloads`, payload);
-    console.log(JSON.stringify(out, null, 2));
-    return;
-  }
+  if (cmd === 'compute') { console.error('Deprecated. Use compute-advanced.'); process.exit(1); }
 
   // Backward compatibility: 'wgsl' command
-  if (cmd === 'wgsl') {
-    console.warn('WARNING: "wgsl" command is deprecated. Use "compute --framework webgpu" instead.');
-
-    if (!args.wgsl) {
-      console.error('wgsl: --wgsl <file.wgsl> is required');
-      process.exit(1);
-    }
-
-    const wgslPath = path.resolve(args.wgsl);
-    const wgsl = await fs.readFile(wgslPath, 'utf8');
-    const label = args.label || path.basename(wgslPath);
-    const entry = args.entry || 'main';
-    const workgroups = (args.workgroups || '1,1,1').split(',').map(x => parseInt(x, 10));
-
-    if (workgroups.length !== 3 || workgroups.some(n => !Number.isInteger(n) || n <= 0)) {
-      console.error('wgsl: --workgroups must be like "64,1,1"');
-      process.exit(1);
-    }
-
-    // NEW: Parse output sizes for backward compatibility
-    const outputSizes = parseOutputSizes(args);
-    if (outputSizes.length === 0) {
-      console.error('wgsl: --output-sizes or --output-size is required');
-      process.exit(1);
-    }
-
-    const bindLayout = args.bind || 'storage-in-storage-out';
-
-    // NEW: Load inputs
-    const inputJson = await loadInputs(args);
-
-    const payload = {
-      label,
-      framework: 'webgpu', // Force WebGPU for backward compatibility
-      kernel: wgsl,
-      wgsl, // Keep for server backward compatibility
-      entry,
-      workgroupCount: workgroups,
-      bindLayout,
-      outputSizes, // NEW: Array
-      input: Object.keys(inputJson).length > 0 ? JSON.stringify(inputJson) : undefined,
-      chunkable: !!args.chunkable
-    };
-
-    if (args.chunkable) {
-      // NEW: Handle chunk output sizes for legacy WGSL command
-      const chunkOutputSizes = parseChunkOutputSizes(args);
-      if (chunkOutputSizes.length === 0) {
-        console.error('wgsl: --chunk-output-sizes is required for chunkable workloads');
-        process.exit(1);
-      }
-
-      payload.inputChunkProcessingType = args['chunk-type'] || 'elements';
-      payload.inputChunkSize = parseInt(args['chunk-size'] || '1024', 10);
-      payload.chunkOutputSizes = chunkOutputSizes; // NEW: Array
-      payload.inputElementSizeBytes = parseInt(args['elem-size'] || '4', 10);
-      payload.outputAggregationMethod = args.agg || 'concatenate';
-    }
-
-    const out = await postJSON(`${base}/api/workloads`, payload);
-    console.log(JSON.stringify(out, null, 2));
-    return;
-  }
+  if (cmd === 'wgsl')   { console.error('Deprecated. Use compute-advanced.'); process.exit(1); }
 
   if (cmd === 'compute-start' || cmd === 'wgsl-start') {
     const out = await postJSON(`${base}/api/workloads/startQueued`, {});

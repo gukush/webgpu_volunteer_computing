@@ -1,5 +1,7 @@
-export default class BitonicSortChunking extends BaseChunkingStrategy {
-  constructor() {
+/*export default class BitonicSortChunking extends BaseChunkingStrategy {
+*/
+module.exports = class BitonicSortChunking extends BaseChunkingStrategy {
+constructor() {
     super('bitonic_sort');
   }
 

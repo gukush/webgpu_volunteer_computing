@@ -150,7 +150,178 @@ async function detectFrameworkCapabilities() {
   return capabilities;
 }
 
+
+async function executeUnifiedChunk(chunk) {
+  console.log(`[UNIFIED] Starting execution for ${chunk.chunkId} with ${Object.keys(chunk.chunkInputs || {}).length} inputs, ${(chunk.outputSizes || []).length} outputs`);
+
+  if (!state.device) {
+    throw new Error('No GPU device available');
+  }
+
+  const outputSizes = chunk.outputSizes || [chunk.outputSize];
+  if (!outputSizes || outputSizes.some(size => !size || size <= 0)) {
+    throw new Error(`Invalid output sizes: ${JSON.stringify(outputSizes)}`);
+  }
+
+  const t0 = performance.now();
+
+  try {
+    // Create shader module
+    console.log(`[UNIFIED] Creating shader module...`);
+    const shader = state.device.createShaderModule({
+      code: chunk.kernel || chunk.wgsl
+    });
+
+    const ci = await shader.getCompilationInfo();
+    if (ci.messages.some(m => m.type === 'error')) {
+      const errors = ci.messages.filter(m => m.type === 'error').map(m => m.message).join('\n');
+      throw new Error(`Shader compilation failed: ${errors}`);
+    }
+
+    const pipeline = state.device.createComputePipeline({
+      layout: 'auto',
+      compute: {
+        module: shader,
+        entryPoint: chunk.entry || 'main'
+      }
+    });
+
+    const buffers = [];
+    const entries = [];
+    let binding = 0;
+
+    // Handle uniforms
+    if (chunk.uniforms && Object.keys(chunk.uniforms).length > 0) {
+      console.log(`[UNIFIED] Setting up uniforms:`, chunk.uniforms);
+      const uniformArray = createUniformArray(chunk.uniforms, chunk.chunkingStrategy);
+
+      const uniformBuffer = state.device.createBuffer({
+        size: Math.max(16, uniformArray.byteLength),
+        usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST
+      });
+
+      state.device.queue.writeBuffer(uniformBuffer, 0, uniformArray);
+      entries.push({ binding: binding++, resource: { buffer: uniformBuffer } });
+      buffers.push(uniformBuffer);
+    }
+
+    // Handle multiple inputs
+    const inputs = chunk.chunkInputs || {};
+    const inputNames = Object.keys(inputs);
+
+    console.log(`[UNIFIED] Processing ${inputNames.length} inputs:`, inputNames);
+
+    for (const inputName of inputNames) {
+      const inputData = inputs[inputName];
+
+      if (inputData) {
+        const inputBytes = typeof inputData === 'string'
+          ? Uint8Array.from(atob(inputData), c => c.charCodeAt(0))
+          : new Uint8Array(inputData);
+
+        if (inputBytes.length > 0) {
+          const inputBuffer = state.device.createBuffer({
+            size: Math.max(16, inputBytes.byteLength),
+            usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+            mappedAtCreation: true
+          });
+
+          new Uint8Array(inputBuffer.getMappedRange()).set(inputBytes);
+          inputBuffer.unmap();
+
+          entries.push({ binding: binding++, resource: { buffer: inputBuffer } });
+          buffers.push(inputBuffer);
+
+          console.log(`[UNIFIED] Input ${inputName}: ${inputBytes.length} bytes`);
+        }
+      }
+    }
+
+    // Handle multiple outputs
+    const outputBuffers = [];
+
+    console.log(`[UNIFIED] Creating ${outputSizes.length} output buffers:`, outputSizes);
+
+    for (let i = 0; i < outputSizes.length; i++) {
+      const outputSize = outputSizes[i];
+
+      const outputBuffer = state.device.createBuffer({
+        size: Math.max(16, outputSize),
+        usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC
+      });
+
+      entries.push({ binding: binding++, resource: { buffer: outputBuffer } });
+      outputBuffers.push(outputBuffer);
+      buffers.push(outputBuffer);
+
+      console.log(`[UNIFIED] Output ${i}: ${outputSize} bytes`);
+    }
+
+    // Create bind group and execute
+    const bindGroup = state.device.createBindGroup({
+      layout: pipeline.getBindGroupLayout(0),
+      entries
+    });
+
+    console.log(`[UNIFIED] Dispatching workgroups:`, chunk.workgroupCount);
+    const encoder = state.device.createCommandEncoder();
+    const computePass = encoder.beginComputePass();
+    computePass.setPipeline(pipeline);
+    computePass.setBindGroup(0, bindGroup);
+    computePass.dispatchWorkgroups(...(chunk.workgroupCount || [1, 1, 1]));
+    computePass.end();
+
+    // Read back all outputs
+    const readBuffers = [];
+    const results = [];
+
+    for (let i = 0; i < outputBuffers.length; i++) {
+      const outputBuffer = outputBuffers[i];
+      const readBuffer = state.device.createBuffer({
+        size: outputBuffer.size,
+        usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ
+      });
+
+      encoder.copyBufferToBuffer(outputBuffer, 0, readBuffer, 0, outputBuffer.size);
+      readBuffers.push(readBuffer);
+    }
+
+    state.device.queue.submit([encoder.finish()]);
+
+    // Map and read all outputs
+    for (let i = 0; i < readBuffers.length; i++) {
+      const readBuffer = readBuffers[i];
+      await readBuffer.mapAsync(GPUMapMode.READ);
+      const resultBytes = new Uint8Array(readBuffer.getMappedRange().slice(0));
+      readBuffer.unmap();
+
+      const resultBase64 = btoa(String.fromCharCode(...resultBytes));
+      results.push(resultBase64);
+
+      console.log(`[UNIFIED] Output ${i}: ${resultBytes.length} bytes -> ${resultBase64.length} chars base64`);
+    }
+
+    // Cleanup buffers
+    buffers.forEach(buffer => buffer.destroy());
+    readBuffers.forEach(buffer => buffer.destroy());
+
+    const dt = performance.now() - t0;
+    console.log(`[UNIFIED] Chunk ${chunk.chunkId} completed in ${dt.toFixed(0)}ms`);
+
+    return {
+      results: results,
+      result: results[0], // For backward compatibility
+      processingTime: dt
+    };
+
+  } catch (err) {
+    console.error(`[UNIFIED] Chunk execution error:`, err);
+    throw err;
+  }
+}
+
 // Enhanced: Multi-input, multi-framework execution
+/*
 async function executeEnhancedChunk(chunk) {
   console.log(`[ENHANCED] Starting execution for ${chunk.chunkId} with strategy ${chunk.chunkingStrategy || 'unknown'}`);
 
@@ -302,7 +473,7 @@ async function executeEnhancedChunk(chunk) {
     throw err;
   }
 }
-
+*/
 // Helper functions for multi-input support
 function createStorageBuffer(inputData, inputDef) {
   let bytes;
@@ -1077,12 +1248,13 @@ socket.on('workload:chunk_assign', async chunk => {
     return;
   }
 
-  if (!chunk.outputSize || chunk.outputSize <= 0) {
+  const outputSizes = chunk.outputSizes || [chunk.outputSize];
+  if (!outputSizes || outputSizes.some(size => !size || size <= 0)) {
     const eventName = chunk.enhanced ? 'workload:chunk_error_enhanced' : 'workload:chunk_error';
     socket.emit(eventName, {
       parentId: chunk.parentId,
       chunkId: chunk.chunkId,
-      message: `Invalid chunk output size: ${chunk.outputSize}`
+      message: `Invalid output sizes: ${JSON.stringify(outputSizes)}`
     });
     return;
   }
@@ -1091,24 +1263,23 @@ socket.on('workload:chunk_assign', async chunk => {
   state.currentTask = chunk;
   updateComputationStatusDisplay();
 
+  const inputCount = Object.keys(chunk.chunkInputs || {}).length;
+  const outputCount = outputSizes.length;
   const strategy = chunk.chunkingStrategy || 'unknown';
-  logTaskActivity(`Processing ${framework} chunk ${chunk.chunkId} (${strategy}, output: ${chunk.outputSize} bytes)`);
+
+  logTaskActivity(`Processing ${framework} chunk ${chunk.chunkId} (${strategy}, ${inputCount}→${outputCount}, outputs: ${outputSizes.join('+')}) bytes)`);
 
   try {
-    let result;
-
-    if (chunk.enhanced || chunk.inputSchema) {
-      result = await executeEnhancedChunk(chunk);
-    } else {
-      result = await executeFrameworkKernel(chunk);
-    }
+    // Use unified execution for all chunks
+    const result = await executeUnifiedChunk(chunk);
 
     const eventName = chunk.enhanced ? 'workload:chunk_done_enhanced' : 'workload:chunk_done';
     const eventData = {
       parentId: chunk.parentId,
       chunkId: chunk.chunkId,
       chunkOrderIndex: chunk.chunkOrderIndex,
-      result: result.result,
+      results: result.results,  // Multiple outputs
+      result: result.result,    // First output (backward compatibility)
       processingTime: result.processingTime
     };
 
@@ -1117,10 +1288,18 @@ socket.on('workload:chunk_assign', async chunk => {
       eventData.metadata = chunk.metadata;
     }
 
-    // === NEW: include per-chunk reportedChecksum ===
-    eventData.reportedChecksum = await checksumBase64(result.result);
+    // Include checksums for all outputs
+    if (result.results && result.results.length > 1) {
+      eventData.reportedChecksums = await Promise.all(
+        result.results.map(r => checksumBase64(r))
+      );
+    } else {
+      eventData.reportedChecksum = await checksumBase64(result.result);
+    }
 
     socket.emit(eventName, eventData);
+
+    logTaskActivity(`${framework} chunk complete: ${outputCount} outputs (${result.results.map(r => Math.round(r.length * 0.75)).join('+')}) bytes`, 'success');
 
   } catch (err) {
     logTaskActivity(`${framework} chunk error: ${err.message}`, 'error');

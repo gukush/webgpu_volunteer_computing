@@ -1,4 +1,5 @@
-import { BaseChunkingStrategy } from '../../strategies/base/BaseChunkingStrategy.js';
+// strategies/MatrixTiledChunkingStrategy.js
+import { BaseChunkingStrategy } from './base/BaseChunkingStrategy.js';
 
 export default class MatrixTiledChunkingStrategy extends BaseChunkingStrategy {
   constructor() {
@@ -7,12 +8,13 @@ export default class MatrixTiledChunkingStrategy extends BaseChunkingStrategy {
 
   /**
    * Define input/output schema for matrix tiled computation
+   * FIXED: The server generates matrices A and B in a single buffer with header
    */
   defineInputSchema() {
     return {
       inputs: [
         {
-          name: 'input_data',
+          name: 'input', // FIXED: Use 'input' to match server API
           type: 'storage_buffer',
           binding: 1,
           elementType: 'f32',
@@ -21,7 +23,7 @@ export default class MatrixTiledChunkingStrategy extends BaseChunkingStrategy {
       ],
       outputs: [
         {
-          name: 'tile_output',
+          name: 'output',
           type: 'storage_buffer',
           binding: 2,
           elementType: 'f32'
@@ -38,7 +40,7 @@ export default class MatrixTiledChunkingStrategy extends BaseChunkingStrategy {
     }
 
     // Strategy-specific validation
-    const { matrixSize, tileSize, customShader } = workload.metadata || {};
+    const { matrixSize, tileSize } = workload.metadata || {};
 
     if (!matrixSize || !tileSize) {
       return {
@@ -61,15 +63,19 @@ export default class MatrixTiledChunkingStrategy extends BaseChunkingStrategy {
       };
     }
 
-    if (customShader != null && typeof customShader !== 'string') {
-      return { valid: false, error: 'customShader must be a string when provided' };
+    // Check that input data exists
+    if (!workload.input) {
+      return {
+        valid: false,
+        error: 'Input matrix data is required'
+      };
     }
 
     return { valid: true };
   }
 
   planExecution(workload) {
-    const { matrixSize, tileSize } = workload.metadata;
+    const { matrixSize, tileSize, operation = 'matrix_multiply' } = workload.metadata;
     const tilesPerDim = Math.ceil(matrixSize / tileSize);
     const totalTiles = tilesPerDim * tilesPerDim;
 
@@ -78,22 +84,25 @@ export default class MatrixTiledChunkingStrategy extends BaseChunkingStrategy {
     return {
       strategy: this.name,
       totalChunks: totalTiles,
-      schema: schema, // NEW: Include schema in plan
+      schema: schema,
       metadata: {
         matrixSize,
         tileSize,
         tilesPerDim,
+        operation,
         inputData: workload.input,
+        // NEW: Support for custom shaders
         customShader: workload.metadata?.customShader,
         entry: workload.metadata?.entry || 'main',
-        inputSchema: workload.metadata?.inputSchema || schema // Allow override
+        // NEW: Multi-output support
+        outputSizes: workload.outputSizes || [matrixSize * matrixSize * 4]
       },
       assemblyStrategy: 'matrix_tiled_assembly'
     };
   }
 
   createChunkDescriptors(plan) {
-    const { matrixSize, tileSize, tilesPerDim } = plan.metadata;
+    const { matrixSize, tileSize, tilesPerDim, operation } = plan.metadata;
     const schema = plan.schema;
     const parsedInputs = this.parseMultipleInputs(plan.metadata.inputData, schema);
     const descriptors = [];
@@ -111,9 +120,9 @@ export default class MatrixTiledChunkingStrategy extends BaseChunkingStrategy {
         const tileOutputSize = actualTileRows * actualTileCols * 4; // float32
 
         const entry = plan.metadata.entry || 'main';
-        const kernel = plan.metadata.customShader || this.getTiledMatrixShader();
+        const kernel = plan.metadata.customShader || this.getTiledMatrixShader(operation);
 
-        // NEW: Create inputs using the chunking system
+        // Create inputs using the chunking system (replicate full matrix to all tiles)
         const inputChunks = this.chunkInputs(schema, parsedInputs, tileIndex, plan.totalChunks, plan.metadata);
 
         descriptors.push({
@@ -147,7 +156,6 @@ export default class MatrixTiledChunkingStrategy extends BaseChunkingStrategy {
             tile_size: tileSize
           },
 
-          inputSchema: schema,
           assemblyMetadata: {
             tileRow,
             tileCol,
@@ -169,6 +177,7 @@ export default class MatrixTiledChunkingStrategy extends BaseChunkingStrategy {
 
   /**
    * Override chunking to replicate input data to all tiles
+   * FIXED: Handle the matrix data format from server
    */
   chunkInputs(schema, parsedInputs, chunkIndex, totalChunks, chunkingParams = {}) {
     const inputChunks = [];
@@ -182,7 +191,7 @@ export default class MatrixTiledChunkingStrategy extends BaseChunkingStrategy {
       }
 
       // Matrix tiled strategy always replicates input data
-      // All tiles need access to the full matrices
+      // All tiles need access to the full matrices A and B
       inputChunks.push(inputData);
     }
 
@@ -190,49 +199,20 @@ export default class MatrixTiledChunkingStrategy extends BaseChunkingStrategy {
   }
 
   /**
-   * Compute workgroup count for matrix tiles
+   * FIXED: Support different matrix operations
    */
-  computeWorkgroupCount(chunkIndex, plan) {
-    const { matrixSize, tileSize, tilesPerDim } = plan.metadata;
-    const tileRow = Math.floor(chunkIndex / tilesPerDim);
-    const tileCol = chunkIndex % tilesPerDim;
-
-    const startRow = tileRow * tileSize;
-    const startCol = tileCol * tileSize;
-    const endRow = Math.min(startRow + tileSize, matrixSize);
-    const endCol = Math.min(startCol + tileSize, matrixSize);
-
-    const actualTileRows = endRow - startRow;
-    const actualTileCols = endCol - startCol;
-
-    return [
-      Math.ceil(actualTileRows / 16),
-      Math.ceil(actualTileCols / 16),
-      1
-    ];
+  getTiledMatrixShader(operation = 'matrix_multiply') {
+    if (operation === 'matrix_multiply') {
+      return this.getMatrixMultiplyShader();
+    } else {
+      return this.getGenericTileShader();
+    }
   }
 
   /**
-   * Compute output sizes for each tile
+   * FIXED: Matrix multiplication shader that works with server's data format
    */
-  computeChunkOutputSizes(schema, metadata, chunkIndex, totalChunks) {
-    const { matrixSize, tileSize, tilesPerDim } = metadata;
-    const tileRow = Math.floor(chunkIndex / tilesPerDim);
-    const tileCol = chunkIndex % tilesPerDim;
-
-    const startRow = tileRow * tileSize;
-    const startCol = tileCol * tileSize;
-    const endRow = Math.min(startRow + tileSize, matrixSize);
-    const endCol = Math.min(startCol + tileSize, matrixSize);
-
-    const actualTileRows = endRow - startRow;
-    const actualTileCols = endCol - startCol;
-    const tileOutputSize = actualTileRows * actualTileCols * 4; // float32
-
-    return [tileOutputSize];
-  }
-
-  getTiledMatrixShader() {
+  getMatrixMultiplyShader() {
     return `
       struct TileParams {
           matrix_n: u32,
@@ -264,7 +244,7 @@ export default class MatrixTiledChunkingStrategy extends BaseChunkingStrategy {
               return;
           }
 
-          // Input layout: [matrix_size_header, A_data..., B_data...]
+          // FIXED: Input layout from server: [matrix_size_header, A_data..., B_data...]
           let header_size = 1u;
           let a_offset = header_size;
           let b_offset = header_size + n * n;
@@ -276,7 +256,51 @@ export default class MatrixTiledChunkingStrategy extends BaseChunkingStrategy {
               sum = sum + a_val * b_val;
           }
 
-          tile_output[local_row * params.tile_cols + local_col] = sum;
+          let output_index = local_row * params.tile_cols + local_col;
+          tile_output[output_index] = sum;
+      }
+    `;
+  }
+
+  /**
+   * Generic tile processing shader for other operations
+   */
+  getGenericTileShader() {
+    return `
+      struct TileParams {
+          matrix_n: u32,
+          tile_start_row: u32,
+          tile_start_col: u32,
+          tile_rows: u32,
+          tile_cols: u32,
+          tile_size: u32,
+      }
+
+      @group(0) @binding(0) var<uniform> params: TileParams;
+      @group(0) @binding(1) var<storage, read> input_data: array<f32>;
+      @group(0) @binding(2) var<storage, read_write> tile_output: array<f32>;
+
+      @compute @workgroup_size(16, 16, 1)
+      fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
+          let local_row = global_id.x;
+          let local_col = global_id.y;
+
+          if (local_row >= params.tile_rows || local_col >= params.tile_cols) {
+              return;
+          }
+
+          let global_row = params.tile_start_row + local_row;
+          let global_col = params.tile_start_col + local_col;
+
+          if (global_row >= params.matrix_n || global_col >= params.matrix_n) {
+              return;
+          }
+
+          // Simple tile extraction
+          let input_index = global_row * params.matrix_n + global_col;
+          let output_index = local_row * params.tile_cols + local_col;
+
+          tile_output[output_index] = input_data[input_index];
       }
     `;
   }

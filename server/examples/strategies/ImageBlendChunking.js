@@ -1,10 +1,12 @@
 // examples/custom_strategies/ImageBlendChunking.js
 // Example: Custom image processing with multi-input support
-
+/*
 import { BaseChunkingStrategy } from '../../strategies/base/BaseChunkingStrategy.js';
 
 export default class ImageBlendChunking extends BaseChunkingStrategy {
-  constructor() {
+*/
+module.exports = class ImageBlendChunking extends BaseChunkingStrategy {
+constructor() {
     super('image_blend_custom');
   }
 
@@ -20,7 +22,7 @@ export default class ImageBlendChunking extends BaseChunkingStrategy {
           chunking: 'tiled_2d'
         },
         {
-          name: 'image_b', 
+          name: 'image_b',
           type: 'storage_buffer',
           binding: 2,
           elementType: 'u32',
@@ -49,7 +51,7 @@ export default class ImageBlendChunking extends BaseChunkingStrategy {
   validateWorkload(workload) {
     const required = ['imageWidth', 'imageHeight', 'tileSize'];
     const missing = required.filter(field => !workload.metadata[field]);
-    
+
     if (missing.length > 0) {
       return { valid: false, error: `Missing: ${missing.join(', ')}` };
     }
@@ -61,7 +63,7 @@ export default class ImageBlendChunking extends BaseChunkingStrategy {
     const { imageWidth, imageHeight, tileSize } = workload.metadata;
     const tilesX = Math.ceil(imageWidth / tileSize);
     const tilesY = Math.ceil(imageHeight / tileSize);
-    
+
     return {
       strategy: this.name,
       totalChunks: tilesX * tilesY,
@@ -78,7 +80,7 @@ export default class ImageBlendChunking extends BaseChunkingStrategy {
   createChunkDescriptors(plan) {
     const { imageWidth, imageHeight, tileSize, tilesX, tilesY, parsedInputs } = plan.metadata;
     const descriptors = [];
-    
+
     let chunkIndex = 0;
     for (let tileY = 0; tileY < tilesY; tileY++) {
       for (let tileX = 0; tileX < tilesX; tileX++) {
@@ -86,44 +88,44 @@ export default class ImageBlendChunking extends BaseChunkingStrategy {
         const startY = tileY * tileSize;
         const endX = Math.min((tileX + 1) * tileSize, imageWidth);
         const endY = Math.min((tileY + 1) * tileSize, imageHeight);
-        
+
         const actualWidth = endX - startX;
         const actualHeight = endY - startY;
 
         // Extract tile data for both images
         const tileDataA = this.extractImageTile(
-          parsedInputs.image_a, imageWidth, imageHeight, 
+          parsedInputs.image_a, imageWidth, imageHeight,
           startX, startY, actualWidth, actualHeight
         );
-        
+
         const tileDataB = this.extractImageTile(
           parsedInputs.image_b, imageWidth, imageHeight,
-          startX, startY, actualWidth, actualHeight  
+          startX, startY, actualWidth, actualHeight
         );
 
         descriptors.push({
           chunkId: `tile-${tileX}-${tileY}`,
           chunkIndex,
           parentId: plan.parentId,
-          
+
           framework: 'webgpu',
           kernel: this.getImageBlendShader(),
           entry: 'main',
           workgroupCount: [
             Math.ceil(actualWidth / 16),
-            Math.ceil(actualHeight / 16), 
+            Math.ceil(actualHeight / 16),
             1
           ],
-          
+
           // Multi-input data for this chunk
           inputSchema: plan.inputSchema,
           chunkInputs: {
             image_a: tileDataA.toString('base64'),
             image_b: tileDataB.toString('base64')
           },
-          
+
           outputSize: actualWidth * actualHeight * 4, // RGBA bytes
-          
+
           uniforms: {
             image_width: imageWidth,
             image_height: imageHeight,
@@ -132,12 +134,12 @@ export default class ImageBlendChunking extends BaseChunkingStrategy {
             tile_width: actualWidth,
             tile_height: actualHeight
           },
-          
+
           assemblyMetadata: {
             tileX, tileY, startX, startY, actualWidth, actualHeight
           }
         });
-        
+
         chunkIndex++;
       }
     }
@@ -149,11 +151,11 @@ export default class ImageBlendChunking extends BaseChunkingStrategy {
     // Convert base64 to buffer
     const imageBuffer = Buffer.from(imageData, 'base64');
     const imageArray = new Uint32Array(imageBuffer.buffer);
-    
+
     // Extract the tile
     const tileBuffer = Buffer.alloc(tileWidth * tileHeight * 4);
     const tileArray = new Uint32Array(tileBuffer.buffer);
-    
+
     for (let y = 0; y < tileHeight; y++) {
       for (let x = 0; x < tileWidth; x++) {
         const srcIndex = (startY + y) * imageWidth + (startX + x);
@@ -161,7 +163,7 @@ export default class ImageBlendChunking extends BaseChunkingStrategy {
         tileArray[dstIndex] = imageArray[srcIndex];
       }
     }
-    
+
     return tileBuffer;
   }
 
@@ -178,27 +180,27 @@ export default class ImageBlendChunking extends BaseChunkingStrategy {
 
       @group(0) @binding(0) var<uniform> params: BlendParams;
       @group(0) @binding(1) var<storage, read> image_a: array<u32>;      // RGBA packed
-      @group(0) @binding(2) var<storage, read> image_b: array<u32>;      // RGBA packed  
+      @group(0) @binding(2) var<storage, read> image_b: array<u32>;      // RGBA packed
       @group(0) @binding(3) var<storage, read_write> output: array<u32>; // RGBA packed
 
       @compute @workgroup_size(16, 16, 1)
       fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
           let local_x = global_id.x;
           let local_y = global_id.y;
-          
+
           if (local_x >= params.tile_width || local_y >= params.tile_height) {
               return;
           }
-          
+
           let tile_index = local_y * params.tile_width + local_x;
-          
+
           // Read pixels from both input images
           let pixel_a = unpack_rgba(image_a[tile_index]);
           let pixel_b = unpack_rgba(image_b[tile_index]);
-          
+
           // Simple blend: 50% mix
           let blended = mix(pixel_a, pixel_b, 0.5);
-          
+
           output[tile_index] = pack_rgba(blended);
       }
 

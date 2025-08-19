@@ -1,4 +1,5 @@
-import { BaseAssemblyStrategy } from '../../strategies/base/BaseAssemblyStrategy.js';
+// strategies/MatrixTiledAssemblyStrategy.js
+import { BaseAssemblyStrategy } from './base/BaseAssemblyStrategy.js';
 
 export default class MatrixTiledAssemblyStrategy extends BaseAssemblyStrategy {
   constructor() {
@@ -6,13 +7,13 @@ export default class MatrixTiledAssemblyStrategy extends BaseAssemblyStrategy {
   }
 
   /**
-   * Get schema for matrix tiled assembly
+   * FIXED: Get schema that matches chunking strategy
    */
   getDefaultSchema() {
     return {
       outputs: [
         {
-          name: 'result_matrix',
+          name: 'output', // FIXED: Match chunking strategy output name
           type: 'storage_buffer',
           elementType: 'f32'
         }
@@ -32,11 +33,30 @@ export default class MatrixTiledAssemblyStrategy extends BaseAssemblyStrategy {
 
     try {
       const schema = plan.schema || this.getDefaultSchema();
-      const matrixSize = completedChunks[0].assemblyMetadata.matrixSize;
+
+      // Extract matrix size from the first chunk's metadata
+      let matrixSize;
+      if (completedChunks[0].assemblyMetadata) {
+        matrixSize = completedChunks[0].assemblyMetadata.matrixSize;
+      } else {
+        // Fallback: extract from plan metadata
+        matrixSize = plan.metadata?.matrixSize;
+      }
+
+      if (!matrixSize) {
+        return {
+          success: false,
+          error: 'Could not determine matrix size from chunks or plan metadata'
+        };
+      }
+
       const resultMatrix = new Float32Array(matrixSize * matrixSize);
 
+      // Sort chunks to ensure proper assembly order
+      const sortedChunks = this.sortChunks(completedChunks);
+
       // Place each tile in the correct position
-      for (const chunk of completedChunks) {
+      for (const chunk of sortedChunks) {
         const {
           startRow,
           startCol,
@@ -44,7 +64,7 @@ export default class MatrixTiledAssemblyStrategy extends BaseAssemblyStrategy {
           tileCols
         } = chunk.assemblyMetadata;
 
-        // NEW: Handle both single result and multi-result format
+        // FIXED: Handle both single result and multi-result format
         let tileResult;
         if (chunk.results && Array.isArray(chunk.results)) {
           // Multi-result format - take first result
@@ -54,17 +74,29 @@ export default class MatrixTiledAssemblyStrategy extends BaseAssemblyStrategy {
           tileResult = chunk.result;
         }
 
+        if (!tileResult) {
+          return {
+            success: false,
+            error: `Chunk ${chunk.chunkId || chunk.chunkIndex} has no result data`
+          };
+        }
+
         // Decode the tile result
         const tileBuffer = Buffer.from(tileResult, 'base64');
         const tileData = new Float32Array(tileBuffer.buffer);
 
-        // Copy tile data to the correct position in the result matrix
+        // FIXED: Copy tile data to the correct position in the result matrix
         for (let i = 0; i < tileRows; i++) {
           for (let j = 0; j < tileCols; j++) {
             const tileIndex = i * tileCols + j;
-            const matrixIndex = (startRow + i) * matrixSize + (startCol + j);
+            const globalRow = startRow + i;
+            const globalCol = startCol + j;
+            const matrixIndex = globalRow * matrixSize + globalCol;
 
-            if (tileIndex < tileData.length && matrixIndex < resultMatrix.length) {
+            if (tileIndex < tileData.length &&
+                matrixIndex < resultMatrix.length &&
+                globalRow < matrixSize &&
+                globalCol < matrixSize) {
               resultMatrix[matrixIndex] = tileData[tileIndex];
             }
           }
@@ -85,20 +117,23 @@ export default class MatrixTiledAssemblyStrategy extends BaseAssemblyStrategy {
           ...this.createAssemblyMetadata(plan, completedChunks),
           matrixSize,
           format: 'float32_matrix',
-          shape: [matrixSize, matrixSize]
+          shape: [matrixSize, matrixSize],
+          totalTiles: completedChunks.length,
+          assemblyStrategy: this.name
         }
       };
 
     } catch (error) {
       return {
         success: false,
-        error: `Matrix assembly failed: ${error.message}`
+        error: `Matrix assembly failed: ${error.message}`,
+        stack: error.stack
       };
     }
   }
 
   /**
-   * Override validation to check for matrix-specific metadata
+   * FIXED: Enhanced validation to check for matrix-specific metadata
    */
   validateChunks(completedChunks, plan) {
     // First run base validation
@@ -124,6 +159,17 @@ export default class MatrixTiledAssemblyStrategy extends BaseAssemblyStrategy {
     let matrixSize = null;
 
     for (const chunk of completedChunks) {
+      // Check for result data
+      const hasResult = (chunk.results && Array.isArray(chunk.results) && chunk.results.length > 0) ||
+                       chunk.result;
+
+      if (!hasResult) {
+        return {
+          valid: false,
+          error: `Chunk ${chunk.chunkId || chunk.chunkIndex} has no result data`
+        };
+      }
+
       if (!chunk.assemblyMetadata) {
         return {
           valid: false,
@@ -131,12 +177,29 @@ export default class MatrixTiledAssemblyStrategy extends BaseAssemblyStrategy {
         };
       }
 
-      const { tileRow, tileCol, matrixSize: chunkMatrixSize } = chunk.assemblyMetadata;
+      const {
+        tileRow,
+        tileCol,
+        matrixSize: chunkMatrixSize,
+        startRow,
+        startCol,
+        tileRows,
+        tileCols
+      } = chunk.assemblyMetadata;
 
+      // Validate required metadata fields
       if (tileRow === undefined || tileCol === undefined) {
         return {
           valid: false,
           error: `Chunk ${chunk.chunkId || chunk.chunkIndex} missing tile position metadata`
+        };
+      }
+
+      if (startRow === undefined || startCol === undefined ||
+          tileRows === undefined || tileCols === undefined) {
+        return {
+          valid: false,
+          error: `Chunk ${chunk.chunkId || chunk.chunkIndex} missing tile dimension metadata`
         };
       }
 
@@ -168,9 +231,15 @@ export default class MatrixTiledAssemblyStrategy extends BaseAssemblyStrategy {
    * Find missing tiles for better error reporting
    */
   findMissingTiles(completedChunks, expectedTiles) {
-    const receivedIndices = new Set(
-      completedChunks.map(chunk => chunk.chunkIndex ?? chunk.assemblyMetadata?.tileIndex ?? -1)
-    );
+    const receivedIndices = new Set();
+
+    for (const chunk of completedChunks) {
+      if (chunk.chunkIndex !== undefined) {
+        receivedIndices.add(chunk.chunkIndex);
+      } else if (chunk.assemblyMetadata?.tileIndex !== undefined) {
+        receivedIndices.add(chunk.assemblyMetadata.tileIndex);
+      }
+    }
 
     const missing = [];
     for (let i = 0; i < expectedTiles; i++) {
@@ -183,21 +252,11 @@ export default class MatrixTiledAssemblyStrategy extends BaseAssemblyStrategy {
   }
 
   /**
-   * Override single output buffer assembly for matrix reconstruction
-   */
-  assembleSingleOutputBuffers(buffers, plan, outputDef) {
-    // For matrix tiled assembly, we need to reconstruct the full matrix
-    // This method shouldn't be called directly for matrix assembly
-    // since we override assembleResults completely
-    return Buffer.concat(buffers);
-  }
-
-  /**
-   * Sort chunks by tile position for proper assembly
+   * FIXED: Sort chunks by tile position for proper assembly
    */
   sortChunks(chunks) {
     return chunks.sort((a, b) => {
-      // Sort by tile index if available
+      // Sort by chunk index if available
       if (a.chunkIndex !== undefined && b.chunkIndex !== undefined) {
         return a.chunkIndex - b.chunkIndex;
       }
@@ -218,5 +277,42 @@ export default class MatrixTiledAssemblyStrategy extends BaseAssemblyStrategy {
       // Fallback to base sorting
       return super.sortChunks([a, b])[0] === a ? -1 : 1;
     });
+  }
+
+  /**
+   * Override single output buffer assembly for matrix reconstruction
+   */
+  assembleSingleOutputBuffers(buffers, plan, outputDef) {
+    // For matrix tiled assembly, we override assembleResults completely
+    // This method is called by the base class but not used for tiled matrix assembly
+    console.warn('assembleSingleOutputBuffers called for matrix_tiled_assembly - this should not happen');
+    return Buffer.concat(buffers);
+  }
+
+  /**
+   * NEW: Handle multiple outputs (for future extension)
+   */
+  assembleMultipleOutputs(sortedChunks, plan, schema) {
+    if (schema.outputs.length > 1) {
+      console.warn('Matrix tiled assembly does not yet support multiple outputs, using first output only');
+    }
+
+    // For now, treat as single output
+    return this.assembleSingleOutput(sortedChunks, plan, schema);
+  }
+
+  /**
+   * Create enhanced assembly metadata
+   */
+  createAssemblyMetadata(plan, chunks) {
+    const baseMetadata = super.createAssemblyMetadata(plan, chunks);
+
+    return {
+      ...baseMetadata,
+      matrixStrategy: 'tiled',
+      tilesProcessed: chunks.length,
+      averageProcessingTime: chunks.reduce((sum, chunk) =>
+        sum + (chunk.processingTime || 0), 0) / chunks.length
+    };
   }
 }

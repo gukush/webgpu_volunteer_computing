@@ -1,47 +1,15 @@
 #pragma once
-#include "../common/framework_client.hpp"
 #include <vulkan/vulkan.h>
 #include <vector>
+#include <string>
+#include <optional>
 #include <memory>
+#include "framework_client.hpp"
 
-// NOTE: This header replaces the previous include path "../common/framework_client.hpp".
-// If your tree uses a different layout, adjust the include accordingly.
-
-class VulkanExecutor : public IFrameworkExecutor {
-private:
-    VkInstance instance = VK_NULL_HANDLE;
-    VkPhysicalDevice physicalDevice = VK_NULL_HANDLE;
-    VkDevice device = VK_NULL_HANDLE;
-    VkQueue computeQueue = VK_NULL_HANDLE;
-    VkCommandPool commandPool = VK_NULL_HANDLE;
-    VkDescriptorPool descriptorPool = VK_NULL_HANDLE;
-    VkPipelineCache pipelineCache = VK_NULL_HANDLE;
-    uint32_t computeQueueFamilyIndex = 0;
-    bool initialized = false;
-
-    // Cached device properties/memory properties
-    VkPhysicalDeviceProperties deviceProperties{};
-    VkPhysicalDeviceMemoryProperties memoryProperties{};
-
-    // Helpers
-    bool createInstance(bool enableValidation, bool enableDebugUtils);
-    bool pickPhysicalDevice();
-    bool createLogicalDevice();
-    bool createCommandPool();
-    bool createDescriptorPool();
-    void destroyInstance();
-    void destroyDeviceObjects();
-
-    // Shader compilation
-    bool compileGLSLtoSPIRV(const std::string& glsl, std::vector<uint32_t>& spirv, std::string& error) const;
-
-    // Buffer helpers
-    uint32_t findMemoryType(uint32_t typeFilter, VkMemoryPropertyFlags properties) const;
-    bool createBuffer(VkDeviceSize size, VkBufferUsageFlags usage,
-                      VkMemoryPropertyFlags properties, VkBuffer& buffer, VkDeviceMemory& bufferMemory) const;
-
+// Vulkan executor implementing Multi-Input / Multi-Output (MIMO) interface used by the framework.
+class VulkanExecutor final : public IFrameworkExecutor {
 public:
-    VulkanExecutor();
+    explicit VulkanExecutor(int preferredDeviceIndex = 0);
     ~VulkanExecutor() override;
 
     bool initialize(const json& config = {}) override;
@@ -49,4 +17,35 @@ public:
     TaskResult executeTask(const TaskData& task) override;
     std::string getFrameworkName() const override { return "vulkan"; }
     json getCapabilities() const override;
+
+private:
+    int preferredDeviceIndex_{0};
+
+    VkInstance instance_{VK_NULL_HANDLE};
+    VkPhysicalDevice phys_{VK_NULL_HANDLE};
+    uint32_t computeQueueFamily_{UINT32_MAX};
+    VkDevice device_{VK_NULL_HANDLE};
+    VkQueue queue_{VK_NULL_HANDLE};
+    VkCommandPool cmdPool_{VK_NULL_HANDLE};
+
+    // Helpers
+    bool createInstance();
+    bool pickPhysicalDevice();
+    bool createDevice();
+    void destroyVulkan();
+
+    uint32_t findMemoryType(uint32_t typeBits, VkMemoryPropertyFlags props) const;
+    bool createBuffer(VkDeviceSize size,
+                      VkBufferUsageFlags usage,
+                      VkMemoryPropertyFlags props,
+                      VkBuffer& outBuf, VkDeviceMemory& outMem) const;
+
+    struct Buffer {
+        VkBuffer buf{VK_NULL_HANDLE};
+        VkDeviceMemory mem{VK_NULL_HANDLE};
+        VkDeviceSize size{0};
+        void* mapped{nullptr};
+    };
+    Buffer makeHostBuffer(VkDeviceSize size, VkBufferUsageFlags usage) const;
+    void destroyBuffer(Buffer& b) const;
 };

@@ -1,527 +1,464 @@
 #include "vulkan_executor.hpp"
-#include <iostream>
-#include <vector>
 #include <cstring>
-#include <chrono>
+#include <iostream>
 #include <stdexcept>
 #include <algorithm>
+#include <chrono>
 
-// Shaderc
+#ifndef HAVE_SHADERC
+  #error "This build requires shaderc: define HAVE_SHADERC"
+#endif
 #include <shaderc/shaderc.hpp>
 
-// ========== Utility: scoped VkResult check ==========
-#define VK_CHECK(x) do { VkResult _ret = (x); if (_ret != VK_SUCCESS) { \
-    throw std::runtime_error(std::string("Vulkan error: ") + #x + " -> " + std::to_string(_ret)); } } while(0)
+namespace {
+// Ensure the source contains a #version directive; default to 450 if absent.
+std::string ensure_glsl_version(const std::string& src) {
+    if (src.find("#version") != std::string::npos) return src;
+    return std::string("#version 450\n") + src;
+}
 
-VulkanExecutor::VulkanExecutor() {}
+struct MacroDef { std::string name; std::string value; };
+static std::vector<MacroDef> parse_macros(const json& opts) {
+    std::vector<MacroDef> defs;
+    try {
+        if (opts.contains("macros") && opts["macros"].is_array()) {
+            for (const auto& m : opts["macros"]) {
+                if (m.is_string()) {
+                    std::string s = m.get<std::string>();
+                    auto pos = s.find('=');
+                    if (pos == std::string::npos) defs.push_back({s, "1"});
+                    else defs.push_back({s.substr(0,pos), s.substr(pos+1)});
+                } else if (m.is_object()) {
+                    for (auto it = m.begin(); it != m.end(); ++it) {
+                        defs.push_back({it.key(), it.value().get<std::string>()});
+                    }
+                }
+            }
+        }
+    } catch (...) {}
+    return defs;
+}
+
+std::vector<uint32_t> compile_glsl_shaderc(const std::string& source, const std::string& entry, const std::vector<MacroDef>& macros) {
+    shaderc::Compiler compiler;
+    shaderc::CompileOptions opts;
+    // Target Vulkan environment; change if you need a different Vulkan version
+    opts.SetTargetEnvironment(shaderc_target_env_vulkan, shaderc_env_version_vulkan_1_1);
+    opts.SetSourceLanguage(shaderc_source_language_glsl);
+    opts.SetOptimizationLevel(shaderc_optimization_level_performance);
+
+    for (const auto& d : macros) opts.AddMacroDefinition(d.name, d.value);
+
+    // This code is used for compute shaders in this project. If you want
+    // to support other stages add logic here to pick shaderc_shader_kind.
+    shaderc_shader_kind kind = shaderc_compute_shader;
+
+    auto res = compiler.CompileGlslToSpv(source, kind, "kernel.comp", entry.c_str(), opts);
+    if (res.GetCompilationStatus() != shaderc_compilation_status_success) {
+        throw std::runtime_error(std::string("GLSL->SPIR-V (shaderc) error: ") + res.GetErrorMessage());
+    }
+    return {res.cbegin(), res.cend()};
+}
+
+std::vector<uint32_t> compile_glsl_to_spirv(const std::string& source, const std::string& entry, const std::vector<MacroDef>& macros) {
+    const std::string src = ensure_glsl_version(source);
+    (void)entry; // compile_glsl_shaderc receives entry explicitly
+    return compile_glsl_shaderc(src, entry, macros);
+}
+
+} // namespace
+
+VulkanExecutor::VulkanExecutor(int preferredDeviceIndex)
+    : preferredDeviceIndex_(preferredDeviceIndex) {}
+
 VulkanExecutor::~VulkanExecutor() { cleanup(); }
 
-// -------- Instance & device --------
-bool VulkanExecutor::createInstance(bool enableValidation, bool enableDebugUtils) {
-    // Query available instance extensions
-    uint32_t extCount = 0;
-    vkEnumerateInstanceExtensionProperties(nullptr, &extCount, nullptr);
-    std::vector<VkExtensionProperties> exts(extCount);
-    vkEnumerateInstanceExtensionProperties(nullptr, &extCount, exts.data());
+bool VulkanExecutor::initialize(const json&) {
+    if (!createInstance()) return false;
+    if (!pickPhysicalDevice()) return false;
+    if (!createDevice()) return false;
+    return true;
+}
 
-    auto hasExt = [&](const char* name){
-        for (auto const& e : exts) if (strcmp(e.extensionName, name) == 0) return true;
-        return false;
-    };
+void VulkanExecutor::cleanup() { destroyVulkan(); }
 
-    std::vector<const char*> enabledExts;
-    if (enableDebugUtils && hasExt(VK_EXT_DEBUG_UTILS_EXTENSION_NAME)) {
-        enabledExts.push_back(VK_EXT_DEBUG_UTILS_EXTENSION_NAME);
+json VulkanExecutor::getCapabilities() const {
+    json caps;
+    caps["framework"] = "vulkan";
+    caps["initialized"] = (device_ != VK_NULL_HANDLE);
+    caps["supportsMultiInput"] = true;
+    caps["supportsMultiOutput"] = true;
+    caps["shaderSource"] = "glsl";
+    caps["requiresBindings"] = "inputs first, then outputs (set=0, binding=i)";
+    if (phys_) {
+        VkPhysicalDeviceProperties props{};
+        vkGetPhysicalDeviceProperties(phys_, &props);
+        caps["device"] = {
+            {"apiVersion", (uint32_t)props.apiVersion},
+            {"driverVersion", (uint32_t)props.driverVersion},
+            {"vendorID", (uint32_t)props.vendorID},
+            {"deviceID", (uint32_t)props.deviceID},
+            {"deviceType", (uint32_t)props.deviceType},
+            {"name", std::string(props.deviceName)},
+            {"maxComputeWorkGroupCount", {
+                props.limits.maxComputeWorkGroupCount[0],
+                props.limits.maxComputeWorkGroupCount[1],
+                props.limits.maxComputeWorkGroupCount[2]
+            }}
+        };
     }
-    // portability enumeration is harmless if present (mostly for MoltenVK/macOS)
-#ifdef VK_KHR_PORTABILITY_ENUMERATION_EXTENSION_NAME
-    if (hasExt(VK_KHR_PORTABILITY_ENUMERATION_EXTENSION_NAME)) {
-        enabledExts.push_back(VK_KHR_PORTABILITY_ENUMERATION_EXTENSION_NAME);
-    }
-#endif
+    return caps;
+}
 
-    VkApplicationInfo appInfo{VK_STRUCTURE_TYPE_APPLICATION_INFO};
-    appInfo.pApplicationName = "Multi-Framework Compute Client (Vulkan)";
-    appInfo.applicationVersion = VK_MAKE_VERSION(1,0,0);
-    appInfo.pEngineName = "No Engine";
-    appInfo.engineVersion = VK_MAKE_VERSION(1,0,0);
-    appInfo.apiVersion = VK_API_VERSION_1_1; // reasonable baseline for Linux/Windows in 2025
+bool VulkanExecutor::createInstance() {
+    VkApplicationInfo app{VK_STRUCTURE_TYPE_APPLICATION_INFO};
+    app.pApplicationName = "native-mimo-client";
+    app.applicationVersion = VK_MAKE_VERSION(1,0,0);
+    app.pEngineName = "none";
+    app.engineVersion = VK_MAKE_VERSION(1,0,0);
+    app.apiVersion = VK_API_VERSION_1_1;
 
     VkInstanceCreateInfo ci{VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO};
-    ci.pApplicationInfo = &appInfo;
-    ci.enabledExtensionCount = static_cast<uint32_t>(enabledExts.size());
-    ci.ppEnabledExtensionNames = enabledExts.empty() ? nullptr : enabledExts.data();
-#ifdef VK_KHR_PORTABILITY_ENUMERATION_EXTENSION_NAME
-    if (std::find(enabledExts.begin(), enabledExts.end(), VK_KHR_PORTABILITY_ENUMERATION_EXTENSION_NAME) != enabledExts.end()) {
-        ci.flags |= VK_INSTANCE_CREATE_ENUMERATE_PORTABILITY_BIT_KHR;
-    }
-#endif
-
-    VkResult res = vkCreateInstance(&ci, nullptr, &instance);
-    if (res != VK_SUCCESS) {
-        std::cerr << "vkCreateInstance failed: " << res << std::endl;
-        return false;
-    }
-    return true;
+    ci.pApplicationInfo = &app;
+    return vkCreateInstance(&ci, nullptr, &instance_) == VK_SUCCESS;
 }
 
 bool VulkanExecutor::pickPhysicalDevice() {
     uint32_t count = 0;
-    vkEnumeratePhysicalDevices(instance, &count, nullptr);
-    if (count == 0) return false;
+    vkEnumeratePhysicalDevices(instance_, &count, nullptr);
+    if (!count) return false;
     std::vector<VkPhysicalDevice> devs(count);
-    vkEnumeratePhysicalDevices(instance, &count, devs.data());
+    vkEnumeratePhysicalDevices(instance_, &count, devs.data());
 
-    // Prefer a device with a dedicated compute queue if possible
-    auto pickScore = [&](VkPhysicalDevice pd)->int{
-        VkPhysicalDeviceProperties props{};
-        vkGetPhysicalDeviceProperties(pd, &props);
-        uint32_t qfCount = 0;
-        vkGetPhysicalDeviceQueueFamilyProperties(pd, &qfCount, nullptr);
-        std::vector<VkQueueFamilyProperties> qf(qfCount);
-        vkGetPhysicalDeviceQueueFamilyProperties(pd, &qfCount, qf.data());
-
-        bool hasComputeOnly = false;
-        bool hasCompute = false;
-        for (uint32_t i=0;i<qfCount;i++){
-            if (qf[i].queueFlags & VK_QUEUE_COMPUTE_BIT) {
-                hasCompute = true;
-                if ((qf[i].queueFlags & VK_QUEUE_GRAPHICS_BIT) == 0) hasComputeOnly = true;
-            }
-        }
-        int score = 0;
-        if (hasCompute) score += 10;
-        if (hasComputeOnly) score += 5;
-        // prefer discrete
-        if (props.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU) score += 3;
-        return score;
+    auto computeQ = [&](VkPhysicalDevice d)->std::optional<uint32_t>{
+        uint32_t n=0; vkGetPhysicalDeviceQueueFamilyProperties(d, &n, nullptr);
+        std::vector<VkQueueFamilyProperties> props(n);
+        vkGetPhysicalDeviceQueueFamilyProperties(d, &n, props.data());
+        for (uint32_t i=0;i<n;++i) if (props[i].queueFlags & VK_QUEUE_COMPUTE_BIT) return i;
+        return std::nullopt;
     };
 
-    int bestScore = -1;
-    for (auto pd : devs) {
-        int s = pickScore(pd);
-        if (s > bestScore) { bestScore = s; physicalDevice = pd; }
+    uint32_t picked = 0;
+    if (preferredDeviceIndex_ >= 0 && preferredDeviceIndex_ < (int)devs.size()) {
+        if (computeQ(devs[preferredDeviceIndex_]).has_value()) picked = (uint32_t)preferredDeviceIndex_;
+    } else {
+        for (uint32_t i=0;i<count;++i) if (computeQ(devs[i]).has_value()) { picked = i; break; }
     }
-    if (physicalDevice == VK_NULL_HANDLE) return false;
-
-    vkGetPhysicalDeviceProperties(physicalDevice, &deviceProperties);
-    vkGetPhysicalDeviceMemoryProperties(physicalDevice, &memoryProperties);
+    phys_ = devs[picked];
+    computeQueueFamily_ = computeQ(phys_).value();
     return true;
 }
 
-bool VulkanExecutor::createLogicalDevice() {
-    uint32_t qfCount = 0;
-    vkGetPhysicalDeviceQueueFamilyProperties(physicalDevice, &qfCount, nullptr);
-    std::vector<VkQueueFamilyProperties> qf(qfCount);
-    vkGetPhysicalDeviceQueueFamilyProperties(physicalDevice, &qfCount, qf.data());
-
-    bool found = false;
-    for (uint32_t i=0;i<qfCount;i++){
-        if (qf[i].queueFlags & VK_QUEUE_COMPUTE_BIT) { computeQueueFamilyIndex = i; found = true; break; }
-    }
-    if (!found) return false;
-
+bool VulkanExecutor::createDevice() {
     float prio = 1.0f;
-    VkDeviceQueueCreateInfo qci{VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO};
-    qci.queueFamilyIndex = computeQueueFamilyIndex;
-    qci.queueCount = 1;
-    qci.pQueuePriorities = &prio;
+    VkDeviceQueueCreateInfo q{VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO};
+    q.queueFamilyIndex = computeQueueFamily_;
+    q.queueCount = 1;
+    q.pQueuePriorities = &prio;
 
-    VkPhysicalDeviceFeatures feats{}; // minimal
-    VkDeviceCreateInfo dci{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO};
-    dci.queueCreateInfoCount = 1;
-    dci.pQueueCreateInfos = &qci;
-    dci.pEnabledFeatures = &feats;
+    VkDeviceCreateInfo ci{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO};
+    ci.queueCreateInfoCount = 1;
+    ci.pQueueCreateInfos = &q;
 
-    VK_CHECK(vkCreateDevice(physicalDevice, &dci, nullptr, &device));
-    vkGetDeviceQueue(device, computeQueueFamilyIndex, 0, &computeQueue);
+    if (vkCreateDevice(phys_, &ci, nullptr, &device_) != VK_SUCCESS) return false;
+    vkGetDeviceQueue(device_, computeQueueFamily_, 0, &queue_);
 
-    // Pipeline cache (optional)
-    VkPipelineCacheCreateInfo pci{VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO};
-    VK_CHECK(vkCreatePipelineCache(device, &pci, nullptr, &pipelineCache));
+    VkCommandPoolCreateInfo pi{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
+    pi.queueFamilyIndex = computeQueueFamily_;
+    pi.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
+    if (vkCreateCommandPool(device_, &pi, nullptr, &cmdPool_) != VK_SUCCESS) return false;
     return true;
 }
 
-bool VulkanExecutor::createCommandPool() {
-    VkCommandPoolCreateInfo ci{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
-    ci.queueFamilyIndex = computeQueueFamilyIndex;
-    ci.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
-    VK_CHECK(vkCreateCommandPool(device, &ci, nullptr, &commandPool));
-    return true;
-}
-
-bool VulkanExecutor::createDescriptorPool() {
-    // We assume at most 2 STORAGE_BUFFER per set (in/out). Size pool liberally.
-    std::array<VkDescriptorPoolSize,1> sizes{};
-    sizes[0].type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-    sizes[0].descriptorCount = 2048; // 1000 sets * 2 buffers (rounded up)
-
-    VkDescriptorPoolCreateInfo ci{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
-    ci.flags = VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT;
-    ci.poolSizeCount = static_cast<uint32_t>(sizes.size());
-    ci.pPoolSizes = sizes.data();
-    ci.maxSets = 1024;
-
-    VK_CHECK(vkCreateDescriptorPool(device, &ci, nullptr, &descriptorPool));
-    return true;
-}
-
-void VulkanExecutor::destroyDeviceObjects() {
-    if (descriptorPool) vkDestroyDescriptorPool(device, descriptorPool, nullptr);
-    if (commandPool) vkDestroyCommandPool(device, commandPool, nullptr);
-    if (pipelineCache) vkDestroyPipelineCache(device, pipelineCache, nullptr);
-    if (device) vkDestroyDevice(device, nullptr);
-    descriptorPool = VK_NULL_HANDLE;
-    commandPool = VK_NULL_HANDLE;
-    pipelineCache = VK_NULL_HANDLE;
-    device = VK_NULL_HANDLE;
-}
-
-void VulkanExecutor::destroyInstance() {
-    if (instance) vkDestroyInstance(instance, nullptr);
-    instance = VK_NULL_HANDLE;
-}
-
-bool VulkanExecutor::initialize(const json& config) {
-    if (initialized) return true;
-
-    bool enableValidation = config.value("enableValidation", false);
-    bool enableDebugUtils = config.value("enableDebugUtils", enableValidation);
-
-    try {
-        if (!createInstance(enableValidation, enableDebugUtils)) return false;
-        if (!pickPhysicalDevice()) throw std::runtime_error("No suitable physical device");
-        if (!createLogicalDevice()) throw std::runtime_error("Failed to create logical device");
-        if (!createCommandPool()) throw std::runtime_error("Failed to create command pool");
-        if (!createDescriptorPool()) throw std::runtime_error("Failed to create descriptor pool");
-        initialized = true;
-        std::cout << "Vulkan initialized: " << deviceProperties.deviceName << std::endl;
-        return true;
-    } catch (const std::exception& e) {
-        std::cerr << "[initialize] " << e.what() << std::endl;
-        // Clean up partially created resources
-        destroyDeviceObjects();
-        destroyInstance();
-        initialized = false;
-        return false;
+void VulkanExecutor::destroyVulkan() {
+    if (device_) {
+        if (cmdPool_) { vkDestroyCommandPool(device_, cmdPool_, nullptr); cmdPool_ = VK_NULL_HANDLE; }
+        vkDestroyDevice(device_, nullptr); device_ = VK_NULL_HANDLE;
     }
+    if (instance_) { vkDestroyInstance(instance_, nullptr); instance_ = VK_NULL_HANDLE; }
 }
 
-void VulkanExecutor::cleanup() {
-    destroyDeviceObjects();
-    destroyInstance();
-    initialized = false;
-}
-
-// -------- Buffers --------
-uint32_t VulkanExecutor::findMemoryType(uint32_t typeFilter, VkMemoryPropertyFlags properties) const {
-    for (uint32_t i = 0; i < memoryProperties.memoryTypeCount; i++) {
-        if ((typeFilter & (1u << i)) &&
-            (memoryProperties.memoryTypes[i].propertyFlags & properties) == properties) {
-            return i;
-        }
+uint32_t VulkanExecutor::findMemoryType(uint32_t typeBits, VkMemoryPropertyFlags props) const {
+    VkPhysicalDeviceMemoryProperties mp{};
+    vkGetPhysicalDeviceMemoryProperties(phys_, &mp);
+    for (uint32_t i=0;i<mp.memoryTypeCount;++i) {
+        if ((typeBits & (1u<<i)) && (mp.memoryTypes[i].propertyFlags & props) == props) return i;
     }
-    throw std::runtime_error("No suitable memory type");
+    throw std::runtime_error("No compatible memory type");
 }
 
-bool VulkanExecutor::createBuffer(VkDeviceSize size, VkBufferUsageFlags usage,
-                                  VkMemoryPropertyFlags properties, VkBuffer& buffer, VkDeviceMemory& bufferMemory) const {
+bool VulkanExecutor::createBuffer(VkDeviceSize size,
+                                  VkBufferUsageFlags usage,
+                                  VkMemoryPropertyFlags props,
+                                  VkBuffer& outBuf, VkDeviceMemory& outMem) const {
     VkBufferCreateInfo bi{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
     bi.size = size;
     bi.usage = usage;
     bi.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
-    VK_CHECK(vkCreateBuffer(device, &bi, nullptr, &buffer));
+    if (vkCreateBuffer(device_, &bi, nullptr, &outBuf) != VK_SUCCESS) return false;
 
-    VkMemoryRequirements req;
-    vkGetBufferMemoryRequirements(device, buffer, &req);
+    VkMemoryRequirements req{};
+    vkGetBufferMemoryRequirements(device_, outBuf, &req);
 
     VkMemoryAllocateInfo ai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
     ai.allocationSize = req.size;
-    ai.memoryTypeIndex = findMemoryType(req.memoryTypeBits, properties);
+    ai.memoryTypeIndex = findMemoryType(req.memoryTypeBits, props);
 
-    VK_CHECK(vkAllocateMemory(device, &ai, nullptr, &bufferMemory));
-    VK_CHECK(vkBindBufferMemory(device, buffer, bufferMemory, 0));
+    if (vkAllocateMemory(device_, &ai, nullptr, &outMem) != VK_SUCCESS) return false;
+    vkBindBufferMemory(device_, outBuf, outMem, 0);
     return true;
 }
 
-// -------- Shader compilation --------
-static shaderc_env_version pick_env_from_api(uint32_t apiVersion) {
-    uint32_t major = VK_VERSION_MAJOR(apiVersion);
-    uint32_t minor = VK_VERSION_MINOR(apiVersion);
-    if (major > 1 || (major==1 && minor >= 2)) return shaderc_env_version_vulkan_1_2;
-    if (minor >= 1) return shaderc_env_version_vulkan_1_1;
-    return shaderc_env_version_vulkan_1_0;
+VulkanExecutor::Buffer VulkanExecutor::makeHostBuffer(VkDeviceSize size, VkBufferUsageFlags usage) const {
+    Buffer b;
+    b.size = size;
+    if (!createBuffer(size, usage, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, b.buf, b.mem))
+        throw std::runtime_error("createBuffer failed");
+    if (vkMapMemory(device_, b.mem, 0, size, 0, &b.mapped) != VK_SUCCESS)
+        throw std::runtime_error("vkMapMemory failed");
+    return b;
 }
 
-bool VulkanExecutor::compileGLSLtoSPIRV(const std::string& glsl, std::vector<uint32_t>& spirv, std::string& error) const {
-    shaderc::Compiler compiler;
-    shaderc::CompileOptions options;
-    options.SetTargetEnvironment(shaderc_target_env_vulkan, pick_env_from_api(deviceProperties.apiVersion));
-    // Let drivers legalize. Optimize for performance if requested later.
-    options.SetOptimizationLevel(shaderc_optimization_level_performance);
-
-    auto res = compiler.CompileGlslToSpv(glsl, shaderc_compute_shader, "kernel.comp", options);
-    if (res.GetCompilationStatus() != shaderc_compilation_status_success) {
-        error = res.GetErrorMessage();
-        return false;
-    }
-    spirv.assign(res.cbegin(), res.cend());
-    return true;
+void VulkanExecutor::destroyBuffer(Buffer& b) const {
+    if (!device_) return;
+    if (b.mapped) { vkUnmapMemory(device_, b.mem); b.mapped = nullptr; }
+    if (b.buf) { vkDestroyBuffer(device_, b.buf, nullptr); b.buf = VK_NULL_HANDLE; }
+    if (b.mem) { vkFreeMemory(device_, b.mem, nullptr); b.mem = VK_NULL_HANDLE; }
 }
 
-// -------- Execute --------
 TaskResult VulkanExecutor::executeTask(const TaskData& task) {
-    TaskResult result;
-    auto startTime = std::chrono::high_resolution_clock::now();
+    TaskResult result{};
+    auto t0 = std::chrono::high_resolution_clock::now();
 
-    if (!initialized) {
+    if (device_ == VK_NULL_HANDLE) {
         result.success = false;
         result.errorMessage = "Vulkan not initialized";
         return result;
     }
 
-    // Validate workgroup counts
-    uint32_t gx = 1, gy = 1, gz = 1;
-    if (!task.workgroupCount.empty()) {
-        if (task.workgroupCount.size() > 0) gx = std::max(1, task.workgroupCount[0]);
-        if (task.workgroupCount.size() > 1) gy = std::max(1, task.workgroupCount[1]);
-        if (task.workgroupCount.size() > 2) gz = std::max(1, task.workgroupCount[2]);
-    }
-    // Clamp to device limits
-    gx = std::min<uint32_t>(gx, deviceProperties.limits.maxComputeWorkGroupCount[0]);
-    gy = std::min<uint32_t>(gy, deviceProperties.limits.maxComputeWorkGroupCount[1]);
-    gz = std::min<uint32_t>(gz, deviceProperties.limits.maxComputeWorkGroupCount[2]);
-
-    // Build descriptor set layout based on bindLayout string (server default: "vulkan-storage-buffer")
-    // ABI: set=0, binding 0 -> optional readonly storage buffer (input)
-    //      set=0, binding 1 -> storage buffer (output)
-    VkDescriptorSetLayoutBinding bindings[2]{};
-    uint32_t bindingCount = 0;
-
-    bool hasInput = !task.inputData.empty();
-    // Always provide output
-    if (hasInput) {
-        bindings[bindingCount].binding = 0;
-        bindings[bindingCount].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-        bindings[bindingCount].descriptorCount = 1;
-        bindings[bindingCount].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
-        bindingCount++;
-    }
-    bindings[bindingCount].binding = hasInput ? 1u : 0u;
-    bindings[bindingCount].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-    bindings[bindingCount].descriptorCount = 1;
-    bindings[bindingCount].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
-    bindingCount++;
-
-    VkDescriptorSetLayoutCreateInfo dslci{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
-    dslci.bindingCount = bindingCount;
-    dslci.pBindings = bindings;
-    VkDescriptorSetLayout descriptorSetLayout = VK_NULL_HANDLE;
+    VkDescriptorSetLayout dsetLayout = VK_NULL_HANDLE; VkPipelineLayout pipelineLayout = VK_NULL_HANDLE; VkDescriptorPool descPool = VK_NULL_HANDLE; VkShaderModule shaderModule = VK_NULL_HANDLE; VkPipeline pipeline = VK_NULL_HANDLE;
     try {
-        VK_CHECK(vkCreateDescriptorSetLayout(device, &dslci, nullptr, &descriptorSetLayout));
-    } catch (...) {
-        result.success = false;
-        result.errorMessage = "Failed to create descriptor set layout";
-        return result;
-    }
+        // Determine IO counts
+        const bool multipleInputs = !task.inputData.empty();
+        const bool multipleOutputs = !task.outputSizes.empty();
 
-    // Pipeline layout
-    VkPipelineLayoutCreateInfo plci{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
-    plci.setLayoutCount = 1;
-    plci.pSetLayouts = &descriptorSetLayout;
-    VkPipelineLayout pipelineLayout = VK_NULL_HANDLE;
-    VkPipeline pipeline = VK_NULL_HANDLE;
-    VkShaderModule shaderModule = VK_NULL_HANDLE;
+        const size_t inputCount = multipleInputs ? task.inputData.size() : (task.legacyInputData.empty() ? 0 : 1);
+        const size_t outputCount = multipleOutputs ? task.outputSizes.size() : (task.legacyOutputSize ? 1 : 0);
 
-    // Resources
-    VkBuffer inputBuffer = VK_NULL_HANDLE, outputBuffer = VK_NULL_HANDLE;
-    VkDeviceMemory inputMem = VK_NULL_HANDLE, outputMem = VK_NULL_HANDLE;
-    VkDescriptorSet descriptorSet = VK_NULL_HANDLE;
-    VkCommandBuffer cmd = VK_NULL_HANDLE;
-    VkFence fence = VK_NULL_HANDLE;
-
-    try {
-        VK_CHECK(vkCreatePipelineLayout(device, &plci, nullptr, &pipelineLayout));
-
-        // Compile GLSL (we only support GLSL text for Vulkan client)
-        std::vector<uint32_t> spirv;
-        std::string compileErr;
-        if (!compileGLSLtoSPIRV(task.kernel, spirv, compileErr)) {
-            throw std::runtime_error(std::string("GLSL->SPIR-V compile failed: ") + compileErr);
+        if (outputCount == 0) {
+            result.success = false;
+            result.errorMessage = "No outputs requested";
+            return result;
         }
 
-        VkShaderModuleCreateInfo smci{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
-        smci.codeSize = spirv.size() * sizeof(uint32_t);
-        smci.pCode = spirv.data();
-        VK_CHECK(vkCreateShaderModule(device, &smci, nullptr, &shaderModule));
-
-        VkPipelineShaderStageCreateInfo stage{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
-        stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
-        stage.module = shaderModule;
-        stage.pName = task.entry.empty() ? "main" : task.entry.c_str();
-
-        VkComputePipelineCreateInfo cpci{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
-        cpci.stage = stage;
-        cpci.layout = pipelineLayout;
-        VK_CHECK(vkCreateComputePipelines(device, pipelineCache, 1, &cpci, nullptr, &pipeline));
-
-        // Buffers
-        if (hasInput) {
-            if(!createBuffer(task.inputData.size(),
-                                  VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
-                                  VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
-                                  inputBuffer, inputMem)) {
-                                    throw std::runtime_error("Failed to create input buffer");
-                                  }
-            // Map & write input
-            void* p = nullptr;
-            VkResult mapRes = vkMapMemory(device, inputMem, 0, task.inputData.size(), 0, &p);
-            if (mapRes != VK_SUCCESS || !p) throw std::runtime_error("vkMapMemory failed for input buffer");
-            std::memcpy(p, task.inputData.data(), task.inputData.size());
-            vkUnmapMemory(device, inputMem);
-        }
-
-        if (task.outputSize == 0) throw std::runtime_error("outputSize must be > 0");
-        if (!createBuffer(task.outputSize,
-                  VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
-                  VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
-                  outputBuffer, outputMem)) {
-                throw std::runtime_error("Failed to create output buffer");
+        // Create and fill input buffers
+        std::vector<Buffer> inputBuffers;
+        inputBuffers.reserve(std::max<size_t>(1, inputCount));
+        if (multipleInputs) {
+            for (const auto& in : task.inputData) {
+                auto buf = makeHostBuffer(in.empty() ? 4 : (VkDeviceSize)in.size(), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+                if (!in.empty()) std::memcpy(buf.mapped, in.data(), in.size());
+                inputBuffers.push_back(buf);
             }
+        } else if (!task.legacyInputData.empty()) {
+            auto& in = task.legacyInputData;
+            auto buf = makeHostBuffer((VkDeviceSize)in.size(), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+            std::memcpy(buf.mapped, in.data(), in.size());
+            inputBuffers.push_back(buf);
+        }
 
-        // Allocate descriptor set
-        VkDescriptorSetLayout layouts[1] = { descriptorSetLayout };
+        // Create output buffers
+        std::vector<Buffer> outputBuffers;
+        outputBuffers.reserve(std::max<size_t>(1, outputCount));
+        if (multipleOutputs) {
+            for (size_t sz : task.outputSizes) {
+                auto buf = makeHostBuffer((VkDeviceSize)std::max<size_t>(sz,4), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+                outputBuffers.push_back(buf);
+            }
+        } else {
+            auto buf = makeHostBuffer((VkDeviceSize)std::max<size_t>(task.legacyOutputSize,4), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+            outputBuffers.push_back(buf);
+        }
+
+        const uint32_t totalBindings = (uint32_t)(inputBuffers.size() + outputBuffers.size());
+
+        // Build descriptor set layout: all storage buffers, inputs first then outputs
+        std::vector<VkDescriptorSetLayoutBinding> layoutBindings;
+        layoutBindings.reserve(totalBindings);
+        for (uint32_t i=0; i<totalBindings; ++i) {
+            VkDescriptorSetLayoutBinding lb{};
+            lb.binding = i;
+            lb.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+            lb.descriptorCount = 1;
+            lb.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+            layoutBindings.push_back(lb);
+        }
+
+        VkDescriptorSetLayoutCreateInfo dslci{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+        dslci.bindingCount = (uint32_t)layoutBindings.size();
+        dslci.pBindings = layoutBindings.data();
+        if (vkCreateDescriptorSetLayout(device_, &dslci, nullptr, &dsetLayout) != VK_SUCCESS)
+            throw std::runtime_error("vkCreateDescriptorSetLayout failed");
+
+        VkPipelineLayoutCreateInfo plci{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+        plci.setLayoutCount = 1;
+        plci.pSetLayouts = &dsetLayout;
+        if (vkCreatePipelineLayout(device_, &plci, nullptr, &pipelineLayout) != VK_SUCCESS)
+            throw std::runtime_error("vkCreatePipelineLayout failed");
+
+        // Compile GLSL to SPIR-V if kernel provided; otherwise fall back to CPU copy.
+        bool useGpu = !task.kernel.empty();
+        if (useGpu) {
+            auto macros = parse_macros(task.compilationOptions);
+            std::vector<uint32_t> spirv = compile_glsl_to_spirv(task.kernel, task.entry.empty() ? "main" : task.entry, macros);
+            VkShaderModuleCreateInfo smci{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+            smci.codeSize = spirv.size() * sizeof(uint32_t);
+            smci.pCode = spirv.data();
+            if (vkCreateShaderModule(device_, &smci, nullptr, &shaderModule) != VK_SUCCESS)
+                throw std::runtime_error("vkCreateShaderModule failed");
+
+            VkPipelineShaderStageCreateInfo stage{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
+            stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+            stage.module = shaderModule;
+            stage.pName = (task.entry.empty() ? "main" : task.entry.c_str());
+
+            VkComputePipelineCreateInfo cpci{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
+            cpci.stage = stage;
+            cpci.layout = pipelineLayout;
+            if (vkCreateComputePipelines(device_, VK_NULL_HANDLE, 1, &cpci, nullptr, &pipeline) != VK_SUCCESS)
+                throw std::runtime_error("vkCreateComputePipelines failed");
+        }
+
+        // Descriptor pool & set
+        VkDescriptorPoolSize poolSize{};
+        poolSize.type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        poolSize.descriptorCount = totalBindings;
+
+        VkDescriptorPoolCreateInfo dpci{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
+        dpci.maxSets = 1;
+        dpci.poolSizeCount = 1;
+        dpci.pPoolSizes = &poolSize;
+        if (vkCreateDescriptorPool(device_, &dpci, nullptr, &descPool) != VK_SUCCESS)
+            throw std::runtime_error("vkCreateDescriptorPool failed");
+
+        VkDescriptorSet descSet = VK_NULL_HANDLE;
         VkDescriptorSetAllocateInfo dsai{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
-        dsai.descriptorPool = descriptorPool;
+        dsai.descriptorPool = descPool;
         dsai.descriptorSetCount = 1;
-        dsai.pSetLayouts = layouts;
-        VK_CHECK(vkAllocateDescriptorSets(device, &dsai, &descriptorSet));
+        dsai.pSetLayouts = &dsetLayout;
+        if (vkAllocateDescriptorSets(device_, &dsai, &descSet) != VK_SUCCESS)
+            throw std::runtime_error("vkAllocateDescriptorSets failed");
 
         // Update descriptors
+        std::vector<VkDescriptorBufferInfo> infos(totalBindings);
         std::vector<VkWriteDescriptorSet> writes;
-        VkDescriptorBufferInfo inInfo{}, outInfo{};
-        if (hasInput) {
-            inInfo.buffer = inputBuffer; inInfo.offset = 0; inInfo.range = task.inputData.size();
+        writes.reserve(totalBindings);
+        uint32_t bind = 0;
+        for (const auto& b : inputBuffers) {
+            infos[bind] = { b.buf, 0, b.size };
             VkWriteDescriptorSet w{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
-            w.dstSet = descriptorSet;
-            w.dstBinding = 0;
+            w.dstSet = descSet;
+            w.dstBinding = bind;
             w.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
             w.descriptorCount = 1;
-            w.pBufferInfo = &inInfo;
+            w.pBufferInfo = &infos[bind];
             writes.push_back(w);
+            ++bind;
         }
-        outInfo.buffer = outputBuffer; outInfo.offset = 0; outInfo.range = task.outputSize;
-        {
+        for (const auto& b : outputBuffers) {
+            infos[bind] = { b.buf, 0, b.size };
             VkWriteDescriptorSet w{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
-            w.dstSet = descriptorSet;
-            w.dstBinding = hasInput ? 1u : 0u;
+            w.dstSet = descSet;
+            w.dstBinding = bind;
             w.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
             w.descriptorCount = 1;
-            w.pBufferInfo = &outInfo;
+            w.pBufferInfo = &infos[bind];
             writes.push_back(w);
+            ++bind;
         }
-        vkUpdateDescriptorSets(device, static_cast<uint32_t>(writes.size()), writes.data(), 0, nullptr);
+        vkUpdateDescriptorSets(device_, (uint32_t)writes.size(), writes.data(), 0, nullptr);
 
-        // Command buffer
-        VkCommandBufferAllocateInfo cbai{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
-        cbai.commandPool = commandPool;
-        cbai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-        cbai.commandBufferCount = 1;
-        VK_CHECK(vkAllocateCommandBuffers(device, &cbai, &cmd));
+        if (useGpu) {
+            // Record and submit compute dispatch
+            VkCommandBufferAllocateInfo cbai{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+            cbai.commandPool = cmdPool_;
+            cbai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+            cbai.commandBufferCount = 1;
+            VkCommandBuffer cmd = VK_NULL_HANDLE;
+            if (vkAllocateCommandBuffers(device_, &cbai, &cmd) != VK_SUCCESS)
+                throw std::runtime_error("vkAllocateCommandBuffers failed");
 
-        VkCommandBufferBeginInfo beginInfo{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
-        VK_CHECK(vkBeginCommandBuffer(cmd, &beginInfo));
+            VkCommandBufferBeginInfo cbbi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+            vkBeginCommandBuffer(cmd, &cbbi);
+            vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline);
+            vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipelineLayout, 0, 1, &descSet, 0, nullptr);
 
-        // Bind pipeline & descriptors
-        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline);
-        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipelineLayout, 0, 1, &descriptorSet, 0, nullptr);
+            uint32_t gx = 1, gy = 1, gz = 1;
+            if (!task.workgroupCount.empty()) {
+                if (task.workgroupCount.size() >= 1) gx = (uint32_t)std::max(1, task.workgroupCount[0]);
+                if (task.workgroupCount.size() >= 2) gy = (uint32_t)std::max(1, task.workgroupCount[1]);
+                if (task.workgroupCount.size() >= 3) gz = (uint32_t)std::max(1, task.workgroupCount[2]);
+            }
+            vkCmdDispatch(cmd, gx, gy, gz);
+            vkEndCommandBuffer(cmd);
 
-        // Dispatch
-        vkCmdDispatch(cmd, gx, gy, gz);
+            VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+            si.commandBufferCount = 1;
+            si.pCommandBuffers = &cmd;
+            vkQueueSubmit(queue_, 1, &si, VK_NULL_HANDLE);
+            vkQueueWaitIdle(queue_);
 
-        // Barrier to make shader writes visible to host (explicit even if we wait on fence & coherent memory)
-        VkMemoryBarrier mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
-        mb.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
-        mb.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
-        vkCmdPipelineBarrier(cmd,
-                             VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                             VK_PIPELINE_STAGE_HOST_BIT,
-                             0,
-                             1, &mb,
-                             0, nullptr,
-                             0, nullptr);
+            vkFreeCommandBuffers(device_, cmdPool_, 1, &cmd);
+        } else {
+            // CPU fallback: copy inputs to outputs
+            const size_t n = std::min(inputBuffers.size(), outputBuffers.size());
+            for (size_t i=0;i<n;++i) {
+                size_t copyBytes = (size_t)std::min<VkDeviceSize>(inputBuffers[i].size, outputBuffers[i].size);
+                std::memcpy(outputBuffers[i].mapped, inputBuffers[i].mapped, copyBytes);
+                if (outputBuffers[i].size > copyBytes) {
+                    std::memset(static_cast<char*>(outputBuffers[i].mapped)+copyBytes, 0, (size_t)(outputBuffers[i].size - copyBytes));
+                }
+            }
+            for (size_t i=n;i<outputBuffers.size();++i) {
+                std::memset(outputBuffers[i].mapped, 0, (size_t)outputBuffers[i].size);
+            }
+        }
 
-        VK_CHECK(vkEndCommandBuffer(cmd));
+        // Readback
+        if (multipleOutputs) {
+            result.outputData.resize(outputBuffers.size());
+            for (size_t i=0;i<outputBuffers.size();++i) {
+                result.outputData[i].resize((size_t)outputBuffers[i].size);
+                std::memcpy(result.outputData[i].data(), outputBuffers[i].mapped, (size_t)outputBuffers[i].size);
+            }
+            if (!result.outputData.empty()) result.legacyOutputData = result.outputData[0];
+        } else {
+            result.legacyOutputData.resize((size_t)outputBuffers[0].size);
+            std::memcpy(result.legacyOutputData.data(), outputBuffers[0].mapped, (size_t)outputBuffers[0].size);
+            result.outputData = { result.legacyOutputData };
+        }
 
-        // Fence & submit
-        VkFenceCreateInfo fci{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
-        VK_CHECK(vkCreateFence(device, &fci, nullptr, &fence));
+        // Cleanup resources
+        for (auto& b : inputBuffers) destroyBuffer(b);
+        for (auto& b : outputBuffers) destroyBuffer(b);
+        if (pipeline) vkDestroyPipeline(device_, pipeline, nullptr);
+        if (shaderModule) vkDestroyShaderModule(device_, shaderModule, nullptr);
+        if (descPool) vkDestroyDescriptorPool(device_, descPool, nullptr);
+        if (pipelineLayout) vkDestroyPipelineLayout(device_, pipelineLayout, nullptr);
+        if (dsetLayout) vkDestroyDescriptorSetLayout(device_, dsetLayout, nullptr);
 
-        VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
-        si.commandBufferCount = 1;
-        si.pCommandBuffers = &cmd;
-        VK_CHECK(vkQueueSubmit(computeQueue, 1, &si, fence));
-        VK_CHECK(vkWaitForFences(device, 1, &fence, VK_TRUE, UINT64_C(30'000'000'000))); // 30s
-
-        // Read back output
-        void* mapped = nullptr;
-        VkResult mapRes = vkMapMemory(device, outputMem, 0, task.outputSize, 0, &mapped);
-        if (mapRes != VK_SUCCESS || !mapped) throw std::runtime_error("vkMapMemory failed for output buffer");
-        auto* b = static_cast<uint8_t*>(mapped);
-        result.outputData.assign(b, b + task.outputSize);
-        vkUnmapMemory(device, outputMem);
-
+        auto t1 = std::chrono::high_resolution_clock::now();
+        result.processingTime = std::chrono::duration<double, std::milli>(t1 - t0).count();
         result.success = true;
-        auto end = std::chrono::high_resolution_clock::now();
-        // TODO: fix time measurement result.computeTimeMs = std::chrono::duration_cast<std::chrono::milliseconds>(end - startTime).count();
-        result.errorMessage.clear();
+        return result;
     } catch (const std::exception& e) {
+        if (pipeline) vkDestroyPipeline(device_, pipeline, nullptr);
+        if (shaderModule) vkDestroyShaderModule(device_, shaderModule, nullptr);
+        if (descPool) vkDestroyDescriptorPool(device_, descPool, nullptr);
+        if (pipelineLayout) vkDestroyPipelineLayout(device_, pipelineLayout, nullptr);
+        if (dsetLayout) vkDestroyDescriptorSetLayout(device_, dsetLayout, nullptr);
         result.success = false;
         result.errorMessage = e.what();
+        return result;
     }
-
-    // Cleanup per-task allocations
-    if (fence) vkDestroyFence(device, fence, nullptr);
-    if (cmd) vkFreeCommandBuffers(device, commandPool, 1, &cmd);
-    if (descriptorSet) vkFreeDescriptorSets(device, descriptorPool, 1, &descriptorSet);
-    if (shaderModule) vkDestroyShaderModule(device, shaderModule, nullptr);
-    if (pipeline) vkDestroyPipeline(device, pipeline, nullptr);
-    if (pipelineLayout) vkDestroyPipelineLayout(device, pipelineLayout, nullptr);
-    if (descriptorSetLayout) vkDestroyDescriptorSetLayout(device, descriptorSetLayout, nullptr);
-    if (inputBuffer) vkDestroyBuffer(device, inputBuffer, nullptr);
-    if (inputMem) vkFreeMemory(device, inputMem, nullptr);
-    if (outputBuffer) vkDestroyBuffer(device, outputBuffer, nullptr);
-    if (outputMem) vkFreeMemory(device, outputMem, nullptr);
-
-    return result;
-}
-
-json VulkanExecutor::getCapabilities() const {
-    json caps;
-    caps["framework"] = "vulkan";
-    caps["initialized"] = initialized;
-    if (!initialized || physicalDevice == VK_NULL_HANDLE) return caps;
-
-    caps["device"] = {
-        {"name", deviceProperties.deviceName},
-        {"apiVersion", deviceProperties.apiVersion},
-        {"driverVersion", deviceProperties.driverVersion},
-        {"vendorID", deviceProperties.vendorID},
-        {"deviceID", deviceProperties.deviceID},
-        {"type", deviceProperties.deviceType}
-    };
-    caps["limits"] = {
-        {"maxComputeWorkGroupCount", {
-            deviceProperties.limits.maxComputeWorkGroupCount[0],
-            deviceProperties.limits.maxComputeWorkGroupCount[1],
-            deviceProperties.limits.maxComputeWorkGroupCount[2]
-        }},
-        {"maxComputeWorkGroupSize", {
-            deviceProperties.limits.maxComputeWorkGroupSize[0],
-            deviceProperties.limits.maxComputeWorkGroupSize[1],
-            deviceProperties.limits.maxComputeWorkGroupSize[2]
-        }},
-        {"maxComputeWorkGroupInvocations", deviceProperties.limits.maxComputeWorkGroupInvocations}
-    };
-    return caps;
 }
