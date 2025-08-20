@@ -104,7 +104,8 @@ export default class MatrixTiledChunkingStrategy extends BaseChunkingStrategy {
   createChunkDescriptors(plan) {
     const { matrixSize, tileSize, tilesPerDim, operation } = plan.metadata;
     const schema = plan.schema;
-    const parsedInputs = this.parseMultipleInputs(plan.metadata.inputData, schema);
+    const hasInlineInput = !!(plan.metadata && plan.metadata.inputData);
+    const parsedInputs = hasInlineInput ? this.parseMultipleInputs(plan.metadata.inputData, schema) : {};
     const descriptors = [];
 
     let tileIndex = 0;
@@ -140,11 +141,11 @@ export default class MatrixTiledChunkingStrategy extends BaseChunkingStrategy {
           ],
 
           // NEW: Multi-input/output support
-          inputs: inputChunks, // Array of base64 strings
+          inputRefs: [{ idx: 0, href: `/api/workloads/${plan.parentId}/chunks/tile-${tileRow}-${tileCol}/input/0` }],
           outputSizes: [tileOutputSize], // Array with one output
 
           // Backward compatibility
-          inputData: inputChunks[0] || plan.metadata.inputData,
+          /* no inline input; fetched via inputRefs */
           outputSize: tileOutputSize,
 
           uniforms: {

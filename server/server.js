@@ -6,11 +6,19 @@ import http from 'http';
 import https from 'https';
 import { Server as SocketIOServer } from 'socket.io';
 import crypto from 'crypto';
+import os from 'os';
+import Busboy from 'busboy';
+import { pipeline } from 'stream/promises';
 
 // Enhanced: Import chunking system
 import { EnhancedChunkingManager } from './strategies/EnhancedChunkingManager.js';
 
 const app = express();
+
+
+const STORAGE_ROOT = process.env.VOLUNTEER_STORAGE || path.join(os.tmpdir(), 'volunteer');
+async function ensureDir(p) { await fs.promises.mkdir(p, { recursive: true }); }
+
 
 function sha256Hex(buf) {
   return crypto.createHash('sha256').update(buf).digest('hex');
@@ -264,7 +272,23 @@ function loadCustomWorkloadChunks() {
 }
 
 function broadcastCustomWorkloadList() {
-  io.emit('workloads:list_update', Array.from(customWorkloads.values()));
+  function redactWorkload(w) {
+    return {
+      id: w.id,
+      label: w.label,
+      framework: w.framework,
+      chunkingStrategy: w.chunkingStrategy,
+      assemblyStrategy: w.assemblyStrategy,
+      createdAt: w.createdAt,
+      status: w.status,
+      totalChunks: w.expectedChunks || (w.plan && w.plan.totalChunks) || 0,
+      dispatched: w.dispatchesMade || 0,
+      active: (w.activeAssignments && w.activeAssignments.size) || 0,
+      enhanced: !!w.enhanced
+    };
+  }
+  const summary = Array.from(customWorkloads.values()).map(redactWorkload);
+  io.emit('workloads:list_update', summary);
 }
 
 // --- Advanced route: create parent + chunk store ---
@@ -284,22 +308,7 @@ app.post('/api/workloads/advanced', async (req, res) => {
   } = req.body;
 
   try {
-    // If paths provided, read files into code fields
-    if (customChunkingFile && !customChunkingCode) {
-      try {
-        req.body.customChunkingCode = fs.readFileSync(customChunkingFile, 'utf8');
-      } catch (err) {
-        return res.status(400).json({ error: `Failed to read customChunkingFile: ${err.message}` });
-      }
-    }
-    if (customAssemblyFile && !customAssemblyCode) {
-      try {
-        req.body.customAssemblyCode = fs.readFileSync(customAssemblyFile, 'utf8');
-      } catch (err) {
-        return res.status(400).json({ error: `Failed to read customAssemblyFile: ${err.message}` });
-      }
-    }
-
+    // Register custom strategies if provided
     if (req.body.customChunkingCode) {
       const result = chunkingManager.registerCustomStrategy(req.body.customChunkingCode, 'chunking', chunkingStrategy);
       if (!result.success) return res.status(400).json({ error: `Custom chunking strategy failed: ${result.error}` });
@@ -310,68 +319,179 @@ app.post('/api/workloads/advanced', async (req, res) => {
     }
 
     const workloadId = uuidv4();
+
+    // Create enhanced workload metadata
     const enhancedWorkload = {
       id: workloadId,
       label: label || `Enhanced Workload ${workloadId.substring(0, 6)}`,
       chunkingStrategy,
       assemblyStrategy,
       framework,
-      input,
       metadata: { ...metadata, customShader },
-      createdAt: Date.now()
-    };
-
-    const result = await chunkingManager.processChunkedWorkload(enhancedWorkload);
-    if (!result.success) return res.status(400).json(result);
-
-    const firstCd = result.chunkDescriptors && result.chunkDescriptors[0];
-    customWorkloads.set(workloadId, {
-      ...enhancedWorkload,
+      createdAt: Date.now(),
       isChunkParent: true,
       enhanced: true,
-      chunkDescriptors: result.chunkDescriptors,
-      status: 'queued',
-      dispatchesMade: 0,
-      activeAssignments: new Set(),
-      processingTimes: [],
-      results: [],
-      plan: result.plan,
-      outputSizes: firstCd?.outputSizes || []
-    });
-
-    const store = {
-      parentId: workloadId,
-      allChunkDefs: result.chunkDescriptors.map((cd, idx) => ({
-        ...cd,
-        status: 'queued',
-        dispatchesMade: 0,
-        submissions: [],
-        activeAssignments: new Set(),
-        assignedClients: new Set(),
-        verified_results: null,
-        chunkOrderIndex: idx
-      })),
-      completedChunksData: new Map(),
-      expectedChunks: result.plan.totalChunks,
-      status: 'awaiting_start',
-      aggregationMethod: result.plan.assemblyStrategy,
-      enhanced: true
+      inputRefs: [],
+      outputSizes: req.body.outputSizes || []
     };
-    customWorkloadChunks.set(workloadId, store);
 
+    // PHASE 1: Validate and plan workload (no file access)
+    const validationResult = await chunkingManager.validateAndPlanWorkload(enhancedWorkload);
+    if (!validationResult.success) {
+      return res.status(400).json(validationResult);
+    }
+
+    // Handle inline input if provided (backward compatibility)
+    if (input) {
+      try {
+        const inputsDir = path.join(STORAGE_ROOT, workloadId, 'inputs');
+        await ensureDir(inputsDir);
+        const refs = [];
+
+        let parsedInputs = {};
+        try {
+          parsedInputs = (typeof input === 'string') ? JSON.parse(input) : input;
+        } catch (e) {
+          parsedInputs = { input };
+        }
+
+        for (const [name, val] of Object.entries(parsedInputs || {})) {
+          let buf = null;
+          if (typeof val === 'string') {
+            try { buf = Buffer.from(val, 'base64'); } catch { buf = Buffer.from(val); }
+          } else if (val && val.type === 'Buffer' && Array.isArray(val.data)) {
+            buf = Buffer.from(val.data);
+          }
+          if (!buf) continue;
+
+          const sha = sha256Hex(buf);
+          const fp = path.join(inputsDir, `${name}-${sha}.bin`);
+          await fs.promises.writeFile(fp, buf);
+          refs.push({ name, path: fp, sha256: sha, size: buf.length });
+        }
+
+        enhancedWorkload.inputRefs = refs;
+        enhancedWorkload.status = 'queued'; // Has input, ready to start
+      } catch (e) {
+        console.warn('Failed to persist inline inputs:', e.message);
+      }
+    } else {
+      // Set status based on whether strategy needs file upload
+      enhancedWorkload.status = validationResult.requiresFileUpload ? 'awaiting_input' : 'queued';
+    }
+
+    // Store the plan for later use
+    enhancedWorkload.plan = validationResult.plan;
+
+    // Store workload
+    customWorkloads.set(workloadId, enhancedWorkload);
     saveCustomWorkloads();
-    saveCustomWorkloadChunks();
     broadcastCustomWorkloadList();
 
     return res.json({
       success: true,
       id: workloadId,
-      totalChunks: result.plan.totalChunks,
-      message: `Queued enhanced workload '${label || workloadId.slice(0,6)}'`
+      status: enhancedWorkload.status,
+      requiresFileUpload: validationResult.requiresFileUpload,
+      message: enhancedWorkload.status === 'awaiting_input'
+        ? `Workload created. Upload input files via POST /api/workloads/${workloadId}/inputs then start computation.`
+        : `Workload created and ready to start.`
     });
+
   } catch (error) {
     console.error('Error creating advanced workload:', error);
     res.status(500).json({ error: error.message });
+  }
+});
+
+// STEP 2: Enhanced compute-start endpoint - Process chunks AFTER files uploaded
+app.post('/api/workloads/:id/compute-start', async (req, res) => {
+  const wid = req.params.id;
+  const wl = customWorkloads.get(wid);
+
+  if (!wl) {
+    return res.status(404).json({ error: 'Workload not found' });
+  }
+
+  if (!['queued', 'awaiting_input'].includes(wl.status)) {
+    return res.status(400).json({ error: `Cannot start workload in status: ${wl.status}` });
+  }
+
+  try {
+    // For enhanced workloads, ensure input requirements are met
+    if (wl.enhanced && wl.isChunkParent) {
+      // PHASE 2: Process chunks with uploaded files
+      console.log(`🔄 Processing chunks for workload ${wid}...`);
+
+      const result = await chunkingManager.processChunkedWorkload(wl);
+      if (!result.success) {
+        wl.status = 'error';
+        wl.error = result.error;
+        saveCustomWorkloads();
+        return res.status(400).json(result);
+      }
+
+      // Update workload with chunk information
+      wl.chunkDescriptors = result.chunkDescriptors;
+      wl.plan = result.plan;
+
+      // Create chunk store
+      const store = {
+        parentId: wid,
+        allChunkDefs: result.chunkDescriptors.map((cd, idx) => ({
+          ...cd,
+          status: 'queued',
+          dispatchesMade: 0,
+          submissions: [],
+          activeAssignments: new Set(),
+          assignedClients: new Set(),
+          verified_results: null,
+          chunkOrderIndex: idx
+        })),
+        completedChunksData: new Map(),
+        expectedChunks: result.chunkDescriptors.length,
+        status: 'assigning_chunks',
+        aggregationMethod: result.plan.assemblyStrategy,
+        enhanced: true
+      };
+
+      customWorkloadChunks.set(wid, store);
+      wl.status = 'assigning_chunks';
+
+      console.log(`✅ Created ${store.allChunkDefs.length} chunk descriptors for workload ${wid}`);
+    } else {
+      // Non-chunked workload
+      wl.status = 'pending_dispatch';
+    }
+
+    wl.startedAt = Date.now();
+    saveCustomWorkloads();
+    saveCustomWorkloadChunks();
+    broadcastCustomWorkloadList();
+
+    io.emit('workload:started', {
+      id: wl.id,
+      label: wl.label,
+      status: wl.status,
+      startedAt: wl.startedAt,
+      totalChunks: wl.plan?.totalChunks || wl.chunkDescriptors?.length || 0
+    });
+
+    res.json({
+      success: true,
+      workloadId: wid,
+      status: wl.status,
+      totalChunks: wl.plan?.totalChunks || wl.chunkDescriptors?.length || 0,
+      message: `Workload ${wl.label} started successfully`
+    });
+
+  } catch (error) {
+    console.error('Compute start error:', error);
+    wl.status = 'error';
+    wl.error = error.message;
+    saveCustomWorkloads();
+
+    res.status(500).json({ error: 'Failed to start computation: ' + error.message });
   }
 });
 
@@ -413,6 +533,270 @@ app.post('/api/strategies/register', (req, res) => {
   }
 });
 
+
+// --- Binary input upload (multipart) ---
+app.post('/api/workloads/:id/inputs', async (req, res) => {
+  const wid = req.params.id;
+  const wl = customWorkloads.get(wid);
+
+  if (!wl) {
+    return res.status(404).json({ error: 'Workload not found' });
+  }
+
+  if (wl.status !== 'awaiting_input' && wl.status !== 'queued') {
+    return res.status(400).json({ error: `Cannot upload files to workload in status: ${wl.status}` });
+  }
+
+  const inputsDir = path.join(STORAGE_ROOT, wid, 'inputs');
+  await ensureDir(inputsDir);
+
+  const uploadedFiles = [];
+  const metadata = {};
+  let totalBytesReceived = 0;
+  const maxFileSize = 1024 * 1024 * 1024; // 1GB limit per file
+
+  try {
+    const bb = Busboy({
+      headers: req.headers,
+      limits: {
+        fileSize: maxFileSize,
+        files: 10 // Max 10 files
+      }
+    });
+
+    // Handle file uploads with streaming
+    bb.on('file', (fieldname, fileStream, info) => {
+      const { filename, encoding, mimeType } = info;
+      const sanitizedFilename = path.basename(filename || `${fieldname}_${Date.now()}.bin`);
+      const outputPath = path.join(inputsDir, sanitizedFilename);
+
+      console.log(`📁 Receiving file: ${sanitizedFilename} (${encoding}, ${mimeType})`);
+
+      const hash = crypto.createHash('sha256');
+      const writeStream = fs.createWriteStream(outputPath);
+      let fileSize = 0;
+
+      fileStream.on('data', (chunk) => {
+        totalBytesReceived += chunk.length;
+        fileSize += chunk.length;
+        hash.update(chunk);
+
+        // Check file size limit
+        if (fileSize > maxFileSize) {
+          fileStream.destroy();
+          writeStream.destroy();
+          throw new Error(`File ${sanitizedFilename} exceeds size limit`);
+        }
+      });
+
+      fileStream.on('error', (err) => {
+        console.error(`File stream error for ${sanitizedFilename}:`, err);
+        writeStream.destroy();
+      });
+
+      fileStream.on('end', () => {
+        const sha256 = hash.digest('hex');
+        uploadedFiles.push({
+          name: fieldname,
+          filename: sanitizedFilename,
+          path: outputPath,
+          sha256,
+          size: fileSize,
+          encoding,
+          mimeType
+        });
+        console.log(`✅ File saved: ${sanitizedFilename} (${fileSize} bytes, SHA256: ${sha256.slice(0, 8)}...)`);
+      });
+
+      // Pipe with error handling
+      fileStream.pipe(writeStream);
+    });
+
+    // Handle form fields (metadata)
+    bb.on('field', (fieldname, value) => {
+      metadata[fieldname] = value;
+    });
+
+    // Handle completion
+    bb.on('close', async () => {
+      try {
+        // Update workload with file references
+        wl.inputRefs = (wl.inputRefs || []).concat(uploadedFiles);
+        wl.uploadMetadata = { ...wl.uploadMetadata, ...metadata };
+
+        // Clean up inline input data to save memory
+        delete wl.input;
+
+        // Validate uploaded files using the chunking manager
+        if (wl.enhanced && chunkingManager) {
+          try {
+            const validation = await chunkingManager.validateInputFiles?.(wl, uploadedFiles);
+            if (validation && !validation.valid) {
+              return res.status(400).json({
+                error: 'Input validation failed',
+                details: validation.errors
+              });
+            }
+          } catch (validationError) {
+            console.warn('Input validation error:', validationError.message);
+          }
+        }
+
+        // Update status to ready for computation
+        if (wl.status === 'awaiting_input') {
+          wl.status = 'queued';
+        }
+
+        // Save workload state
+        saveCustomWorkloads();
+        broadcastCustomWorkloadList();
+
+        res.json({
+          success: true,
+          workloadId: wid,
+          files: uploadedFiles.map(f => ({
+            name: f.name,
+            filename: f.filename,
+            size: f.size,
+            sha256: f.sha256
+          })),
+          metadata,
+          totalBytes: totalBytesReceived,
+          status: wl.status,
+          message: `${uploadedFiles.length} files uploaded successfully. Ready to start computation.`
+        });
+
+        console.log(`📦 Upload complete for workload ${wid}: ${uploadedFiles.length} files, ${totalBytesReceived} total bytes`);
+
+      } catch (error) {
+        console.error('Upload completion error:', error);
+        res.status(500).json({ error: 'Failed to process uploaded files: ' + error.message });
+      }
+    });
+
+    // Handle errors
+    bb.on('error', (error) => {
+      console.error('Busboy error:', error);
+      res.status(400).json({ error: 'Upload failed: ' + error.message });
+    });
+
+    // Start processing the upload
+    req.pipe(bb);
+
+  } catch (error) {
+    console.error('Upload setup error:', error);
+    res.status(500).json({ error: 'Failed to setup file upload: ' + error.message });
+  }
+});
+
+// STEP 2: Enhanced compute-start endpoint - Process chunks AFTER files uploaded
+app.post('/api/workloads/:id/compute-start', async (req, res) => {
+  const wid = req.params.id;
+  const wl = customWorkloads.get(wid);
+
+  if (!wl) {
+    return res.status(404).json({ error: 'Workload not found' });
+  }
+
+  if (!['queued', 'awaiting_input'].includes(wl.status)) {
+    return res.status(400).json({ error: `Cannot start workload in status: ${wl.status}` });
+  }
+
+  try {
+    // For enhanced workloads, validate input files are present
+    if (wl.enhanced && wl.isChunkParent) {
+      if (!wl.inputRefs || wl.inputRefs.length === 0) {
+        return res.status(400).json({ error: 'No input files uploaded. Use POST /api/workloads/:id/inputs first.' });
+      }
+
+      // NOW process the chunks with the uploaded files
+      console.log(`🔄 Processing chunks for workload ${wid} with ${wl.inputRefs.length} input files...`);
+
+      const result = await chunkingManager.processChunkedWorkload(wl);
+      if (!result.success) {
+        wl.status = 'error';
+        wl.error = result.error;
+        saveCustomWorkloads();
+        return res.status(400).json(result);
+      }
+
+      // Update workload with chunk information
+      wl.chunkDescriptors = result.chunkDescriptors;
+      wl.plan = result.plan;
+
+      // Create chunk store
+      const store = {
+        parentId: wid,
+        allChunkDefs: result.chunkDescriptors.map((cd, idx) => ({
+          ...cd,
+          status: 'queued',
+          dispatchesMade: 0,
+          submissions: [],
+          activeAssignments: new Set(),
+          assignedClients: new Set(),
+          verified_results: null,
+          chunkOrderIndex: idx
+        })),
+        completedChunksData: new Map(),
+        expectedChunks: result.plan.totalChunks,
+        status: 'assigning_chunks',
+        aggregationMethod: result.plan.assemblyStrategy,
+        enhanced: true
+      };
+
+      customWorkloadChunks.set(wid, store);
+      wl.status = 'assigning_chunks';
+
+      console.log(`✅ Created ${store.allChunkDefs.length} chunk descriptors for workload ${wid}`);
+    } else {
+      // Non-chunked workload
+      wl.status = 'pending_dispatch';
+    }
+
+    wl.startedAt = Date.now();
+    saveCustomWorkloads();
+    saveCustomWorkloadChunks();
+    broadcastCustomWorkloadList();
+
+    io.emit('workload:started', {
+      id: wl.id,
+      label: wl.label,
+      status: wl.status,
+      startedAt: wl.startedAt,
+      totalChunks: wl.plan?.totalChunks || 0
+    });
+
+    res.json({
+      success: true,
+      workloadId: wid,
+      status: wl.status,
+      totalChunks: wl.plan?.totalChunks || 0,
+      message: `Workload ${wl.label} started successfully`
+    });
+
+  } catch (error) {
+    console.error('Compute start error:', error);
+    wl.status = 'error';
+    wl.error = error.message;
+    saveCustomWorkloads();
+
+    res.status(500).json({ error: 'Failed to start computation: ' + error.message });
+  }
+});
+
+// --- Stream chunk input bytes (binary) ---
+app.get('/api/workloads/:wid/chunks/:cid/input/:idx', async (req, res) => {
+  const { wid, cid, idx } = req.params;
+  const wl = customWorkloads.get(wid);
+  if (!wl) return res.status(404).end();
+  // For matrix_tiled, we have a single combined input named 'input'
+  const ref = (wl.inputRefs || []).find(r => r.name === 'input') || (wl.inputRefs || [])[0];
+  if (!ref || !ref.path) return res.status(404).end();
+  res.setHeader('Content-Type', 'application/octet-stream');
+  const rs = fs.createReadStream(ref.path);
+  rs.on('error', () => res.status(500).end());
+  rs.pipe(res);
+});
 app.get('/api/strategies', (req, res) => {
   let strategies = {};
   try {
@@ -446,59 +830,45 @@ app.post('/api/system/k', (req, res) => {
 });
 
 // Activate queued parents - only enhanced parents are started without prepareAndQueueChunks
+// STEP 3: Update the startQueued endpoint to handle the new flow
 app.post('/api/workloads/startQueued', (req, res) => {
   let activatedChunkParents = 0;
   let startedNonChunked = 0;
+  let awaitingInput = 0;
 
-  customWorkloads.forEach(wl => {
+  customWorkloads.forEach(async (wl) => {
     if (wl.status === 'queued') {
-      wl.startedAt = Date.now();
-      if (wl.isChunkParent) {
-        if (wl.enhanced) {
-          const store = customWorkloadChunks.get(wl.id);
-          if (!store) return;
-          wl.status = 'assigning_chunks';
-          store.status = 'assigning_chunks';
-          for (const cd of store.allChunkDefs) {
-            cd.status = 'queued';
-            cd.dispatchesMade = 0;
-            cd.submissions = [];
-            cd.activeAssignments?.clear?.();
-            cd.assignedClients?.clear?.();
-            cd.verified_results = null;
+      try {
+        // Trigger compute-start for each queued workload
+        const computeStartUrl = `/api/workloads/${wl.id}/compute-start`;
+        const startResult = await fetch(`http://localhost:${PORT}${computeStartUrl}`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' }
+        });
+
+        if (startResult.ok) {
+          if (wl.isChunkParent) {
+            activatedChunkParents++;
+          } else {
+            startedNonChunked++;
           }
-          io.emit('workload:parent_started', { id: wl.id, label: wl.label, status: wl.status });
-          activatedChunkParents++;
-        } else {
-          const prep = prepareAndQueueChunks(wl);
-          if (!prep.success) return;
-          const store = customWorkloadChunks.get(wl.id);
-          wl.status = 'assigning_chunks';
-          store.status = 'assigning_chunks';
-          store.allChunkDefs.forEach(cd => {
-            cd.status = 'queued';
-            cd.dispatchesMade = 0;
-            cd.submissions = [];
-            cd.activeAssignments.clear && cd.activeAssignments.clear();
-            cd.verified_results = null;
-          });
-          io.emit('workload:parent_started', { id: wl.id, label: wl.label, status: wl.status });
-          activatedChunkParents++;
         }
-      } else {
-        wl.status = 'pending_dispatch';
-        startedNonChunked++;
+      } catch (error) {
+        console.error(`Failed to start workload ${wl.id}:`, error.message);
       }
+    } else if (wl.status === 'awaiting_input') {
+      awaitingInput++;
     }
   });
 
-  saveCustomWorkloads();
-  saveCustomWorkloadChunks();
-  broadcastCustomWorkloadList();
-
-  res.json({ ok: true, activatedChunkParents, startedNonChunked });
+  res.json({
+    ok: true,
+    activatedChunkParents,
+    startedNonChunked,
+    awaitingInput,
+    message: awaitingInput > 0 ? `${awaitingInput} workloads need input files uploaded first` : 'All queued workloads started'
+  });
 });
-
 app.delete('/api/workloads/:id', (req, res) => {
   const { id } = req.params;
   if (!customWorkloads.has(id)) return res.status(404).json({ error: 'Not found' });
@@ -905,17 +1275,12 @@ function assignCustomChunkToAvailableClients() {
           const taskData = {
             ...cd,
             framework: parent.framework,
-            compilationOptions: parent.compilationOptions,
             enhanced: parent.enhanced,
-
-            // Unified input/output format
-            inputSchema: generateTaskSchema(parsedData.inputs, cd.outputSizes || [cd.outputSize]),
-            chunkInputs: parsedData.inputs,
-            outputSizes: cd.outputSizes || [cd.outputSize],
-
-            // Legacy compatibility
-            inputs: cd.inputs || [cd.inputData || ''],
-            outputSize: cd.outputSize // Keep for backward compatibility
+            // Just pass through what the strategy created
+            inputs: cd.inputs,           // Array of {name, data} objects
+            outputs: cd.outputs,         // Array of {name, size} objects
+            metadata: cd.metadata,       // Strategy-specific uniforms data
+            schema: cd.schema || parent.schema, // Binding schema
           };
 
           client.socket.emit('workload:chunk_assign', taskData);
@@ -1315,20 +1680,32 @@ io.on('connection', socket => {
 
       if (verifyRes.verified) {
         const verifiedResults = cd.verified_results;
+
+        // Use the enhanced chunking manager for completion handling
         const assemblyResult = chunkingManager.handleChunkCompletion(parentId, chunkId, verifiedResults, processingTime);
 
         if (assemblyResult.success && assemblyResult.status === 'complete') {
           workloadState.status = 'complete';
-          let finalBase64 = null;
-          if (assemblyResult.finalResult && assemblyResult.finalResult.data) {
-            finalBase64 = typeof assemblyResult.finalResult.data === 'string'
-              ? assemblyResult.finalResult.data
-              : Buffer.from(assemblyResult.finalResult.data).toString('base64');
-          }
-          workloadState.finalResultBase64 = finalBase64;
           workloadState.completedAt = Date.now();
           workloadState.assemblyStats = assemblyResult.stats;
 
+          // Extract final result data
+          let finalBase64 = null;
+          if (assemblyResult.finalResult && assemblyResult.finalResult.completedChunks) {
+            // Use assembly strategy to combine chunks
+            const assemblyStrategy = chunkingManager.registry.getAssemblyStrategy(workloadState.assemblyStrategy);
+            if (assemblyStrategy) {
+              const finalAssembly = assemblyStrategy.assembleResults(assemblyResult.finalResult.completedChunks, assemblyResult.finalResult.plan);
+              if (finalAssembly.success && finalAssembly.data) {
+                finalBase64 = finalAssembly.data;
+              }
+            }
+          }
+
+          workloadState.finalResultBase64 = finalBase64;
+
+          // Clean up
+          chunkingManager.cleanupWorkload(parentId);
           customWorkloadChunks.delete(parentId);
           saveCustomWorkloads();
           saveCustomWorkloadChunks();
@@ -1339,6 +1716,7 @@ io.on('connection', socket => {
             id: parentId,
             label: workloadState.label,
             finalResultBase64: finalBase64,
+            finalResultUrl: finalBase64 ? null : `/api/workloads/${parentId}/download/final`,
             enhanced: true,
             stats: assemblyResult.stats
           });
@@ -1751,3 +2129,110 @@ server.listen(PORT, () => {
   }, 5000);
 });
 
+
+
+// --- Download final result if stored on disk ---
+app.get('/api/workloads/:id/download/final', (req, res) => {
+  const wid = req.params.id;
+  const wl = customWorkloads.get(wid);
+  if (!wl) return res.status(404).json({ error: 'not found' });
+  const outPath = wl.finalResultPath || (wl.metadata && wl.metadata.outputPath);
+  if (!outPath || !fs.existsSync(outPath)) return res.status(404).json({ error: 'no final file' });
+  res.setHeader('Content-Type', 'application/octet-stream');
+  fs.createReadStream(outPath).pipe(res);
+});
+
+app.get('/api/workloads/:id/status', (req, res) => {
+  const wid = req.params.id;
+  const wl = customWorkloads.get(wid);
+
+  if (!wl) {
+    return res.status(404).json({ error: 'Workload not found' });
+  }
+
+  const store = customWorkloadChunks.get(wid);
+  const status = {
+    id: wid,
+    label: wl.label,
+    status: wl.status,
+    framework: wl.framework,
+    chunkingStrategy: wl.chunkingStrategy,
+    assemblyStrategy: wl.assemblyStrategy,
+    createdAt: wl.createdAt,
+    startedAt: wl.startedAt,
+    completedAt: wl.completedAt,
+    enhanced: wl.enhanced,
+    isChunkParent: wl.isChunkParent,
+    inputFiles: (wl.inputRefs || []).map(ref => ({
+      name: ref.name,
+      size: ref.size,
+      sha256: ref.sha256
+    })),
+    requiresInput: wl.status === 'awaiting_input',
+    canStart: wl.status === 'queued',
+    error: wl.error
+  };
+
+  if (store) {
+    status.chunks = {
+      total: store.expectedChunks,
+      completed: store.completedChunksData.size,
+      active: Array.from(store.allChunkDefs).filter(cd => cd.status === 'active').length,
+      progress: store.expectedChunks > 0 ? (store.completedChunksData.size / store.expectedChunks * 100) : 0
+    };
+  }
+
+  res.json(status);
+});
+
+
+// --- Upload chunk result (binary) ---
+app.post('/api/workloads/:wid/chunks/:cid/result/:idx', async (req, res) => {
+  const { wid, cid, idx } = req.params;
+  const wl = customWorkloads.get(wid);
+  if (!wl) return res.status(404).json({ error: 'workload not found' });
+  const dir = path.join(STORAGE_ROOT, wid, 'results', cid);
+  await ensureDir(dir);
+  const fp = path.join(dir, `out-${idx}.bin`);
+  try {
+    await pipeline(req, fs.createWriteStream(fp));
+    res.json({ success: true, path: fp });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+
+app.post('/api/workloads/debug/:id', (req, res) => {
+  const wl = customWorkloads.get(req.params.id);
+  const store = customWorkloadChunks.get(req.params.id);
+
+  if (!wl || !store) {
+    return res.status(404).json({ error: 'Workload not found' });
+  }
+
+  const debugInfo = {
+    workload: {
+      id: wl.id,
+      status: wl.status,
+      enhanced: wl.enhanced,
+      hasInputRefs: !!wl.inputRefs,
+      inputRefsCount: wl.inputRefs?.length || 0
+    },
+    store: {
+      expectedChunks: store.expectedChunks,
+      actualChunks: store.allChunkDefs.length,
+      chunkSample: store.allChunkDefs[0] ? {
+        chunkId: store.allChunkDefs[0].chunkId,
+        hasInputs: !!store.allChunkDefs[0].inputs,
+        inputsLength: store.allChunkDefs[0].inputs?.length || 0,
+        hasOutputs: !!store.allChunkDefs[0].outputs,
+        outputsLength: store.allChunkDefs[0].outputs?.length || 0,
+        hasKernel: !!store.allChunkDefs[0].kernel,
+        hasMetadata: !!store.allChunkDefs[0].metadata
+      } : null
+    }
+  };
+
+  res.json(debugInfo);
+});

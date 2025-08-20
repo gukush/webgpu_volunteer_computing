@@ -1,5 +1,7 @@
 // strategies/MatrixTiledAssemblyStrategy.js
 import { BaseAssemblyStrategy } from './base/BaseAssemblyStrategy.js';
+import fs from 'fs';
+import path from 'path';
 
 export default class MatrixTiledAssemblyStrategy extends BaseAssemblyStrategy {
   constructor() {
@@ -22,6 +24,9 @@ export default class MatrixTiledAssemblyStrategy extends BaseAssemblyStrategy {
   }
 
   assembleResults(completedChunks, plan) {
+    // Optional: write assembled result directly to a file if plan.metadata.outputPath is set
+    const wantFile = plan && plan.metadata && plan.metadata.outputPath;
+
     const validation = this.validateChunks(completedChunks, plan);
     if (!validation.valid) {
       return {
@@ -49,6 +54,18 @@ export default class MatrixTiledAssemblyStrategy extends BaseAssemblyStrategy {
           error: 'Could not determine matrix size from chunks or plan metadata'
         };
       }
+
+    let outFd = null;
+    if (wantFile) {
+      try {
+        const outPath = path.resolve(plan.metadata.outputPath);
+        outFd = fs.openSync(outPath, 'w');
+        // Preallocate file size
+        fs.ftruncateSync(outFd, matrixSize * matrixSize * 4);
+      } catch (e) {
+        console.warn('Failed to open outputPath for writing, falling back to in-memory:', e.message);
+      }
+    }
 
       const resultMatrix = new Float32Array(matrixSize * matrixSize);
 
@@ -97,13 +114,28 @@ export default class MatrixTiledAssemblyStrategy extends BaseAssemblyStrategy {
                 matrixIndex < resultMatrix.length &&
                 globalRow < matrixSize &&
                 globalCol < matrixSize) {
+            if (resultMatrix) {
               resultMatrix[matrixIndex] = tileData[tileIndex];
+            } else if (wantFile && outFd) {
+              const byteOffset = matrixIndex * 4;
+              // Write one float32 at the correct position
+              const tmpBuf = Buffer.allocUnsafe(4);
+              tmpBuf.writeFloatLE(tileData[tileIndex], 0);
+              fs.writeSync(outFd, tmpBuf, 0, 4, byteOffset);
+            }
             }
           }
         }
       }
 
       // Convert back to buffer and then base64
+      if (wantFile && outFd) {
+        fs.closeSync(outFd);
+        return {
+          success: true,
+          finalResult: { path: path.resolve(plan.metadata.outputPath) }
+        };
+      }
       const resultBuffer = Buffer.from(resultMatrix.buffer);
       const outputName = schema.outputs[0].name;
 

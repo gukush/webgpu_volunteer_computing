@@ -150,20 +150,16 @@ async function detectFrameworkCapabilities() {
   return capabilities;
 }
 
-
 async function executeUnifiedChunk(chunk) {
-  console.log(`[UNIFIED] Starting execution for ${chunk.chunkId} with ${Object.keys(chunk.chunkInputs || {}).length} inputs, ${(chunk.outputSizes || []).length} outputs`);
+  console.log(`[UNIFIED] Starting execution for ${chunk.chunkId}`);
 
   if (!state.device) {
     throw new Error('No GPU device available');
   }
 
-  const outputSizes = chunk.outputSizes || [chunk.outputSize];
-  if (!outputSizes || outputSizes.some(size => !size || size <= 0)) {
-    throw new Error(`Invalid output sizes: ${JSON.stringify(outputSizes)}`);
-  }
-
   const t0 = performance.now();
+  const buffers = [];
+  const entries = [];
 
   try {
     // Create shader module
@@ -186,40 +182,34 @@ async function executeUnifiedChunk(chunk) {
       }
     });
 
-    const buffers = [];
-    const entries = [];
-    let binding = 0;
+    // Handle uniforms based on schema
+    if (chunk.metadata && chunk.schema?.uniforms) {
+      for (const uniformDef of chunk.schema.uniforms) {
+        const uniformArray = createUniformArrayFromSchema(chunk.metadata, uniformDef);
+        const uniformBuffer = state.device.createBuffer({
+          size: Math.max(16, uniformArray.byteLength),
+          usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST
+        });
 
-    // Handle uniforms
-    if (chunk.uniforms && Object.keys(chunk.uniforms).length > 0) {
-      console.log(`[UNIFIED] Setting up uniforms:`, chunk.uniforms);
-      const uniformArray = createUniformArray(chunk.uniforms, chunk.chunkingStrategy);
-
-      const uniformBuffer = state.device.createBuffer({
-        size: Math.max(16, uniformArray.byteLength),
-        usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST
-      });
-
-      state.device.queue.writeBuffer(uniformBuffer, 0, uniformArray);
-      entries.push({ binding: binding++, resource: { buffer: uniformBuffer } });
-      buffers.push(uniformBuffer);
+        state.device.queue.writeBuffer(uniformBuffer, 0, uniformArray);
+        entries.push({
+          binding: uniformDef.binding,
+          resource: { buffer: uniformBuffer }
+        });
+        buffers.push(uniformBuffer);
+      }
     }
 
-    // Handle multiple inputs
-    const inputs = chunk.chunkInputs || {};
-    const inputNames = Object.keys(inputs);
+    // Handle inputs based on schema
+    if (chunk.inputs && chunk.schema?.inputs) {
+      // Match inputs to schema by name or order
+      for (let i = 0; i < chunk.schema.inputs.length; i++) {
+        const inputDef = chunk.schema.inputs[i];
+        const inputData = chunk.inputs[i]; // Assumes same order
 
-    console.log(`[UNIFIED] Processing ${inputNames.length} inputs:`, inputNames);
+        if (inputData && inputData.data) {
+          const inputBytes = Uint8Array.from(atob(inputData.data), c => c.charCodeAt(0));
 
-    for (const inputName of inputNames) {
-      const inputData = inputs[inputName];
-
-      if (inputData) {
-        const inputBytes = typeof inputData === 'string'
-          ? Uint8Array.from(atob(inputData), c => c.charCodeAt(0))
-          : new Uint8Array(inputData);
-
-        if (inputBytes.length > 0) {
           const inputBuffer = state.device.createBuffer({
             size: Math.max(16, inputBytes.byteLength),
             usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
@@ -229,32 +219,38 @@ async function executeUnifiedChunk(chunk) {
           new Uint8Array(inputBuffer.getMappedRange()).set(inputBytes);
           inputBuffer.unmap();
 
-          entries.push({ binding: binding++, resource: { buffer: inputBuffer } });
+          entries.push({
+            binding: inputDef.binding,
+            resource: { buffer: inputBuffer }
+          });
           buffers.push(inputBuffer);
 
-          console.log(`[UNIFIED] Input ${inputName}: ${inputBytes.length} bytes`);
+          console.log(`[UNIFIED] Input ${inputData.name}: ${inputBytes.length} bytes at binding ${inputDef.binding}`);
         }
       }
     }
 
-    // Handle multiple outputs
+    // Handle outputs based on schema
     const outputBuffers = [];
+    if (chunk.outputs && chunk.schema?.outputs) {
+      for (let i = 0; i < chunk.schema.outputs.length; i++) {
+        const outputDef = chunk.schema.outputs[i];
+        const outputSpec = chunk.outputs[i];
 
-    console.log(`[UNIFIED] Creating ${outputSizes.length} output buffers:`, outputSizes);
+        const outputBuffer = state.device.createBuffer({
+          size: Math.max(16, outputSpec.size),
+          usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC
+        });
 
-    for (let i = 0; i < outputSizes.length; i++) {
-      const outputSize = outputSizes[i];
+        entries.push({
+          binding: outputDef.binding,
+          resource: { buffer: outputBuffer }
+        });
+        buffers.push(outputBuffer);
+        outputBuffers.push(outputBuffer);
 
-      const outputBuffer = state.device.createBuffer({
-        size: Math.max(16, outputSize),
-        usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC
-      });
-
-      entries.push({ binding: binding++, resource: { buffer: outputBuffer } });
-      outputBuffers.push(outputBuffer);
-      buffers.push(outputBuffer);
-
-      console.log(`[UNIFIED] Output ${i}: ${outputSize} bytes`);
+        console.log(`[UNIFIED] Output ${outputSpec.name}: ${outputSpec.size} bytes at binding ${outputDef.binding}`);
+      }
     }
 
     // Create bind group and execute
@@ -320,6 +316,13 @@ async function executeUnifiedChunk(chunk) {
   }
 }
 
+function createUniformArrayFromSchema(metadata, uniformDef) {
+  if (uniformDef.fields) {
+    return new Uint32Array(uniformDef.fields.map(field => metadata[field.name] || 0));
+  }
+  // Fallback for strategies that don't define fields
+  return new Uint32Array(Object.values(metadata).filter(v => typeof v === 'number'));
+}
 // Enhanced: Multi-input, multi-framework execution
 /*
 async function executeEnhancedChunk(chunk) {

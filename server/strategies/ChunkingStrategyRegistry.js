@@ -8,6 +8,11 @@ import { BaseAssemblyStrategy } from './base/BaseAssemblyStrategy.js';
 import MatrixTiledChunkingStrategy from './MatrixTiledChunkingStrategy.js';
 import MatrixTiledAssemblyStrategy from './MatrixTiledAssemblyStrategy.js';
 
+import BlockMatrixChunkingStrategy from './BlockMatrixChunkingStrategy.js';
+import BlockMatrixAssemblyStrategy from './BlockMatrixAssemblyStrategy.js';
+
+
+
 import vm from 'vm';
 import { fileURLToPath } from 'url';
 import path from 'path';
@@ -210,6 +215,8 @@ export class ChunkingStrategyRegistry {
     this.registerChunkingStrategy(new MatrixTiledChunkingStrategy());
     this.registerAssemblyStrategy(new MatrixTiledAssemblyStrategy());
 
+    this.registerChunkingStrategy(new BlockMatrixChunkingStrategy());
+    this.registerAssemblyStrategy(new BlockMatrixAssemblyStrategy());
     // Register built-in shader templates
     this.registerShaderTemplate('linear_process', this.getLinearProcessShader());
     this.registerShaderTemplate('multi_buffer_process', this.getMultiBufferProcessShader());

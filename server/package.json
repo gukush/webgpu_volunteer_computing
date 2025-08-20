@@ -15,7 +15,8 @@
     "socket.io": "^4.7.2",
     "uuid": "^9.0.1",
     "puppeteer": "^22.10.0",
-    "minimist": "^1.2.8"
+    "minimist": "^1.2.8",
+    "busboy": "^1.6.0"
   },
   "devDependencies": {
     "nodemon": "^3.0.1"
