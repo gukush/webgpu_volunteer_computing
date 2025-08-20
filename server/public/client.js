@@ -152,9 +152,27 @@ async function detectFrameworkCapabilities() {
 
 async function executeUnifiedChunk(chunk) {
   console.log(`[UNIFIED] Starting execution for ${chunk.chunkId}`);
+  console.log(`[UNIFIED] Chunk structure:`, {
+    hasInputs: !!chunk.inputs,
+    inputsLength: chunk.inputs?.length || 0,
+    hasOutputs: !!chunk.outputs,
+    outputsLength: chunk.outputs?.length || 0,
+    hasSchema: !!chunk.schema,
+    hasMetadata: !!chunk.metadata,
+    hasKernel: !!(chunk.kernel || chunk.wgsl)
+  });
 
   if (!state.device) {
     throw new Error('No GPU device available');
+  }
+
+  // Validate chunk has required data
+  if (!chunk.kernel && !chunk.wgsl) {
+    throw new Error('No shader code provided');
+  }
+
+  if (!chunk.outputs || chunk.outputs.length === 0) {
+    throw new Error('No output specifications provided');
   }
 
   const t0 = performance.now();
@@ -164,8 +182,9 @@ async function executeUnifiedChunk(chunk) {
   try {
     // Create shader module
     console.log(`[UNIFIED] Creating shader module...`);
+    const shaderCode = chunk.kernel || chunk.wgsl;
     const shader = state.device.createShaderModule({
-      code: chunk.kernel || chunk.wgsl
+      code: shaderCode
     });
 
     const ci = await shader.getCompilationInfo();
@@ -182,10 +201,36 @@ async function executeUnifiedChunk(chunk) {
       }
     });
 
-    // Handle uniforms based on schema
-    if (chunk.metadata && chunk.schema?.uniforms) {
-      for (const uniformDef of chunk.schema.uniforms) {
-        const uniformArray = createUniformArrayFromSchema(chunk.metadata, uniformDef);
+    let bindingIndex = 0;
+
+    // Handle uniforms/metadata
+    if (chunk.metadata && Object.keys(chunk.metadata).length > 0) {
+      console.log(`[UNIFIED] Setting up uniforms from metadata:`, chunk.metadata);
+
+      // Create uniform array from metadata
+      const uniformValues = [];
+
+      // Add common uniform fields that strategies might use
+      const commonFields = [
+        'matrix_n', 'matrixSize', 'tile_start_row', 'tile_start_col',
+        'tile_rows', 'tile_cols', 'tile_size', 'tileSize'
+      ];
+
+      for (const field of commonFields) {
+        if (chunk.metadata[field] !== undefined) {
+          uniformValues.push(chunk.metadata[field]);
+        }
+      }
+
+      // Add any remaining numeric values
+      for (const [key, value] of Object.entries(chunk.metadata)) {
+        if (typeof value === 'number' && !commonFields.includes(key)) {
+          uniformValues.push(value);
+        }
+      }
+
+      if (uniformValues.length > 0) {
+        const uniformArray = new Uint32Array(uniformValues);
         const uniformBuffer = state.device.createBuffer({
           size: Math.max(16, uniformArray.byteLength),
           usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST
@@ -193,22 +238,29 @@ async function executeUnifiedChunk(chunk) {
 
         state.device.queue.writeBuffer(uniformBuffer, 0, uniformArray);
         entries.push({
-          binding: uniformDef.binding,
+          binding: bindingIndex++,
           resource: { buffer: uniformBuffer }
         });
         buffers.push(uniformBuffer);
+
+        console.log(`[UNIFIED] Created uniform buffer with ${uniformValues.length} values at binding ${bindingIndex - 1}`);
       }
     }
 
-    // Handle inputs based on schema
-    if (chunk.inputs && chunk.schema?.inputs) {
-      // Match inputs to schema by name or order
-      for (let i = 0; i < chunk.schema.inputs.length; i++) {
-        const inputDef = chunk.schema.inputs[i];
-        const inputData = chunk.inputs[i]; // Assumes same order
+    // Handle inputs
+    if (chunk.inputs && chunk.inputs.length > 0) {
+      console.log(`[UNIFIED] Processing ${chunk.inputs.length} inputs`);
 
-        if (inputData && inputData.data) {
-          const inputBytes = Uint8Array.from(atob(inputData.data), c => c.charCodeAt(0));
+      for (let i = 0; i < chunk.inputs.length; i++) {
+        const input = chunk.inputs[i];
+
+        if (!input || !input.data) {
+          console.warn(`[UNIFIED] Input ${i} has no data, skipping`);
+          continue;
+        }
+
+        try {
+          const inputBytes = Uint8Array.from(atob(input.data), c => c.charCodeAt(0));
 
           const inputBuffer = state.device.createBuffer({
             size: Math.max(16, inputBytes.byteLength),
@@ -220,37 +272,43 @@ async function executeUnifiedChunk(chunk) {
           inputBuffer.unmap();
 
           entries.push({
-            binding: inputDef.binding,
+            binding: bindingIndex++,
             resource: { buffer: inputBuffer }
           });
           buffers.push(inputBuffer);
 
-          console.log(`[UNIFIED] Input ${inputData.name}: ${inputBytes.length} bytes at binding ${inputDef.binding}`);
+          console.log(`[UNIFIED] Input ${input.name || i}: ${inputBytes.length} bytes at binding ${bindingIndex - 1}`);
+        } catch (err) {
+          console.error(`[UNIFIED] Failed to process input ${i}:`, err);
+          throw new Error(`Failed to decode input ${input.name || i}: ${err.message}`);
         }
       }
     }
 
-    // Handle outputs based on schema
+    // Handle outputs
     const outputBuffers = [];
-    if (chunk.outputs && chunk.schema?.outputs) {
-      for (let i = 0; i < chunk.schema.outputs.length; i++) {
-        const outputDef = chunk.schema.outputs[i];
-        const outputSpec = chunk.outputs[i];
+    console.log(`[UNIFIED] Creating ${chunk.outputs.length} output buffers`);
 
-        const outputBuffer = state.device.createBuffer({
-          size: Math.max(16, outputSpec.size),
-          usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC
-        });
+    for (let i = 0; i < chunk.outputs.length; i++) {
+      const output = chunk.outputs[i];
 
-        entries.push({
-          binding: outputDef.binding,
-          resource: { buffer: outputBuffer }
-        });
-        buffers.push(outputBuffer);
-        outputBuffers.push(outputBuffer);
-
-        console.log(`[UNIFIED] Output ${outputSpec.name}: ${outputSpec.size} bytes at binding ${outputDef.binding}`);
+      if (!output || !output.size || output.size <= 0) {
+        throw new Error(`Invalid output ${i}: missing or invalid size`);
       }
+
+      const outputBuffer = state.device.createBuffer({
+        size: Math.max(16, output.size),
+        usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC
+      });
+
+      entries.push({
+        binding: bindingIndex++,
+        resource: { buffer: outputBuffer }
+      });
+      buffers.push(outputBuffer);
+      outputBuffers.push(outputBuffer);
+
+      console.log(`[UNIFIED] Output ${output.name || i}: ${output.size} bytes at binding ${bindingIndex - 1}`);
     }
 
     // Create bind group and execute
@@ -259,12 +317,14 @@ async function executeUnifiedChunk(chunk) {
       entries
     });
 
-    console.log(`[UNIFIED] Dispatching workgroups:`, chunk.workgroupCount);
+    const workgroupCount = chunk.workgroupCount || [1, 1, 1];
+    console.log(`[UNIFIED] Dispatching workgroups:`, workgroupCount);
+
     const encoder = state.device.createCommandEncoder();
     const computePass = encoder.beginComputePass();
     computePass.setPipeline(pipeline);
     computePass.setBindGroup(0, bindGroup);
-    computePass.dispatchWorkgroups(...(chunk.workgroupCount || [1, 1, 1]));
+    computePass.dispatchWorkgroups(...workgroupCount);
     computePass.end();
 
     // Read back all outputs
@@ -312,6 +372,10 @@ async function executeUnifiedChunk(chunk) {
 
   } catch (err) {
     console.error(`[UNIFIED] Chunk execution error:`, err);
+    // Cleanup any created buffers
+    buffers.forEach(buffer => {
+      try { buffer.destroy(); } catch {}
+    });
     throw err;
   }
 }
@@ -1229,9 +1293,21 @@ socket.on('workload:removed', ({ id }) => {
 
 // Enhanced: Enhanced chunk assignment handler
 socket.on('workload:chunk_assign', async chunk => {
+  console.log(`[CHUNK] Received chunk assignment:`, {
+    chunkId: chunk.chunkId,
+    framework: chunk.framework,
+    hasInputs: !!chunk.inputs,
+    inputsLength: chunk.inputs?.length || 0,
+    hasOutputs: !!chunk.outputs,
+    outputsLength: chunk.outputs?.length || 0,
+    hasKernel: !!(chunk.kernel || chunk.wgsl),
+    enhanced: chunk.enhanced
+  });
+
   const framework = chunk.framework || 'webgpu';
 
   if (state.isComputingMatrix || state.isComputingWgsl || state.isComputingChunk) {
+    console.warn(`[CHUNK] Client busy, rejecting chunk ${chunk.chunkId}`);
     const eventName = chunk.enhanced ? 'workload:chunk_error_enhanced' : 'workload:chunk_error';
     socket.emit(eventName, {
       parentId: chunk.parentId,
@@ -1242,6 +1318,7 @@ socket.on('workload:chunk_assign', async chunk => {
   }
 
   if (!frameworkState[framework]?.supported) {
+    console.warn(`[CHUNK] Framework ${framework} not supported for chunk ${chunk.chunkId}`);
     const eventName = chunk.enhanced ? 'workload:chunk_error_enhanced' : 'workload:chunk_error';
     socket.emit(eventName, {
       parentId: chunk.parentId,
@@ -1251,13 +1328,15 @@ socket.on('workload:chunk_assign', async chunk => {
     return;
   }
 
-  const outputSizes = chunk.outputSizes || [chunk.outputSize];
-  if (!outputSizes || outputSizes.some(size => !size || size <= 0)) {
+  // Validate outputs
+  const outputs = chunk.outputs || [];
+  if (outputs.length === 0) {
+    console.error(`[CHUNK] No outputs specified for chunk ${chunk.chunkId}`);
     const eventName = chunk.enhanced ? 'workload:chunk_error_enhanced' : 'workload:chunk_error';
     socket.emit(eventName, {
       parentId: chunk.parentId,
       chunkId: chunk.chunkId,
-      message: `Invalid output sizes: ${JSON.stringify(outputSizes)}`
+      message: 'No outputs specified'
     });
     return;
   }
@@ -1266,11 +1345,11 @@ socket.on('workload:chunk_assign', async chunk => {
   state.currentTask = chunk;
   updateComputationStatusDisplay();
 
-  const inputCount = Object.keys(chunk.chunkInputs || {}).length;
-  const outputCount = outputSizes.length;
+  const inputCount = chunk.inputs?.length || 0;
+  const outputCount = outputs.length;
   const strategy = chunk.chunkingStrategy || 'unknown';
 
-  logTaskActivity(`Processing ${framework} chunk ${chunk.chunkId} (${strategy}, ${inputCount}→${outputCount}, outputs: ${outputSizes.join('+')}) bytes)`);
+  logTaskActivity(`[${framework}] Processing chunk ${chunk.chunkId} (${strategy}, ${inputCount}→${outputCount})`);
 
   try {
     // Use unified execution for all chunks
@@ -1300,12 +1379,19 @@ socket.on('workload:chunk_assign', async chunk => {
       eventData.reportedChecksum = await checksumBase64(result.result);
     }
 
+    console.log(`[CHUNK] Sending results for ${chunk.chunkId}:`, {
+      resultsCount: result.results.length,
+      resultSizes: result.results.map(r => Math.round(r.length * 0.75))
+    });
+
     socket.emit(eventName, eventData);
 
-    logTaskActivity(`${framework} chunk complete: ${outputCount} outputs (${result.results.map(r => Math.round(r.length * 0.75)).join('+')}) bytes`, 'success');
+    logTaskActivity(`[${framework}] Chunk ${chunk.chunkId} complete: ${outputCount} outputs`, 'success');
 
   } catch (err) {
-    logTaskActivity(`${framework} chunk error: ${err.message}`, 'error');
+    console.error(`[CHUNK] Execution error for ${chunk.chunkId}:`, err);
+    logTaskActivity(`[${framework}] Chunk ${chunk.chunkId} error: ${err.message}`, 'error');
+
     const eventName = chunk.enhanced ? 'workload:chunk_error_enhanced' : 'workload:chunk_error';
     socket.emit(eventName, {
       parentId: chunk.parentId,

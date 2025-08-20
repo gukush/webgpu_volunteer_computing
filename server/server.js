@@ -1266,26 +1266,59 @@ function assignCustomChunkToAvailableClients() {
           cd.assignedAt = Date.now();
           client.isBusyWithCustomChunk = true;
 
-          // Parse parent inputs and generate schema
-          const parsedData = parseWorkloadInputs(parent.input);
-          const inputCount = Object.keys(parsedData.inputs).length;
-          const outputCount = cd.outputSizes?.length || 1;
+          // Debug: Log what we're about to send
+          console.log(`[CHUNK DEBUG] Chunk ${cd.chunkId} structure:`, {
+            hasInputs: !!cd.inputs,
+            inputsLength: cd.inputs ? cd.inputs.length : 0,
+            hasOutputs: !!cd.outputs,
+            outputsLength: cd.outputs ? cd.outputs.length : 0,
+            hasSchema: !!cd.schema,
+            hasMetadata: !!cd.metadata
+          });
 
-          // Create unified task data with proper schema
+          // Create unified task data that the client expects
           const taskData = {
-            ...cd,
+            // Basic chunk info
+            parentId: cd.parentId,
+            chunkId: cd.chunkId,
+            chunkOrderIndex: cd.chunkOrderIndex,
             framework: parent.framework,
             enhanced: parent.enhanced,
-            // Just pass through what the strategy created
-            inputs: cd.inputs,           // Array of {name, data} objects
-            outputs: cd.outputs,         // Array of {name, size} objects
-            metadata: cd.metadata,       // Strategy-specific uniforms data
-            schema: cd.schema || parent.schema, // Binding schema
+
+            // Shader code
+            kernel: cd.kernel || parent.metadata?.customShader,
+            wgsl: cd.wgsl || cd.kernel || parent.metadata?.customShader,
+            entry: cd.entry || 'main',
+            workgroupCount: cd.workgroupCount || [1, 1, 1],
+
+            // NEW: Ensure consistent data format for client
+            inputs: cd.inputs || [],           // Array of {name, data} objects
+            outputs: cd.outputs || [],         // Array of {name, size} objects
+            metadata: cd.metadata || {},       // Strategy-specific uniforms data
+            schema: cd.schema,                 // Binding schema
+
+            // Legacy compatibility
+            outputSizes: cd.outputs ? cd.outputs.map(o => o.size) : [cd.outputSize],
+            outputSize: cd.outputs ? cd.outputs[0]?.size : cd.outputSize,
+
+            // Debug info
+            chunkingStrategy: parent.chunkingStrategy,
+            assemblyStrategy: parent.assemblyStrategy
           };
+
+          // Debug: Log the complete task data being sent
+          console.log(`[CHUNK DEBUG] Sending chunk ${cd.chunkId} to ${clientId}:`, {
+            inputs: taskData.inputs?.length,
+            outputs: taskData.outputs?.length,
+            hasKernel: !!taskData.kernel,
+            hasSchema: !!taskData.schema,
+            workgroupCount: taskData.workgroupCount
+          });
 
           client.socket.emit('workload:chunk_assign', taskData);
 
-          // Fixed logging to show actual input/output counts
+          const inputCount = taskData.inputs?.length || 0;
+          const outputCount = taskData.outputs?.length || 0;
           console.log(`Assigned ${parent.framework} chunk ${cd.chunkId} to ${clientId} (${inputCount} inputs, ${outputCount} outputs)`);
           break;
         }
@@ -1294,6 +1327,18 @@ function assignCustomChunkToAvailableClients() {
       if (client.isBusyWithCustomChunk) break;
     }
   }
+}
+
+function debugMatrixTiledChunk(chunkDef, parentWorkload) {
+  console.log(`[MATRIX TILED DEBUG] Chunk ${chunkDef.chunkId}:`, {
+    hasInputs: !!chunkDef.inputs,
+    inputNames: chunkDef.inputs?.map(i => i.name) || [],
+    hasOutputs: !!chunkDef.outputs,
+    outputSizes: chunkDef.outputs?.map(o => o.size) || [],
+    hasMetadata: !!chunkDef.metadata,
+    metadataKeys: Object.keys(chunkDef.metadata || {}),
+    hasKernel: !!(chunkDef.kernel || parentWorkload.metadata?.customShader)
+  });
 }
 
 // Generate complete task schema including outputs
@@ -1642,75 +1687,106 @@ io.on('connection', socket => {
 
   // Enhanced chunk completion
   socket.on('workload:chunk_done_enhanced', ({ parentId, chunkId, results, result, processingTime, strategy, metadata, reportedChecksum }) => {
+    console.log(`[CHUNK RESULT] Enhanced chunk ${chunkId} completed by ${socket.id}`);
+
     const client = matrixState.clients.get(socket.id);
     if (client) client.isBusyWithCustomChunk = false;
 
     const workloadState = customWorkloads.get(parentId);
     const chunkStore = customWorkloadChunks.get(parentId);
 
-    if (workloadState && chunkStore && chunkStore.enhanced) {
-      const cd = chunkStore.allChunkDefs.find(c => c.chunkId === chunkId);
-      if (!cd) {
-        console.warn(`Enhanced chunk ${chunkId} not found in store for parent ${parentId}`);
-        return;
-      }
+    if (!workloadState || !chunkStore) {
+      console.error(`[CHUNK RESULT] Workload ${parentId} not found for chunk ${chunkId}`);
+      return;
+    }
 
-      let finalResults = results || [result];
-      if (!Array.isArray(finalResults)) finalResults = [finalResults];
+    if (!chunkStore.enhanced) {
+      console.error(`[CHUNK RESULT] Chunk ${chunkId} received enhanced completion but store is not enhanced`);
+      return;
+    }
 
-      let checksumData;
+    const cd = chunkStore.allChunkDefs.find(c => c.chunkId === chunkId);
+    if (!cd) {
+      console.warn(`[CHUNK RESULT] Enhanced chunk ${chunkId} not found in store for parent ${parentId}`);
+      return;
+    }
+
+    let finalResults = results || [result];
+    if (!Array.isArray(finalResults)) finalResults = [finalResults];
+
+    console.log(`[CHUNK RESULT] Processing ${finalResults.length} results for chunk ${chunkId}`);
+
+    let checksumData;
+    try {
+      checksumData = checksumFromResults(finalResults);
+      console.log(`[CHUNK RESULT] Chunk ${chunkId} checksum: ${checksumData.serverChecksum.slice(0, 8)}... (${checksumData.byteLength} bytes)`);
+    } catch (err) {
+      console.error(`[CHUNK RESULT] Enhanced chunk ${chunkId} from ${socket.id} invalid base64:`, err);
+      return;
+    }
+
+    const submission = {
+      clientId: socket.id,
+      results: finalResults,
+      processingTime,
+      reportedChecksum: reportedChecksum,
+      serverChecksum: checksumData.serverChecksum,
+      byteLength: checksumData.byteLength,
+      buffers: checksumData.buffers
+    };
+
+    const verifyRes = verifyAndRecordChunkSubmission(workloadState, chunkStore, cd, submission, cd.chunkOrderIndex, ADMIN_K_PARAMETER);
+
+    if (verifyRes.verified) {
+      console.log(`✅ Enhanced chunk ${chunkId} VERIFIED by K=${ADMIN_K_PARAMETER} (checksum ${verifyRes.winningChecksum.slice(0,8)}…)`);
+
+      const verifiedResults = cd.verified_results;
+
+      // Use the enhanced chunking manager for completion handling
+      console.log(`[CHUNK RESULT] Calling chunkingManager.handleChunkCompletion for ${chunkId}`);
+
       try {
-        checksumData = checksumFromResults(finalResults);
-      } catch (err) {
-        console.error(`Enhanced chunk ${chunkId} from ${socket.id} invalid base64`);
-        return;
-      }
-
-      const submission = {
-        clientId: socket.id,
-        results: finalResults,
-        processingTime,
-        reportedChecksum: reportedChecksum,
-        serverChecksum: checksumData.serverChecksum,
-        byteLength: checksumData.byteLength,
-        buffers: checksumData.buffers
-      };
-
-      const verifyRes = verifyAndRecordChunkSubmission(workloadState, chunkStore, cd, submission, cd.chunkOrderIndex, ADMIN_K_PARAMETER);
-
-      if (verifyRes.verified) {
-        const verifiedResults = cd.verified_results;
-
-        // Use the enhanced chunking manager for completion handling
         const assemblyResult = chunkingManager.handleChunkCompletion(parentId, chunkId, verifiedResults, processingTime);
+        console.log(`[CHUNK RESULT] Assembly result for ${chunkId}:`, {
+          success: assemblyResult.success,
+          status: assemblyResult.status,
+          error: assemblyResult.error
+        });
 
         if (assemblyResult.success && assemblyResult.status === 'complete') {
+          console.log(`🎉 Enhanced workload ${parentId} COMPLETED!`);
+
           workloadState.status = 'complete';
           workloadState.completedAt = Date.now();
           workloadState.assemblyStats = assemblyResult.stats;
 
           // Extract final result data
           let finalBase64 = null;
-          if (assemblyResult.finalResult && assemblyResult.finalResult.completedChunks) {
-            // Use assembly strategy to combine chunks
-            const assemblyStrategy = chunkingManager.registry.getAssemblyStrategy(workloadState.assemblyStrategy);
-            if (assemblyStrategy) {
-              const finalAssembly = assemblyStrategy.assembleResults(assemblyResult.finalResult.completedChunks, assemblyResult.finalResult.plan);
-              if (finalAssembly.success && finalAssembly.data) {
-                finalBase64 = finalAssembly.data;
-              }
+          if (assemblyResult.finalResult) {
+            if (typeof assemblyResult.finalResult === 'string') {
+              finalBase64 = assemblyResult.finalResult;
+            } else if (assemblyResult.finalResult.data) {
+              finalBase64 = typeof assemblyResult.finalResult.data === 'string'
+                ? assemblyResult.finalResult.data
+                : Buffer.from(assemblyResult.finalResult.data).toString('base64');
             }
           }
 
           workloadState.finalResultBase64 = finalBase64;
 
           // Clean up
-          chunkingManager.cleanupWorkload(parentId);
+          console.log(`[CHUNK RESULT] Cleaning up workload ${parentId}`);
+          try {
+            chunkingManager.cleanupWorkload(parentId);
+          } catch (cleanupError) {
+            console.warn(`[CHUNK RESULT] Cleanup warning for ${parentId}:`, cleanupError.message);
+          }
+
           customWorkloadChunks.delete(parentId);
           saveCustomWorkloads();
           saveCustomWorkloadChunks();
 
-          console.log(`✅ Enhanced workload ${parentId} completed with ${assemblyResult.stats.chunkingStrategy}/${assemblyResult.stats.assemblyStrategy}`);
+          console.log(`✅ Enhanced workload ${parentId} completed with ${assemblyResult.stats?.chunkingStrategy}/${assemblyResult.stats?.assemblyStrategy}`);
 
           io.emit('workload:complete', {
             id: parentId,
@@ -1721,23 +1797,37 @@ io.on('connection', socket => {
             stats: assemblyResult.stats
           });
         } else if (!assemblyResult.success) {
-          console.error(`Enhanced chunk processing failed: ${assemblyResult.error}`);
+          console.error(`❌ Enhanced chunk processing failed for ${parentId}: ${assemblyResult.error}`);
           workloadState.status = 'error';
           workloadState.error = assemblyResult.error;
-          saveCustomWorkloads(); saveCustomWorkloadChunks();
+          saveCustomWorkloads();
+          saveCustomWorkloadChunks();
           broadcastCustomWorkloadList();
         } else {
+          console.log(`⏳ Enhanced workload ${parentId} still processing (${assemblyResult.status})`);
           workloadState.status = 'processing_chunks';
-          saveCustomWorkloads(); saveCustomWorkloadChunks(); broadcastCustomWorkloadList();
+          saveCustomWorkloads();
+          saveCustomWorkloadChunks();
+          broadcastCustomWorkloadList();
         }
-      } else {
-        workloadState.status = 'processing_chunks';
-        saveCustomWorkloads(); saveCustomWorkloadChunks(); broadcastCustomWorkloadList();
+      } catch (assemblyError) {
+        console.error(`❌ Assembly error for chunk ${chunkId}:`, assemblyError);
+        workloadState.status = 'error';
+        workloadState.error = assemblyError.message;
+        saveCustomWorkloads();
+        saveCustomWorkloadChunks();
+        broadcastCustomWorkloadList();
       }
     } else {
-      handleRegularChunkCompletion(parentId, chunkId, results || [result], processingTime, reportedChecksum);
+      console.log(`⏳ Enhanced chunk ${chunkId} waiting for more submissions (${cd.submissions?.length || 0}/${ADMIN_K_PARAMETER})`);
+      workloadState.status = 'processing_chunks';
+      saveCustomWorkloads();
+      saveCustomWorkloadChunks();
+      broadcastCustomWorkloadList();
     }
   });
+
+
 
   // Regular chunk completion
   socket.on('workload:chunk_done', ({ parentId, chunkId, chunkOrderIndex, results, result, processingTime, reportedChecksum }) => {
@@ -2235,4 +2325,113 @@ app.post('/api/workloads/debug/:id', (req, res) => {
   };
 
   res.json(debugInfo);
+  debugMatrixTiledChunk(store,wl);
 });
+
+
+app.get('/api/workloads/:id/chunks/status', (req, res) => {
+  const wid = req.params.id;
+  const wl = customWorkloads.get(wid);
+  const store = customWorkloadChunks.get(wid);
+
+  if (!wl || !store) {
+    return res.status(404).json({ error: 'Workload not found' });
+  }
+
+  const chunkStatus = store.allChunkDefs.map(cd => ({
+    chunkId: cd.chunkId,
+    status: cd.status,
+    submissions: cd.submissions ? cd.submissions.length : 0,
+    verified: !!cd.verified_results,
+    dispatchesMade: cd.dispatchesMade,
+    activeAssignments: cd.activeAssignments ? cd.activeAssignments.size : 0
+  }));
+
+  res.json({
+    workloadId: wid,
+    totalChunks: store.expectedChunks,
+    completedChunks: store.completedChunksData.size,
+    chunks: chunkStatus,
+    progress: store.expectedChunks > 0 ? (store.completedChunksData.size / store.expectedChunks * 100) : 0
+  });
+});
+
+
+function verifyAndRecordChunkSubmission(parent, store, cd, submission, chunkOrderIndex, k) {
+  if (cd.verified_results) {
+    return { verified: true, winningChecksum: cd._winningChecksum || null, winnerSubmission: null };
+  }
+
+  if (!cd.submissions) cd.submissions = [];
+  const dup = cd.submissions.some(s => s.clientId === submission.clientId && s.serverChecksum === submission.serverChecksum);
+  if (!dup) cd.submissions.push(submission);
+
+  console.log(`[SUBMISSION] Chunk ${cd.chunkId} received submission from ${submission.clientId} (${cd.submissions.length} total)`);
+
+  const expectedSize = (cd.outputSizes && cd.outputSizes.length > 0)
+    ? cd.outputSizes.reduce((a, b) => a + b, 0)
+    : (parent.chunkOutputSizes && parent.chunkOutputSizes.length > 0)
+      ? parent.chunkOutputSizes.reduce((a, b) => a + b, 0)
+      : parent.chunkOutputSize;
+
+  const tallyResult = tallyKByChecksum(
+    cd.submissions.map(s => ({
+      clientId: s.clientId,
+      serverChecksum: s.serverChecksum,
+      reportedChecksum: s.reportedChecksum,
+      byteLength: s.byteLength
+    })),
+    expectedSize,
+    k
+  );
+
+  if (!tallyResult.ok) {
+    console.log(`[SUBMISSION] Chunk ${cd.chunkId} needs more submissions (${cd.submissions.length}/${k})`);
+    return { verified: false, winningChecksum: null, winnerSubmission: null };
+  }
+
+  const winningChecksum = tallyResult.winningChecksum;
+
+  if (cd.verified_results) {
+    return { verified: true, winningChecksum: cd._winningChecksum || winningChecksum, winnerSubmission: null };
+  }
+
+  const winner = cd.submissions.find(s => s.serverChecksum === winningChecksum);
+  if (!winner) {
+    console.error(`[SUBMISSION] No winning submission found for chunk ${cd.chunkId} with checksum ${winningChecksum.slice(0,8)}...`);
+    return { verified: false, winningChecksum: null, winnerSubmission: null };
+  }
+
+  cd.verified_results = winner.results;
+  cd.status = 'completed';
+  cd._winningChecksum = winningChecksum;
+
+  if (!store.completedChunksData) store.completedChunksData = new Map();
+  store.completedChunksData.set(chunkOrderIndex, winner.buffers || winner.results.map(r => Buffer.from(r, 'base64')));
+
+  console.log(`✅ Chunk ${cd.chunkId} verified with checksum ${winningChecksum.slice(0,8)}...`);
+
+  // Log progress after verification
+  logChunkProgress(parent.id);
+
+  return { verified: true, winningChecksum, winnerSubmission: winner };
+}
+
+  function logChunkProgress(parentId) {
+  const store = customWorkloadChunks.get(parentId);
+  if (!store) return;
+
+  const completed = store.completedChunksData.size;
+  const total = store.expectedChunks;
+  const percentage = total > 0 ? Math.round((completed / total) * 100) : 0;
+
+  console.log(`📊 Chunk progress for ${parentId}: ${completed}/${total} chunks (${percentage}%)`);
+
+  // Emit progress update to clients
+  io.emit('workload:progress', {
+    id: parentId,
+    completed,
+    total,
+    percentage
+  });
+}
