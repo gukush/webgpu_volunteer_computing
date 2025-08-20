@@ -104,7 +104,15 @@ export class EnhancedChunkingManager {
       // Plan the execution (now with file access if needed)
       const plan = chunkingStrategy.planExecution(workload);
       plan.parentId = workload.id;
+      plan.framework = workload.framework;
+      plan.metadata = {
+        ...plan.metadata,
+        ...workload.metadata,
+        framework: workload.framework  // Ensure framework is in metadata too
+      };
 
+    console.log(`[CHUNKING MANAGER DEBUG] Plan framework: ${plan.framework}`);
+    console.log(`[CHUNKING MANAGER DEBUG] Workload framework: ${workload.framework}`);
       // Check for multi-phase execution
       if (plan.executionModel === 'iterative_refinement') {
         return await this.processIterativeWorkload(workload, plan, chunkingStrategy);

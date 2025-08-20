@@ -1,6 +1,6 @@
 #!/usr/bin/env node
-// FINAL: app/scripts/test-chunking.mjs
-// End-to-end two-step test harness for block-matrix workloads with proper flow.
+// ENHANCED: app/scripts/test-chunking.mjs
+// End-to-end two-step test harness for block-matrix workloads with framework selection.
 
 import fs from 'fs/promises';
 import path from 'path';
@@ -14,10 +14,14 @@ const args = minimist(process.argv.slice(2));
 
 const size = parseInt(args.size, 10);
 const blockSize = parseInt(args['block-size'], 10);
+const framework = args.framework || 'webgpu'; // NEW: Framework selection
 const inputPath = args.input ? path.resolve(args.input) : null;
 const apiBase = args['api-base'] || process.env.API_BASE || 'https://localhost:3000';
 const insecureFlag = args.insecure || process.env.TEST_INSECURE;
 const pollInterval = Number(args.interval || process.env.TEST_POLL_INTERVAL || 2000);
+
+// NEW: Framework validation
+const SUPPORTED_FRAMEWORKS = ['webgpu', 'webgl', 'cuda', 'opencl', 'vulkan'];
 
 // If the user requested insecure, set TLS reject env early so node fetch accepts self-signed certs.
 if (insecureFlag) {
@@ -25,11 +29,28 @@ if (insecureFlag) {
 }
 
 if (!Number.isInteger(size) || !Number.isInteger(blockSize)) {
-  console.error('Usage: --size N --block-size M [--input path] [--api-base https://host:port] [--insecure]');
+  console.error('Usage: --size N --block-size M [--framework F] [--input path] [--api-base https://host:port] [--insecure]');
+  console.error('');
+  console.error('Options:');
+  console.error('  --framework    GPU framework to use (webgpu, webgl, cuda, opencl, vulkan) [default: webgpu]');
+  console.error('  --size         Matrix size (must be divisible by block-size)');
+  console.error('  --block-size   Block size for matrix subdivision');
+  console.error('  --input        Path to pre-generated matrix file (optional)');
+  console.error('  --api-base     API server URL [default: https://localhost:3000]');
+  console.error('  --insecure     Accept self-signed certificates');
+  console.error('  --interval     Status polling interval in ms [default: 2000]');
   process.exit(1);
 }
+
 if (size % blockSize !== 0) {
   console.error(`--size ${size} must be divisible by --block-size ${blockSize}`);
+  process.exit(1);
+}
+
+// NEW: Validate framework
+if (!SUPPORTED_FRAMEWORKS.includes(framework)) {
+  console.error(`Unsupported framework: ${framework}`);
+  console.error(`Supported frameworks: ${SUPPORTED_FRAMEWORKS.join(', ')}`);
   process.exit(1);
 }
 
@@ -143,6 +164,63 @@ function packCombinedMatrices(size, A, B) {
   return buf;
 }
 
+// NEW: Check framework availability on server
+async function checkFrameworkSupport(framework, apiBase) {
+  try {
+    const frameworks = await getJSON(`${apiBase}/api/frameworks`);
+
+    if (!frameworks.frameworks || !frameworks.frameworks[framework]) {
+      return {
+        supported: false,
+        reason: `Framework ${framework} not recognized by server`
+      };
+    }
+
+    const stats = frameworks.stats[framework];
+    if (stats.availableClients === 0) {
+      return {
+        supported: false,
+        reason: `No clients support ${framework} framework`,
+        stats
+      };
+    }
+
+    return {
+      supported: true,
+      stats
+    };
+  } catch (error) {
+    console.warn(`⚠️ Could not check framework support: ${error.message}`);
+    return { supported: true }; // Assume supported if we can't check
+  }
+}
+
+// NEW: Get framework-specific chunking strategy
+function getChunkingStrategyForFramework(framework) {
+  const strategyMap = {
+    'webgpu': 'block_matrix',
+    'webgl': 'block_matrix', // Same strategy, different shader
+    'cuda': 'block_matrix',
+    'opencl': 'block_matrix',
+    'vulkan': 'block_matrix'
+  };
+
+  return strategyMap[framework] || 'block_matrix';
+}
+
+// NEW: Get framework-specific assembly strategy
+function getAssemblyStrategyForFramework(framework) {
+  const strategyMap = {
+    'webgpu': 'block_matrix_assembly',
+    'webgl': 'block_matrix_assembly',
+    'cuda': 'block_matrix_assembly',
+    'opencl': 'block_matrix_assembly',
+    'vulkan': 'block_matrix_assembly'
+  };
+
+  return strategyMap[framework] || 'block_matrix_assembly';
+}
+
 async function pollStatus(workloadId, intervalMs = 2000) {
   while (true) {
     try {
@@ -174,6 +252,8 @@ async function pollStatus(workloadId, intervalMs = 2000) {
 
 (async () => {
   console.log(`API base: ${apiBase}`);
+  console.log(`Framework: ${framework.toUpperCase()}`); // NEW: Show selected framework
+
   if (insecureFlag) {
     console.log('⚠️ Insecure mode enabled: NODE_TLS_REJECT_UNAUTHORIZED=0 (accepting self-signed certs)');
   }
@@ -188,14 +268,43 @@ async function pollStatus(workloadId, intervalMs = 2000) {
   }
 
   try {
-    // STEP 1: Create workload (metadata only) - NEW TWO-STEP FLOW
-    console.log('📝 Creating workload definition...');
+    // NEW: Check framework support
+    console.log(`🔍 Checking ${framework.toUpperCase()} framework support...`);
+    const frameworkCheck = await checkFrameworkSupport(framework, apiBase);
+
+    if (!frameworkCheck.supported) {
+      console.error(`❌ Framework ${framework.toUpperCase()} not supported: ${frameworkCheck.reason}`);
+      if (frameworkCheck.stats) {
+        console.error(`   Available clients: ${frameworkCheck.stats.availableClients}`);
+        console.error(`   Active workloads: ${frameworkCheck.stats.activeWorkloads}`);
+      }
+      console.error(`\nTips:`);
+      console.error(`   - Make sure clients supporting ${framework.toUpperCase()} are connected`);
+      console.error(`   - For WebGL, ensure clients have WebGL2 support`);
+      console.error(`   - Try --framework webgpu as fallback`);
+      process.exit(3);
+    } else {
+      console.log(`✅ Framework ${framework.toUpperCase()} supported`);
+      if (frameworkCheck.stats) {
+        console.log(`   Available clients: ${frameworkCheck.stats.availableClients}`);
+        console.log(`   Active workloads: ${frameworkCheck.stats.activeWorkloads}`);
+        console.log(`   Completed workloads: ${frameworkCheck.stats.completedWorkloads}`);
+      }
+    }
+
+    // STEP 1: Create workload (metadata only) - NEW TWO-STEP FLOW with framework selection
+    console.log('📋 Creating workload definition...');
     const payload = {
-      label: `Block Matrix ${size}×${size} test (${blockSize}×${blockSize} blocks)`,
-      framework: 'webgpu',
-      chunkingStrategy: 'block_matrix',
-      assemblyStrategy: 'block_matrix_assembly',
-      metadata: { matrixSize: size, blockSize },
+      label: `${framework.toUpperCase()} Block Matrix ${size}×${size} test (${blockSize}×${blockSize} blocks)`,
+      framework: framework, // NEW: Use selected framework
+      chunkingStrategy: getChunkingStrategyForFramework(framework), // NEW: Framework-specific strategy
+      assemblyStrategy: getAssemblyStrategyForFramework(framework), // NEW: Framework-specific assembly
+      metadata: {
+        matrixSize: size,
+        blockSize,
+        framework: framework, // Additional metadata
+        testType: 'block_matrix_multiplication'
+      },
       outputSizes: [ size * size * 4 ]
     };
 
@@ -205,6 +314,7 @@ async function pollStatus(workloadId, intervalMs = 2000) {
 
     console.log(`✅ Workload created: ${workloadId}`);
     console.log(`   Status: ${workloadInfo.status}`);
+    console.log(`   Framework: ${framework.toUpperCase()}`);
     console.log(`   Requires file upload: ${workloadInfo.requiresFileUpload}`);
 
     if (workloadInfo.requiresFileUpload) {
@@ -233,7 +343,7 @@ async function pollStatus(workloadId, intervalMs = 2000) {
         }
         console.log(`   ✅ File validation passed: ${size}×${size} matrices`);
       } else {
-        console.log('⚙️ Generating random matrices...');
+        console.log(`⚙️ Generating random matrices for ${framework.toUpperCase()} computation...`);
         const A = Array.from({ length: size }, () => Array.from({ length: size }, () => Math.random()));
         const B = Array.from({ length: size }, () => Array.from({ length: size }, () => Math.random()));
         buf = packCombinedMatrices(size, A, B);
@@ -242,7 +352,7 @@ async function pollStatus(workloadId, intervalMs = 2000) {
 
       console.log('📤 Uploading input data...');
       const uploadResp = await postMultipart(`${apiBase}/api/workloads/${workloadId}/inputs`, [
-        { name: 'combined_matrix', buffer: buf, filename: `matrix_${size}x${size}.bin` }
+        { name: 'combined_matrix', buffer: buf, filename: `matrix_${size}x${size}_${framework}.bin` }
       ]);
 
       console.log('✅ Upload successful:');
@@ -255,10 +365,11 @@ async function pollStatus(workloadId, intervalMs = 2000) {
     }
 
     // STEP 3: Start computation
-    console.log('🚀 Starting computation...');
+    console.log(`🚀 Starting ${framework.toUpperCase()} computation...`);
     const startResp = await postJSON(`${apiBase}/api/workloads/${workloadId}/compute-start`, {});
     console.log(`✅ Computation started successfully`);
     console.log(`   Status: ${startResp.status}`);
+    console.log(`   Framework: ${framework.toUpperCase()}`);
     console.log(`   Total chunks: ${startResp.totalChunks}`);
     console.log(`   Message: ${startResp.message}`);
 
@@ -310,6 +421,7 @@ async function pollStatus(workloadId, intervalMs = 2000) {
 
     console.log('\n🎉 Test completed successfully!');
     console.log(`\n📈 Performance Summary:`);
+    console.log(`   Framework: ${framework.toUpperCase()}`);
     console.log(`   Matrix size: ${size}×${size}`);
     console.log(`   Block size: ${blockSize}×${blockSize}`);
     console.log(`   Expected chunks: ${Math.pow(Math.floor(size / blockSize), 3)}`);
@@ -322,8 +434,17 @@ async function pollStatus(workloadId, intervalMs = 2000) {
     if (err.message.includes('HTTP 400')) {
       console.error('\n🔍 Debugging tips:');
       console.error('   - Check that the server is running with the updated code');
-      console.error('   - Verify the block_matrix strategy is properly registered');
-      console.error('   - Ensure the two-step flow is implemented correctly');
+      console.error(`   - Verify the ${framework} framework is properly supported`);
+      console.error('   - Ensure the block_matrix strategy is properly registered');
+      console.error('   - Verify the two-step flow is implemented correctly');
+    }
+
+    if (err.message.includes('Framework') && err.message.includes('not supported')) {
+      console.error('\n💡 Framework troubleshooting:');
+      console.error(`   - For WebGL: ensure clients have WebGL2 and proper extensions`);
+      console.error(`   - For CUDA: ensure CUDA runtime and clients are available`);
+      console.error(`   - For OpenCL: ensure OpenCL runtime and clients are available`);
+      console.error(`   - Try different framework with --framework <name>`);
     }
 
     if (err.cause && err.cause.socket) {

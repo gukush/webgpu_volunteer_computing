@@ -1,4 +1,4 @@
-// FIXED: BlockMatrixChunkingStrategy.js - Handle deferred file processing
+// ENHANCED: BlockMatrixChunkingStrategy.js - Now provides framework-specific shaders
 import { BaseChunkingStrategy } from './base/BaseChunkingStrategy.js';
 import fs from 'fs/promises';
 
@@ -30,9 +30,6 @@ export default class BlockMatrixChunkingStrategy extends BaseChunkingStrategy {
     };
   }
 
-  /**
-   * FIXED: Plan execution - validate metadata and return plan WITHOUT processing files
-   */
   planExecution(plan) {
     const matrixSize = plan.metadata?.matrixSize;
     const blockSize = plan.metadata?.blockSize;
@@ -46,11 +43,10 @@ export default class BlockMatrixChunkingStrategy extends BaseChunkingStrategy {
     }
 
     const blocksPerDim = Math.floor(matrixSize / blockSize);
-    const totalChunks = blocksPerDim * blocksPerDim * blocksPerDim; // blocksPerDim³
+    const totalChunks = blocksPerDim * blocksPerDim * blocksPerDim;
     const blockElementCount = blockSize * blockSize;
     const blockByteSize = blockElementCount * 4;
 
-    // Return plan without creating chunk descriptors yet
     return {
       strategy: this.name,
       totalChunks,
@@ -65,13 +61,12 @@ export default class BlockMatrixChunkingStrategy extends BaseChunkingStrategy {
     };
   }
 
-  /**
-   * NEW: Create chunk descriptors - called AFTER files are uploaded
-   */
   async createChunkDescriptors(plan) {
     const { matrixSize, blockSize, blocksPerDim, blockByteSize } = plan.metadata;
-
-    // NOW we can safely access input files
+    const framework = plan.framework || 'webgpu';
+    console.log(`[STRATEGY DEBUG] createChunkDescriptors called with framework: ${framework}`);
+    console.log(`[STRATEGY DEBUG] Plan framework: ${plan.framework}`);
+    // Get input data
     const inputFileRef = (plan.inputRefs || []).find(r => r.name === 'combined_matrix')
                       || (plan.inputRefs || []).find(r => r.name === 'input');
 
@@ -84,14 +79,10 @@ export default class BlockMatrixChunkingStrategy extends BaseChunkingStrategy {
       throw new Error('BlockMatrix requires input file or inline inputData. Upload files first via POST /api/workloads/:id/inputs');
     }
 
-    // Validate file size if using file input
     if (inputFileRef) {
-      const expectedSize = 4 + matrixSize * matrixSize * 2 * 4; // header + 2 matrices
+      const expectedSize = 4 + matrixSize * matrixSize * 2 * 4;
       if (inputFileRef.size !== expectedSize) {
-        throw new Error(
-          `Input file size mismatch: expected ${expectedSize} bytes ` +
-          `(header + 2×${matrixSize}×${matrixSize} float32 matrices), got ${inputFileRef.size} bytes`
-        );
+        throw new Error(`Input file size mismatch: expected ${expectedSize} bytes, got ${inputFileRef.size} bytes`);
       }
     }
 
@@ -120,23 +111,21 @@ export default class BlockMatrixChunkingStrategy extends BaseChunkingStrategy {
             } else {
               throw new Error('No input data available');
             }
-
-            descriptors.push({
-              chunkId: `block-${i}-${j}-k${k}`,
-              chunkIndex: chunkIndex++,
-              parentId: plan.parentId,
-              framework: 'webgpu',
-              kernel: this.getBlockMultiplyShader(),
-              entry: 'main',
-              workgroupCount: [Math.ceil(blockSize / 16), Math.ceil(blockSize / 16), 1],
-              inputs: [
-                { name: 'matrix_a_block', data: blockA.toString('base64') },
-                { name: 'matrix_b_block', data: blockB.toString('base64') }
-              ],
-              outputs: [{ name: 'partial_result', size: blockByteSize }],
-              metadata: { block_size: blockSize, matrix_size: matrixSize },
-              assemblyMetadata: { outputBlockRow: i, outputBlockCol: j, kIndex: k }
-            });
+            console.log(`[STRATEGY DEBUG] About to create descriptor for framework: ${framework}, chunk: ${i}-${j}-k${k}`);
+            // NEW: Framework-specific descriptor creation
+            const descriptor = this.createFrameworkSpecificDescriptor(
+              framework, chunkIndex, i, j, k, blockA, blockB, blockSize, matrixSize, plan.parentId, blockByteSize
+            );
+            console.log(`[STRATEGY DEBUG] Created descriptor keys:`, Object.keys(descriptor));
+            console.log(`[STRATEGY DEBUG] Descriptor has webglVertexShader:`, !!descriptor.webglVertexShader);
+            console.log(`[STRATEGY DEBUG] Descriptor has kernel:`, !!descriptor.kernel);
+            console.log(`[STRATEGY DEBUG] Descriptor framework:`, descriptor.framework);
+            if (descriptor.webglVertexShader) {
+              console.log(`[STRATEGY DEBUG] WebGL vertex shader length:`, descriptor.webglVertexShader.length);
+              console.log(`[STRATEGY DEBUG] WebGL vertex shader preview:`, descriptor.webglVertexShader.substring(0, 100) + '...');
+            }
+            descriptors.push(descriptor);
+            chunkIndex++;
           }
         }
       }
@@ -150,85 +139,88 @@ export default class BlockMatrixChunkingStrategy extends BaseChunkingStrategy {
     }
   }
 
-  /**
-   * Read a block from an open file handle
-   */
-  async readBlockFromHandle(fileHandle, matrixType, blockCoords, blockSize, matrixSize) {
-    const floatSize = 4;
-    const matrixAOffset = 4; // Skip 4-byte size header
-    const matrixBOffset = matrixAOffset + matrixSize * matrixSize * floatSize;
-    const baseOffset = (matrixType === 'A') ? matrixAOffset : matrixBOffset;
+  // NEW: Create framework-specific chunk descriptors
+  createFrameworkSpecificDescriptor(framework, chunkIndex, i, j, k, blockA, blockB, blockSize, matrixSize, parentId, blockByteSize) {
+    console.log(`[STRATEGY DEBUG] createFrameworkSpecificDescriptor called with framework: ${framework}`);
+    const baseDescriptor = {
+      chunkId: `block-${i}-${j}-k${k}`,
+      chunkIndex,
+      parentId,
+      framework,
+      inputs: [
+        { name: 'matrix_a_block', data: blockA.toString('base64') },
+        { name: 'matrix_b_block', data: blockB.toString('base64') }
+      ],
+      outputs: [{ name: 'partial_result', size: blockByteSize }],
+      metadata: { block_size: blockSize, matrix_size: matrixSize },
+      assemblyMetadata: { outputBlockRow: i, outputBlockCol: j, kIndex: k }
+    };
+    console.log(`[STRATEGY DEBUG] Base descriptor created, framework: ${framework}`);
+    switch (framework) {
+      case 'webgpu':
+        return {
+          ...baseDescriptor,
+          kernel: this.getWebGPUShader(),
+          entry: 'main',
+          workgroupCount: [Math.ceil(blockSize / 16), Math.ceil(blockSize / 16), 1]
+        };
 
-    const startRow = blockCoords.row * blockSize;
-    const startCol = blockCoords.col * blockSize;
 
-    const blockBuffer = Buffer.alloc(blockSize * blockSize * floatSize);
-    const rowBytes = blockSize * floatSize;
+      case 'webgl':
+        console.log(`[STRATEGY DEBUG] Creating WebGL descriptor`);
+        const webglVertexShader = this.getWebGLVertexShader();
+        const webglFragmentShader = this.getWebGLFragmentShader();
+        console.log(`[STRATEGY DEBUG] Retrieved WebGL shaders:`);
+        console.log(`[STRATEGY DEBUG] - Vertex shader length:`, webglVertexShader ? webglVertexShader.length : 'undefined');
+        console.log(`[STRATEGY DEBUG] - Fragment shader length:`, webglFragmentShader ? webglFragmentShader.length : 'undefined');
+        console.log(`[STRATEGY DEBUG] Creating WebGL descriptor for ${framework}:`);
+        console.log(`[STRATEGY DEBUG] Vertex shader length: ${webglVertexShader ? webglVertexShader.length : 'undefined'}`);
+        console.log(`[STRATEGY DEBUG] Fragment shader length: ${webglFragmentShader ? webglFragmentShader.length : 'undefined'}`);
+        console.log(`[STRATEGY DEBUG] Vertex shader preview: ${webglVertexShader ? webglVertexShader.substring(0, 100) + '...' : 'undefined'}`);
 
-    for (let r = 0; r < blockSize; r++) {
-      const filePos = baseOffset + ((startRow + r) * matrixSize * floatSize) + (startCol * floatSize);
-      await fileHandle.read(blockBuffer, r * rowBytes, rowBytes, filePos);
+        const descriptor = {
+          ...baseDescriptor,
+          // WebGL-specific configuration
+          webglShaderType: 'transform_feedback',
+          webglVertexShader: webglVertexShader,
+          webglFragmentShader: webglFragmentShader,
+          webglVaryings: ['v_result'],
+          webglNumElements: blockSize * blockSize,
+          webglInputSpec: {
+            type: 'texture',
+            format: 'float32',
+            internalFormat: 'R32F'
+          }
+        };
+
+        console.log(`[STRATEGY DEBUG] Final descriptor keys:`, Object.keys(descriptor));
+        console.log(`[STRATEGY DEBUG] Has webglVertexShader:`, !!descriptor.webglVertexShader);
+
+        return descriptor;
+
+      case 'cuda':
+        return {
+          ...baseDescriptor,
+          kernel: this.getCUDAKernel(),
+          blockDim: [16, 16, 1],
+          gridDim: [Math.ceil(blockSize / 16), Math.ceil(blockSize / 16), 1]
+        };
+
+      case 'opencl':
+        return {
+          ...baseDescriptor,
+          kernel: this.getOpenCLKernel(),
+          globalWorkSize: [blockSize, blockSize],
+          localWorkSize: [16, 16]
+        };
+
+      default:
+        throw new Error(`Unsupported framework: ${framework}`);
     }
-
-    return blockBuffer;
   }
 
-  /**
-   * Extract a block from an in-memory buffer
-   */
-  extractBlockFromBuffer(combinedBuffer, matrixType, blockCoords, blockSize, matrixSize) {
-    const floatSize = 4;
-    const matrixAOffset = 4; // Skip 4-byte size header
-    const matrixBOffset = matrixAOffset + matrixSize * matrixSize * floatSize;
-    const baseOffset = (matrixType === 'A') ? matrixAOffset : matrixBOffset;
-
-    const startRow = blockCoords.row * blockSize;
-    const startCol = blockCoords.col * blockSize;
-
-    const blockBuffer = Buffer.alloc(blockSize * blockSize * floatSize);
-    const rowBytes = blockSize * floatSize;
-
-    for (let r = 0; r < blockSize; r++) {
-      const sourcePos = baseOffset + ((startRow + r) * matrixSize * floatSize) + (startCol * floatSize);
-      const destPos = r * rowBytes;
-      combinedBuffer.copy(blockBuffer, destPos, sourcePos, sourcePos + rowBytes);
-    }
-
-    return blockBuffer;
-  }
-
-  /**
-   * Validate input files match expected format
-   */
-  async validateInputs(uploadedFiles, metadata) {
-    const { matrixSize } = metadata;
-
-    const matrixFile = uploadedFiles.find(f =>
-      f.name === 'combined_matrix' || f.name === 'input'
-    );
-
-    if (!matrixFile) {
-      return {
-        valid: false,
-        errors: ['No combined_matrix or input file uploaded']
-      };
-    }
-
-    const expectedSize = 4 + matrixSize * matrixSize * 2 * 4; // header + 2 matrices
-    if (matrixFile.size !== expectedSize) {
-      return {
-        valid: false,
-        errors: [
-          `Matrix file size mismatch: expected ${expectedSize} bytes ` +
-          `(header + 2×${matrixSize}×${matrixSize} float32 matrices), got ${matrixFile.size} bytes`
-        ]
-      };
-    }
-
-    return { valid: true };
-  }
-
-  getBlockMultiplyShader() {
+  // WebGPU shader (existing)
+  getWebGPUShader() {
     return `
       struct BlockParams {
         block_size: u32,
@@ -256,5 +248,185 @@ export default class BlockMatrixChunkingStrategy extends BaseChunkingStrategy {
         partial_result[row * params.block_size + col] = sum;
       }
     `;
+  }
+
+  // NEW: WebGL vertex shader for matrix block multiplication
+  getWebGLVertexShader() {
+    return `#version 300 es
+      precision highp float;
+
+      in float a_index;
+
+      uniform int u_block_size;
+      uniform int u_matrix_size;
+      uniform sampler2D u_input_0; // matrix_a_block as texture
+      uniform sampler2D u_input_1; // matrix_b_block as texture
+
+      out float v_result;
+
+      void main() {
+        int index = int(a_index);
+        int block_size = u_block_size;
+
+        int local_row = index / block_size;
+        int local_col = index % block_size;
+
+        if (local_row >= block_size || local_col >= block_size) {
+          v_result = 0.0;
+          return;
+        }
+
+        float sum = 0.0;
+        for (int k = 0; k < block_size; k++) {
+          // Sample from block textures
+          float a_coord_x = (float(k) + 0.5) / float(block_size);
+          float a_coord_y = (float(local_row) + 0.5) / float(block_size);
+          float a_val = texture(u_input_0, vec2(a_coord_x, a_coord_y)).r;
+
+          float b_coord_x = (float(local_col) + 0.5) / float(block_size);
+          float b_coord_y = (float(k) + 0.5) / float(block_size);
+          float b_val = texture(u_input_1, vec2(b_coord_x, b_coord_y)).r;
+
+          sum += a_val * b_val;
+        }
+
+        v_result = sum;
+
+        // Required vertex position (not used)
+        gl_Position = vec4(0.0);
+        gl_PointSize = 1.0;
+      }
+    `;
+  }
+
+  // NEW: WebGL fragment shader (minimal, required but not used for transform feedback)
+  getWebGLFragmentShader() {
+    return `#version 300 es
+      precision highp float;
+      out vec4 fragColor;
+
+      void main() {
+        fragColor = vec4(1.0);
+      }
+    `;
+  }
+
+  // NEW: CUDA kernel
+  getCUDAKernel() {
+    return `
+      extern "C" __global__ void block_matrix_multiply(
+          const float* block_a,
+          const float* block_b,
+          float* partial_result,
+          int block_size,
+          int matrix_size
+      ) {
+          int row = blockIdx.x * blockDim.x + threadIdx.x;
+          int col = blockIdx.y * blockDim.y + threadIdx.y;
+
+          if (row >= block_size || col >= block_size) return;
+
+          float sum = 0.0f;
+          for (int k = 0; k < block_size; k++) {
+              sum += block_a[row * block_size + k] * block_b[k * block_size + col];
+          }
+
+          partial_result[row * block_size + col] = sum;
+      }
+    `;
+  }
+
+  // NEW: OpenCL kernel
+  getOpenCLKernel() {
+    return `
+      __kernel void block_matrix_multiply(
+          __global const float* block_a,
+          __global const float* block_b,
+          __global float* partial_result,
+          const int block_size,
+          const int matrix_size
+      ) {
+          int row = get_global_id(0);
+          int col = get_global_id(1);
+
+          if (row >= block_size || col >= block_size) return;
+
+          float sum = 0.0f;
+          for (int k = 0; k < block_size; k++) {
+              sum += block_a[row * block_size + k] * block_b[k * block_size + col];
+          }
+
+          partial_result[row * block_size + col] = sum;
+      }
+    `;
+  }
+
+  // Existing helper methods remain unchanged
+  async readBlockFromHandle(fileHandle, matrixType, blockCoords, blockSize, matrixSize) {
+    const floatSize = 4;
+    const matrixAOffset = 4;
+    const matrixBOffset = matrixAOffset + matrixSize * matrixSize * floatSize;
+    const baseOffset = (matrixType === 'A') ? matrixAOffset : matrixBOffset;
+
+    const startRow = blockCoords.row * blockSize;
+    const startCol = blockCoords.col * blockSize;
+
+    const blockBuffer = Buffer.alloc(blockSize * blockSize * floatSize);
+    const rowBytes = blockSize * floatSize;
+
+    for (let r = 0; r < blockSize; r++) {
+      const filePos = baseOffset + ((startRow + r) * matrixSize * floatSize) + (startCol * floatSize);
+      await fileHandle.read(blockBuffer, r * rowBytes, rowBytes, filePos);
+    }
+
+    return blockBuffer;
+  }
+
+  extractBlockFromBuffer(combinedBuffer, matrixType, blockCoords, blockSize, matrixSize) {
+    const floatSize = 4;
+    const matrixAOffset = 4;
+    const matrixBOffset = matrixAOffset + matrixSize * matrixSize * floatSize;
+    const baseOffset = (matrixType === 'A') ? matrixAOffset : matrixBOffset;
+
+    const startRow = blockCoords.row * blockSize;
+    const startCol = blockCoords.col * blockSize;
+
+    const blockBuffer = Buffer.alloc(blockSize * blockSize * floatSize);
+    const rowBytes = blockSize * floatSize;
+
+    for (let r = 0; r < blockSize; r++) {
+      const sourcePos = baseOffset + ((startRow + r) * matrixSize * floatSize) + (startCol * floatSize);
+      const destPos = r * rowBytes;
+      combinedBuffer.copy(blockBuffer, destPos, sourcePos, sourcePos + rowBytes);
+    }
+
+    return blockBuffer;
+  }
+
+  async validateInputs(uploadedFiles, metadata) {
+    const { matrixSize } = metadata;
+
+    const matrixFile = uploadedFiles.find(f =>
+      f.name === 'combined_matrix' || f.name === 'input'
+    );
+
+    if (!matrixFile) {
+      return {
+        valid: false,
+        errors: ['No combined_matrix or input file uploaded']
+      };
+    }
+
+    const expectedSize = 4 + matrixSize * matrixSize * 2 * 4;
+    if (matrixFile.size !== expectedSize) {
+      return {
+        valid: false,
+        errors: [
+          `Matrix file size mismatch: expected ${expectedSize} bytes, got ${matrixFile.size} bytes`
+        ]
+      };
+    }
+
+    return { valid: true };
   }
 }

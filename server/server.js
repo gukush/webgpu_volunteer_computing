@@ -1278,33 +1278,49 @@ function assignCustomChunkToAvailableClients() {
 
           // Create unified task data that the client expects
           const taskData = {
-            // Basic chunk info
-            parentId: cd.parentId,
-            chunkId: cd.chunkId,
-            chunkOrderIndex: cd.chunkOrderIndex,
-            framework: parent.framework,
-            enhanced: parent.enhanced,
+          // Basic chunk info
+          parentId: cd.parentId,
+          chunkId: cd.chunkId,
+          chunkOrderIndex: cd.chunkOrderIndex,
+          framework: parent.framework,
+          enhanced: parent.enhanced,
 
-            // Shader code
-            kernel: cd.kernel || parent.metadata?.customShader,
-            wgsl: cd.wgsl || cd.kernel || parent.metadata?.customShader,
-            entry: cd.entry || 'main',
-            workgroupCount: cd.workgroupCount || [1, 1, 1],
+          // Shader code (WebGPU)
+          kernel: cd.kernel || parent.metadata?.customShader,
+          wgsl: cd.wgsl || cd.kernel || parent.metadata?.customShader,
+          entry: cd.entry || 'main',
+          workgroupCount: cd.workgroupCount || [1, 1, 1],
 
-            // NEW: Ensure consistent data format for client
-            inputs: cd.inputs || [],           // Array of {name, data} objects
-            outputs: cd.outputs || [],         // Array of {name, size} objects
-            metadata: cd.metadata || {},       // Strategy-specific uniforms data
-            schema: cd.schema,                 // Binding schema
+          // NEW: WebGL-specific properties (copy from chunk descriptor)
+          webglShaderType: cd.webglShaderType,
+          webglVertexShader: cd.webglVertexShader,
+          webglFragmentShader: cd.webglFragmentShader,
+          webglVaryings: cd.webglVaryings,
+          webglNumElements: cd.webglNumElements,
+          webglInputSpec: cd.webglInputSpec,
 
-            // Legacy compatibility
-            outputSizes: cd.outputs ? cd.outputs.map(o => o.size) : [cd.outputSize],
-            outputSize: cd.outputs ? cd.outputs[0]?.size : cd.outputSize,
+          // NEW: CUDA-specific properties (for future)
+          blockDim: cd.blockDim,
+          gridDim: cd.gridDim,
 
-            // Debug info
-            chunkingStrategy: parent.chunkingStrategy,
-            assemblyStrategy: parent.assemblyStrategy
-          };
+          // NEW: OpenCL-specific properties (for future)
+          globalWorkSize: cd.globalWorkSize,
+          localWorkSize: cd.localWorkSize,
+
+          // Data and outputs
+          inputs: cd.inputs || [],           // Array of {name, data} objects
+          outputs: cd.outputs || [],         // Array of {name, size} objects
+          metadata: cd.metadata || {},       // Strategy-specific uniforms data
+          schema: cd.schema,                 // Binding schema
+
+          // Legacy compatibility
+          outputSizes: cd.outputs ? cd.outputs.map(o => o.size) : [cd.outputSize],
+          outputSize: cd.outputs ? cd.outputs[0]?.size : cd.outputSize,
+
+          // Debug info
+          chunkingStrategy: parent.chunkingStrategy,
+          assemblyStrategy: parent.assemblyStrategy
+        };
 
           // Debug: Log the complete task data being sent
           console.log(`[CHUNK DEBUG] Sending chunk ${cd.chunkId} to ${clientId}:`, {
@@ -1315,6 +1331,26 @@ function assignCustomChunkToAvailableClients() {
             workgroupCount: taskData.workgroupCount
           });
 
+          console.log(`[SERVER DEBUG] Sending chunk ${cd.chunkId} to ${clientId}:`);
+          console.log(`[SERVER DEBUG] Framework: ${parent.framework}`);
+          console.log(`[SERVER DEBUG] TaskData keys:`, Object.keys(taskData));
+          console.log(`[SERVER DEBUG] Has webglVertexShader:`, !!taskData.webglVertexShader);
+          console.log(`[SERVER DEBUG] Has webglFragmentShader:`, !!taskData.webglFragmentShader);
+          console.log(`[SERVER DEBUG] Has kernel:`, !!taskData.kernel);
+
+          if (taskData.webglVertexShader) {
+            console.log(`[SERVER DEBUG] WebGL vertex shader length:`, taskData.webglVertexShader.length);
+            console.log(`[SERVER DEBUG] WebGL vertex shader preview:`, taskData.webglVertexShader.substring(0, 100) + '...');
+          }
+
+          if (taskData.webglFragmentShader) {
+            console.log(`[SERVER DEBUG] WebGL fragment shader length:`, taskData.webglFragmentShader.length);
+          }
+
+          // Also debug the original chunk descriptor
+          console.log(`[SERVER DEBUG] Original cd keys:`, Object.keys(cd));
+          console.log(`[SERVER DEBUG] Original cd.webglVertexShader:`, !!cd.webglVertexShader);
+          console.log(`[SERVER DEBUG] Original cd.kernel:`, !!cd.kernel);
           client.socket.emit('workload:chunk_assign', taskData);
 
           const inputCount = taskData.inputs?.length || 0;
