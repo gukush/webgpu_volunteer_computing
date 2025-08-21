@@ -6,7 +6,7 @@
 #include <chrono>
 
 #ifndef HAVE_SHADERC
-  #error "This build requires shaderc: define HAVE_SHADERC"
+  #error "This build requires shaderc: define HAVE_SHADERC and link with shaderc"
 #endif
 #include <shaderc/shaderc.hpp>
 
@@ -62,7 +62,6 @@ std::vector<uint32_t> compile_glsl_shaderc(const std::string& source, const std:
 
 std::vector<uint32_t> compile_glsl_to_spirv(const std::string& source, const std::string& entry, const std::vector<MacroDef>& macros) {
     const std::string src = ensure_glsl_version(source);
-    (void)entry; // compile_glsl_shaderc receives entry explicitly
     return compile_glsl_shaderc(src, entry, macros);
 }
 
@@ -89,7 +88,7 @@ json VulkanExecutor::getCapabilities() const {
     caps["supportsMultiInput"] = true;
     caps["supportsMultiOutput"] = true;
     caps["shaderSource"] = "glsl";
-    caps["requiresBindings"] = "inputs first, then outputs (set=0, binding=i)";
+    caps["requiresBindings"] = "uniforms at binding 0, inputs first, then outputs (set=0, binding=i)";
     if (phys_) {
         VkPhysicalDeviceProperties props{};
         vkGetPhysicalDeviceProperties(phys_, &props);
@@ -226,6 +225,7 @@ void VulkanExecutor::destroyBuffer(Buffer& b) const {
     if (b.mem) { vkFreeMemory(device_, b.mem, nullptr); b.mem = VK_NULL_HANDLE; }
 }
 
+// FIXED: Enhanced executeTask with metadata handling
 TaskResult VulkanExecutor::executeTask(const TaskData& task) {
     TaskResult result{};
     auto t0 = std::chrono::high_resolution_clock::now();
@@ -236,14 +236,26 @@ TaskResult VulkanExecutor::executeTask(const TaskData& task) {
         return result;
     }
 
-    VkDescriptorSetLayout dsetLayout = VK_NULL_HANDLE; VkPipelineLayout pipelineLayout = VK_NULL_HANDLE; VkDescriptorPool descPool = VK_NULL_HANDLE; VkShaderModule shaderModule = VK_NULL_HANDLE; VkPipeline pipeline = VK_NULL_HANDLE;
+    VkDescriptorSetLayout dsetLayout = VK_NULL_HANDLE;
+    VkPipelineLayout pipelineLayout = VK_NULL_HANDLE;
+    VkDescriptorPool descPool = VK_NULL_HANDLE;
+    VkShaderModule shaderModule = VK_NULL_HANDLE;
+    VkPipeline pipeline = VK_NULL_HANDLE;
+
     try {
         // Determine IO counts
         const bool multipleInputs = !task.inputData.empty();
         const bool multipleOutputs = !task.outputSizes.empty();
+        const bool hasUniforms = !task.metadata.empty();
 
-        const size_t inputCount = multipleInputs ? task.inputData.size() : (task.legacyInputData.empty() ? 0 : 1);
-        const size_t outputCount = multipleOutputs ? task.outputSizes.size() : (task.legacyOutputSize ? 1 : 0);
+        const size_t inputCount = multipleInputs ? task.inputData.size() :
+                                 (task.legacyInputData.empty() ? 0 : 1);
+        const size_t outputCount = multipleOutputs ? task.outputSizes.size() :
+                                  (task.legacyOutputSize ? 1 : 0);
+
+        std::cout << "Task " << task.id << " - Framework: " << task.framework
+                  << ", Inputs: " << inputCount << ", Outputs: " << outputCount
+                  << ", Has uniforms: " << hasUniforms << std::endl;
 
         if (outputCount == 0) {
             result.success = false;
@@ -251,19 +263,65 @@ TaskResult VulkanExecutor::executeTask(const TaskData& task) {
             return result;
         }
 
+        // FIXED: Create uniform buffer from metadata
+        Buffer uniformBuffer{};
+        if (hasUniforms) {
+            std::cout << "Creating uniform buffer from metadata..." << std::endl;
+
+            // Extract uniform values in consistent order (matching browser client)
+            std::vector<uint32_t> uniformData;
+            std::vector<std::string> fieldOrder = {
+                "block_size", "matrix_size", "matrix_n", "matrixSize",
+                "tile_start_row", "tile_start_col", "tile_rows", "tile_cols",
+                "tile_size", "tileSize"
+            };
+
+            for (const auto& field : fieldOrder) {
+                if (task.metadata.contains(field)) {
+                    uint32_t value = task.metadata[field].get<uint32_t>();
+                    uniformData.push_back(value);
+                    std::cout << "  " << field << " = " << value << std::endl;
+                }
+            }
+
+            // Add any remaining numeric values not in fieldOrder
+            for (auto it = task.metadata.begin(); it != task.metadata.end(); ++it) {
+                if (it.value().is_number() &&
+                    std::find(fieldOrder.begin(), fieldOrder.end(), it.key()) == fieldOrder.end()) {
+                    uniformData.push_back(it.value().get<uint32_t>());
+                    std::cout << "  " << it.key() << " = " << it.value().get<uint32_t>() << " (extra)" << std::endl;
+                }
+            }
+
+            if (!uniformData.empty()) {
+                size_t uniformSize = std::max<size_t>(16, uniformData.size() * sizeof(uint32_t));
+                uniformBuffer = makeHostBuffer(uniformSize, VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT);
+                std::memcpy(uniformBuffer.mapped, uniformData.data(),
+                           uniformData.size() * sizeof(uint32_t));
+                std::cout << "Created uniform buffer with " << uniformData.size()
+                         << " values (" << uniformSize << " bytes)" << std::endl;
+            }
+        }
+
         // Create and fill input buffers
         std::vector<Buffer> inputBuffers;
         inputBuffers.reserve(std::max<size_t>(1, inputCount));
         if (multipleInputs) {
-            for (const auto& in : task.inputData) {
-                auto buf = makeHostBuffer(in.empty() ? 4 : (VkDeviceSize)in.size(), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
-                if (!in.empty()) std::memcpy(buf.mapped, in.data(), in.size());
+            for (size_t i = 0; i < task.inputData.size(); ++i) {
+                const auto& in = task.inputData[i];
+                auto buf = makeHostBuffer(in.empty() ? 4 : (VkDeviceSize)in.size(),
+                                         VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+                if (!in.empty()) {
+                    std::memcpy(buf.mapped, in.data(), in.size());
+                    std::cout << "Input buffer " << i << ": " << in.size() << " bytes" << std::endl;
+                }
                 inputBuffers.push_back(buf);
             }
         } else if (!task.legacyInputData.empty()) {
             auto& in = task.legacyInputData;
             auto buf = makeHostBuffer((VkDeviceSize)in.size(), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
             std::memcpy(buf.mapped, in.data(), in.size());
+            std::cout << "Legacy input buffer: " << in.size() << " bytes" << std::endl;
             inputBuffers.push_back(buf);
         }
 
@@ -271,23 +329,50 @@ TaskResult VulkanExecutor::executeTask(const TaskData& task) {
         std::vector<Buffer> outputBuffers;
         outputBuffers.reserve(std::max<size_t>(1, outputCount));
         if (multipleOutputs) {
-            for (size_t sz : task.outputSizes) {
-                auto buf = makeHostBuffer((VkDeviceSize)std::max<size_t>(sz,4), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+            for (size_t i = 0; i < task.outputSizes.size(); ++i) {
+                size_t sz = task.outputSizes[i];
+                auto buf = makeHostBuffer((VkDeviceSize)std::max<size_t>(sz,4),
+                                         VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
                 outputBuffers.push_back(buf);
+                std::cout << "Output buffer " << i << ": " << sz << " bytes" << std::endl;
             }
         } else {
-            auto buf = makeHostBuffer((VkDeviceSize)std::max<size_t>(task.legacyOutputSize,4), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+            auto buf = makeHostBuffer((VkDeviceSize)std::max<size_t>(task.legacyOutputSize,4),
+                                     VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
             outputBuffers.push_back(buf);
+            std::cout << "Legacy output buffer: " << task.legacyOutputSize << " bytes" << std::endl;
         }
 
-        const uint32_t totalBindings = (uint32_t)(inputBuffers.size() + outputBuffers.size());
+        // FIXED: Calculate total bindings: uniforms(0 or 1) + inputs + outputs
+        const uint32_t uniformBindings = hasUniforms ? 1 : 0;
+        const uint32_t totalBindings = uniformBindings + (uint32_t)inputBuffers.size() +
+                                      (uint32_t)outputBuffers.size();
 
-        // Build descriptor set layout: all storage buffers, inputs first then outputs
+        std::cout << "Descriptor layout: " << uniformBindings << " uniforms + "
+                  << inputBuffers.size() << " inputs + " << outputBuffers.size()
+                  << " outputs = " << totalBindings << " total bindings" << std::endl;
+
+        // Build descriptor set layout
         std::vector<VkDescriptorSetLayoutBinding> layoutBindings;
         layoutBindings.reserve(totalBindings);
-        for (uint32_t i=0; i<totalBindings; ++i) {
+
+        uint32_t binding = 0;
+
+        // FIXED: Add uniform buffer binding at 0 if present
+        if (hasUniforms) {
             VkDescriptorSetLayoutBinding lb{};
-            lb.binding = i;
+            lb.binding = binding++;
+            lb.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+            lb.descriptorCount = 1;
+            lb.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+            layoutBindings.push_back(lb);
+            std::cout << "Added uniform buffer at binding " << (binding-1) << std::endl;
+        }
+
+        // Add storage buffer bindings for inputs and outputs
+        for (uint32_t i = 0; i < (uint32_t)(inputBuffers.size() + outputBuffers.size()); ++i) {
+            VkDescriptorSetLayoutBinding lb{};
+            lb.binding = binding++;
             lb.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
             lb.descriptorCount = 1;
             lb.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
@@ -309,8 +394,11 @@ TaskResult VulkanExecutor::executeTask(const TaskData& task) {
         // Compile GLSL to SPIR-V if kernel provided; otherwise fall back to CPU copy.
         bool useGpu = !task.kernel.empty();
         if (useGpu) {
+            std::cout << "Compiling GLSL shader..." << std::endl;
             auto macros = parse_macros(task.compilationOptions);
-            std::vector<uint32_t> spirv = compile_glsl_to_spirv(task.kernel, task.entry.empty() ? "main" : task.entry, macros);
+            std::vector<uint32_t> spirv = compile_glsl_to_spirv(task.kernel,
+                task.entry.empty() ? "main" : task.entry, macros);
+
             VkShaderModuleCreateInfo smci{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
             smci.codeSize = spirv.size() * sizeof(uint32_t);
             smci.pCode = spirv.data();
@@ -329,15 +417,20 @@ TaskResult VulkanExecutor::executeTask(const TaskData& task) {
                 throw std::runtime_error("vkCreateComputePipelines failed");
         }
 
-        // Descriptor pool & set
-        VkDescriptorPoolSize poolSize{};
-        poolSize.type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-        poolSize.descriptorCount = totalBindings;
+        // Create descriptor pool
+        std::vector<VkDescriptorPoolSize> poolSizes;
+        if (hasUniforms) {
+            poolSizes.push_back({VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1});
+        }
+        if (inputBuffers.size() + outputBuffers.size() > 0) {
+            poolSizes.push_back({VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+                               (uint32_t)(inputBuffers.size() + outputBuffers.size())});
+        }
 
         VkDescriptorPoolCreateInfo dpci{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
         dpci.maxSets = 1;
-        dpci.poolSizeCount = 1;
-        dpci.pPoolSizes = &poolSize;
+        dpci.poolSizeCount = (uint32_t)poolSizes.size();
+        dpci.pPoolSizes = poolSizes.data();
         if (vkCreateDescriptorPool(device_, &dpci, nullptr, &descPool) != VK_SUCCESS)
             throw std::runtime_error("vkCreateDescriptorPool failed");
 
@@ -349,33 +442,55 @@ TaskResult VulkanExecutor::executeTask(const TaskData& task) {
         if (vkAllocateDescriptorSets(device_, &dsai, &descSet) != VK_SUCCESS)
             throw std::runtime_error("vkAllocateDescriptorSets failed");
 
-        // Update descriptors
+        // FIXED: Update descriptors with proper binding order
         std::vector<VkDescriptorBufferInfo> infos(totalBindings);
         std::vector<VkWriteDescriptorSet> writes;
         writes.reserve(totalBindings);
-        uint32_t bind = 0;
+
+        binding = 0;
+
+        // Bind uniform buffer first if present
+        if (hasUniforms) {
+            infos[binding] = { uniformBuffer.buf, 0, uniformBuffer.size };
+            VkWriteDescriptorSet w{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+            w.dstSet = descSet;
+            w.dstBinding = binding;
+            w.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+            w.descriptorCount = 1;
+            w.pBufferInfo = &infos[binding];
+            writes.push_back(w);
+            std::cout << "Bound uniform buffer to binding " << binding << std::endl;
+            ++binding;
+        }
+
+        // Bind input buffers
         for (const auto& b : inputBuffers) {
-            infos[bind] = { b.buf, 0, b.size };
+            infos[binding] = { b.buf, 0, b.size };
             VkWriteDescriptorSet w{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
             w.dstSet = descSet;
-            w.dstBinding = bind;
+            w.dstBinding = binding;
             w.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
             w.descriptorCount = 1;
-            w.pBufferInfo = &infos[bind];
+            w.pBufferInfo = &infos[binding];
             writes.push_back(w);
-            ++bind;
+            std::cout << "Bound input buffer to binding " << binding << std::endl;
+            ++binding;
         }
+
+        // Bind output buffers
         for (const auto& b : outputBuffers) {
-            infos[bind] = { b.buf, 0, b.size };
+            infos[binding] = { b.buf, 0, b.size };
             VkWriteDescriptorSet w{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
             w.dstSet = descSet;
-            w.dstBinding = bind;
+            w.dstBinding = binding;
             w.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
             w.descriptorCount = 1;
-            w.pBufferInfo = &infos[bind];
+            w.pBufferInfo = &infos[binding];
             writes.push_back(w);
-            ++bind;
+            std::cout << "Bound output buffer to binding " << binding << std::endl;
+            ++binding;
         }
+
         vkUpdateDescriptorSets(device_, (uint32_t)writes.size(), writes.data(), 0, nullptr);
 
         if (useGpu) {
@@ -391,7 +506,8 @@ TaskResult VulkanExecutor::executeTask(const TaskData& task) {
             VkCommandBufferBeginInfo cbbi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
             vkBeginCommandBuffer(cmd, &cbbi);
             vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline);
-            vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipelineLayout, 0, 1, &descSet, 0, nullptr);
+            vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipelineLayout,
+                                   0, 1, &descSet, 0, nullptr);
 
             uint32_t gx = 1, gy = 1, gz = 1;
             if (!task.workgroupCount.empty()) {
@@ -399,6 +515,8 @@ TaskResult VulkanExecutor::executeTask(const TaskData& task) {
                 if (task.workgroupCount.size() >= 2) gy = (uint32_t)std::max(1, task.workgroupCount[1]);
                 if (task.workgroupCount.size() >= 3) gz = (uint32_t)std::max(1, task.workgroupCount[2]);
             }
+
+            std::cout << "Dispatching compute: " << gx << "x" << gy << "x" << gz << " workgroups" << std::endl;
             vkCmdDispatch(cmd, gx, gy, gz);
             vkEndCommandBuffer(cmd);
 
@@ -410,37 +528,43 @@ TaskResult VulkanExecutor::executeTask(const TaskData& task) {
 
             vkFreeCommandBuffers(device_, cmdPool_, 1, &cmd);
         } else {
+            std::cout << "Using CPU fallback (no GPU kernel provided)" << std::endl;
             // CPU fallback: copy inputs to outputs
             const size_t n = std::min(inputBuffers.size(), outputBuffers.size());
-            for (size_t i=0;i<n;++i) {
+            for (size_t i = 0; i < n; ++i) {
                 size_t copyBytes = (size_t)std::min<VkDeviceSize>(inputBuffers[i].size, outputBuffers[i].size);
                 std::memcpy(outputBuffers[i].mapped, inputBuffers[i].mapped, copyBytes);
                 if (outputBuffers[i].size > copyBytes) {
-                    std::memset(static_cast<char*>(outputBuffers[i].mapped)+copyBytes, 0, (size_t)(outputBuffers[i].size - copyBytes));
+                    std::memset(static_cast<char*>(outputBuffers[i].mapped) + copyBytes, 0,
+                               (size_t)(outputBuffers[i].size - copyBytes));
                 }
             }
-            for (size_t i=n;i<outputBuffers.size();++i) {
+            for (size_t i = n; i < outputBuffers.size(); ++i) {
                 std::memset(outputBuffers[i].mapped, 0, (size_t)outputBuffers[i].size);
             }
         }
 
-        // Readback
+        // Readback results
         if (multipleOutputs) {
             result.outputData.resize(outputBuffers.size());
-            for (size_t i=0;i<outputBuffers.size();++i) {
+            for (size_t i = 0; i < outputBuffers.size(); ++i) {
                 result.outputData[i].resize((size_t)outputBuffers[i].size);
                 std::memcpy(result.outputData[i].data(), outputBuffers[i].mapped, (size_t)outputBuffers[i].size);
+                std::cout << "Retrieved output " << i << ": " << result.outputData[i].size() << " bytes" << std::endl;
             }
             if (!result.outputData.empty()) result.legacyOutputData = result.outputData[0];
         } else {
             result.legacyOutputData.resize((size_t)outputBuffers[0].size);
             std::memcpy(result.legacyOutputData.data(), outputBuffers[0].mapped, (size_t)outputBuffers[0].size);
             result.outputData = { result.legacyOutputData };
+            std::cout << "Retrieved legacy output: " << result.legacyOutputData.size() << " bytes" << std::endl;
         }
 
         // Cleanup resources
         for (auto& b : inputBuffers) destroyBuffer(b);
         for (auto& b : outputBuffers) destroyBuffer(b);
+        if (hasUniforms) destroyBuffer(uniformBuffer);  // FIXED: Clean up uniform buffer
+
         if (pipeline) vkDestroyPipeline(device_, pipeline, nullptr);
         if (shaderModule) vkDestroyShaderModule(device_, shaderModule, nullptr);
         if (descPool) vkDestroyDescriptorPool(device_, descPool, nullptr);
@@ -450,13 +574,21 @@ TaskResult VulkanExecutor::executeTask(const TaskData& task) {
         auto t1 = std::chrono::high_resolution_clock::now();
         result.processingTime = std::chrono::duration<double, std::milli>(t1 - t0).count();
         result.success = true;
+
+        std::cout << "Task " << task.id << " completed successfully in "
+                  << result.processingTime << "ms" << std::endl;
         return result;
+
     } catch (const std::exception& e) {
+        std::cerr << "Task " << task.id << " failed: " << e.what() << std::endl;
+
+        // Cleanup on error
         if (pipeline) vkDestroyPipeline(device_, pipeline, nullptr);
         if (shaderModule) vkDestroyShaderModule(device_, shaderModule, nullptr);
         if (descPool) vkDestroyDescriptorPool(device_, descPool, nullptr);
         if (pipelineLayout) vkDestroyPipelineLayout(device_, pipelineLayout, nullptr);
         if (dsetLayout) vkDestroyDescriptorSetLayout(device_, dsetLayout, nullptr);
+
         result.success = false;
         result.errorMessage = e.what();
         return result;

@@ -1018,7 +1018,7 @@ async function executeWebGPUCompute(chunk) {
 
 
 // Basic WebGL compute support (simplified)
-
+// Basic WebGL compute support (task-agnostic, multi-output)
 async function executeWebGLCompute(chunk) {
   console.log(`[WebGL] Starting compute execution for ${chunk.chunkId || chunk.id}`);
 
@@ -1046,7 +1046,7 @@ async function executeWebGLCompute(chunk) {
       throw new Error('Failed to create WebGL2 context for compute');
     }
 
-    // Check if strategy provided WebGL-specific shaders
+    // Use strategy-provided shaders for WebGL
     if (chunk.webglVertexShader) {
       console.log(`[WebGL] Using strategy-provided WebGL shaders`);
       return await executeWebGLTransformFeedback(computeGL, chunk, t0);
@@ -1062,31 +1062,29 @@ async function executeWebGLCompute(chunk) {
   }
 }
 
-// WebGL Transform Feedback execution with strategy-provided shaders
+// WebGL Transform Feedback execution with strategy-provided shaders (multi-output)
 async function executeWebGLTransformFeedback(gl, chunk, t0) {
   console.log(`[WebGL] Executing transform feedback compute...`);
 
   // Use strategy-provided shaders
-  const vertexShaderSource = chunk.webglVertexShader;
+  const vertexShaderSource   = chunk.webglVertexShader;
   const fragmentShaderSource = chunk.webglFragmentShader || getDefaultFragmentShader();
-
   if (!vertexShaderSource) {
     throw new Error('No WebGL vertex shader provided by strategy');
   }
 
-  console.log(`[WebGL] Vertex shader preview:`, vertexShaderSource.substring(0, 200) + '...');
-
-  // Create and compile shaders
-  const vertexShader = compileShader(gl, gl.VERTEX_SHADER, vertexShaderSource);
+  // Compile + link
+  const vertexShader   = compileShader(gl, gl.VERTEX_SHADER,   vertexShaderSource);
   const fragmentShader = compileShader(gl, gl.FRAGMENT_SHADER, fragmentShaderSource);
-
-  // Create and link program
   const program = gl.createProgram();
   gl.attachShader(program, vertexShader);
   gl.attachShader(program, fragmentShader);
 
-  // Transform feedback varyings from strategy
+  // Configure transform feedback varyings (one per output)
   const varyings = chunk.webglVaryings || ['v_result'];
+  if ((chunk.outputs?.length || 0) !== varyings.length) {
+    throw new Error(`Outputs (${chunk.outputs?.length || 0}) must match webglVaryings (${varyings.length})`);
+  }
   gl.transformFeedbackVaryings(program, varyings, gl.SEPARATE_ATTRIBS);
   gl.linkProgram(program);
 
@@ -1094,154 +1092,152 @@ async function executeWebGLTransformFeedback(gl, chunk, t0) {
     const error = gl.getProgramInfoLog(program);
     throw new Error(`Program linking failed: ${error}`);
   }
-
   gl.useProgram(program);
 
-  // Set up input data as textures (strategy specifies texture-based input)
-  const { textureA, textureB } = setupMatrixTexturesFromChunk(gl, chunk);
+  // Set uniforms from metadata
+  const metadata = chunk.metadata || {};
+  setWebGLUniforms(gl, program, metadata);
 
-  // Set up vertex buffer with indices for transform feedback
-  const numElements = chunk.webglNumElements || (chunk.metadata?.block_size * chunk.metadata?.block_size) || 64;
-  const indices = new Float32Array(numElements);
-  for (let i = 0; i < numElements; i++) {
-    indices[i] = i;
+  // ---- Inputs (task-agnostic) ----
+  // Route inputs by spec (default: texture-based)
+  const resources = setupWebGLInputs(gl, program, chunk);
+
+  // If textures were created, bind them to texture units and set sampler uniforms u_input_0..N
+  if (resources.textures && resources.textures.length > 0) {
+    resources.textures.forEach((tex, i) => {
+      gl.activeTexture(gl.TEXTURE0 + i);
+      gl.bindTexture(gl.TEXTURE_2D, tex);
+      const loc = gl.getUniformLocation(program, `u_input_${i}`);
+      if (loc) gl.uniform1i(loc, i);
+    });
   }
+
+  // ---- Geometry / dispatch ----
+  // Number of logical "points" to process (prefer strategy hint, then matrix fallback, then bytes/4)
+  const outputs = chunk.outputs || [];
+  const fallbackElems =
+    (metadata.block_size && metadata.block_size * metadata.block_size) ||
+    Math.max(1, Math.floor((outputs[0]?.size || 4) / 4));
+  const numElements = chunk.webglNumElements ?? fallbackElems;
+
+  // Index stream (as before)
+  const indices = new Float32Array(numElements);
+  for (let i = 0; i < numElements; i++) indices[i] = i;
 
   const indexBuffer = gl.createBuffer();
   gl.bindBuffer(gl.ARRAY_BUFFER, indexBuffer);
   gl.bufferData(gl.ARRAY_BUFFER, indices, gl.STATIC_DRAW);
 
-  // Set up vertex attribute
   const a_index = gl.getAttribLocation(program, 'a_index');
   if (a_index !== -1) {
     gl.enableVertexAttribArray(a_index);
     gl.vertexAttribPointer(a_index, 1, gl.FLOAT, false, 0, 0);
   }
 
-  // Set uniforms from chunk metadata
-  const metadata = chunk.metadata || {};
-  setWebGLUniforms(gl, program, metadata);
+  console.log(`[WebGL DEBUG] Execution parameters:`, {
+    numElements,
+    outputs: outputs.map(o => o.size),
+    inputsLength: (chunk.inputs || []).length,
+    varyings
+  });
 
-  // Bind input textures
-  gl.activeTexture(gl.TEXTURE0);
-  gl.bindTexture(gl.TEXTURE_2D, textureA);
-  gl.activeTexture(gl.TEXTURE1);
-  gl.bindTexture(gl.TEXTURE_2D, textureB);
+  // ---- Transform Feedback output buffers (one per output) ----
+  const tf = gl.createTransformFeedback();
+  gl.bindTransformFeedback(gl.TRANSFORM_FEEDBACK, tf);
 
-  const u_input_0 = gl.getUniformLocation(program, 'u_input_0');
-  const u_input_1 = gl.getUniformLocation(program, 'u_input_1');
-  if (u_input_0) gl.uniform1i(u_input_0, 0);
-  if (u_input_1) gl.uniform1i(u_input_1, 1);
+  const tfBuffers = [];
+  const outArrays = [];
 
-  // Set up transform feedback buffer for output
-  const outputSize = chunk.outputs[0].size;
-  const outputBuffer = gl.createBuffer();
-  gl.bindBuffer(gl.TRANSFORM_FEEDBACK_BUFFER, outputBuffer);
-  gl.bufferData(gl.TRANSFORM_FEEDBACK_BUFFER, outputSize, gl.DYNAMIC_READ);
+  for (let i = 0; i < outputs.length; i++) {
+    const size = outputs[i].size;
+    const buf = gl.createBuffer();
+    gl.bindBuffer(gl.TRANSFORM_FEEDBACK_BUFFER, buf);
+    gl.bufferData(gl.TRANSFORM_FEEDBACK_BUFFER, size, gl.DYNAMIC_READ);
+    gl.bindBufferBase(gl.TRANSFORM_FEEDBACK_BUFFER, i, buf);
+    tfBuffers.push(buf);
+    outArrays.push(new Uint8Array(size));
+  }
 
-  // Set up transform feedback
-  const transformFeedback = gl.createTransformFeedback();
-  gl.bindTransformFeedback(gl.TRANSFORM_FEEDBACK, transformFeedback);
-  gl.bindBufferBase(gl.TRANSFORM_FEEDBACK_BUFFER, 0, outputBuffer);
-
-  // Execute transform feedback
+  // ---- Draw (points) with rasterizer discard ----
   gl.enable(gl.RASTERIZER_DISCARD);
   gl.beginTransformFeedback(gl.POINTS);
   gl.drawArrays(gl.POINTS, 0, numElements);
   gl.endTransformFeedback();
   gl.disable(gl.RASTERIZER_DISCARD);
 
-  // Read back results
-  const results = new ArrayBuffer(outputSize);
-  gl.bindBuffer(gl.TRANSFORM_FEEDBACK_BUFFER, outputBuffer);
-  gl.getBufferSubData(gl.TRANSFORM_FEEDBACK_BUFFER, 0, results);
+  /*
+  // Add fence synchronization before reading buffers
+   // Create a sync object to wait for GPU operations to complete
+  const sync = gl.fenceSync(gl.SYNC_GPU_COMMANDS_COMPLETE, 0);
 
-  // Convert to base64
-  const resultBase64 = Buffer.from(results).toString('base64');
+  // Flush commands to ensure the sync object is processed
+  gl.flush();
 
-  // Cleanup
-  gl.deleteTexture(textureA);
-  gl.deleteTexture(textureB);
+  // Wait for the GPU to complete all operations (with timeout)
+  const timeoutNs = 1000000000; // 1 second in nanoseconds
+  const result = gl.clientWaitSync(sync, gl.SYNC_FLUSH_COMMANDS_BIT, timeoutNs);
+
+  if (result === gl.TIMEOUT_EXPIRED) {
+    console.warn('[WebGL] Sync timeout - operations may not have completed');
+  } else if (result === gl.WAIT_FAILED) {
+    console.warn('[WebGL] Sync wait failed');
+  }
+
+  // Clean up the sync object
+  gl.deleteSync(sync);
+  */
+  // ---- CRITICAL FIX: Properly unbind transform feedback before reading ----
+  // First, unbind the transform feedback object
+  gl.bindTransformFeedback(gl.TRANSFORM_FEEDBACK, null);
+
+  // Then, explicitly unbind each buffer from its indexed transform feedback binding point
+  for (let i = 0; i < tfBuffers.length; i++) {
+    gl.bindBufferBase(gl.TRANSFORM_FEEDBACK_BUFFER, i, null);
+  }
+
+  // Ensure transform feedback buffer binding point is unbound
+  gl.bindBuffer(gl.TRANSFORM_FEEDBACK_BUFFER, null);
+
+  // ---- Read back results (now safe to bind to COPY_READ_BUFFER) ----
+  const results = [];
+  for (let i = 0; i < tfBuffers.length; i++) {
+    gl.bindBuffer(gl.COPY_READ_BUFFER, tfBuffers[i]);
+    gl.getBufferSubData(gl.COPY_READ_BUFFER, 0, outArrays[i]);
+    const base64 = btoa(String.fromCharCode(...outArrays[i]));
+    results.push(base64);
+  }
+
+  // Unbind the copy read buffer
+  gl.bindBuffer(gl.COPY_READ_BUFFER, null);
+
+  // ---- Cleanup ----
+  if (resources.textures) {
+    resources.textures.forEach(tex => gl.deleteTexture(tex));
+  }
+  if (resources.attributeBuffers) {
+    resources.attributeBuffers.forEach(({ buffer, location }) => {
+      try { if (location !== -1) gl.disableVertexAttribArray(location); } catch {}
+      gl.deleteBuffer(buffer);
+    });
+  }
+
   gl.deleteBuffer(indexBuffer);
-  gl.deleteBuffer(outputBuffer);
-  gl.deleteTransformFeedback(transformFeedback);
+  tfBuffers.forEach(b => gl.deleteBuffer(b));
+  gl.deleteTransformFeedback(tf);
   gl.deleteShader(vertexShader);
   gl.deleteShader(fragmentShader);
   gl.deleteProgram(program);
 
   const dt = performance.now() - t0;
-  console.log(`[WebGL] Transform feedback completed in ${dt.toFixed(0)}ms, ${results.byteLength} bytes`);
+  console.log(`[WebGL] Transform feedback completed in ${dt.toFixed(0)}ms, results: ${results.length}`);
 
   return {
-    result: resultBase64,
-    results: [resultBase64],
+    results,
+    result: results[0], // backward compatibility
     processingTime: dt
   };
 }
 
-// Fallback for WGSL chunks without WebGL shaders (basic conversion)
-async function executeWebGLWithWGSLFallback(gl, chunk, t0) {
-  console.warn(`[WebGL] WGSL fallback not fully implemented - WebGL requires GLSL shaders`);
-  throw new Error('WebGL execution requires WebGL-specific shaders from strategy. WGSL->GLSL conversion not implemented.');
-}
-
-// Helper: Set up matrix textures from chunk input data
-function setupMatrixTexturesFromChunk(gl, chunk) {
-  // Get input data from chunk
-  const inputs = chunk.inputs || [];
-  if (inputs.length < 2) {
-    throw new Error('Matrix computation requires 2 inputs (matrix A and B blocks)');
-  }
-
-  const blockAData = inputs[0].data; // base64
-  const blockBData = inputs[1].data; // base64
-
-  // Decode base64 to float arrays
-  const blockABytes = Uint8Array.from(atob(blockAData), c => c.charCodeAt(0));
-  const blockBBytes = Uint8Array.from(atob(blockBData), c => c.charCodeAt(0));
-
-  const blockAFloats = new Float32Array(blockABytes.buffer);
-  const blockBFloats = new Float32Array(blockBBytes.buffer);
-
-  // Get block size from metadata
-  const blockSize = chunk.metadata?.block_size || 4;
-
-  // Create textures for matrix blocks
-  const textureA = createFloatTexture(gl, blockAFloats, blockSize, blockSize);
-  const textureB = createFloatTexture(gl, blockBFloats, blockSize, blockSize);
-
-  return { textureA, textureB };
-}
-
-// Helper: Create float texture
-function createFloatTexture(gl, data, width, height) {
-  const texture = gl.createTexture();
-  gl.bindTexture(gl.TEXTURE_2D, texture);
-  gl.texImage2D(gl.TEXTURE_2D, 0, gl.R32F, width, height, 0, gl.RED, gl.FLOAT, data);
-  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
-  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
-  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
-  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
-  return texture;
-}
-
-// Helper: Set WebGL uniforms from metadata
-function setWebGLUniforms(gl, program, uniforms) {
-  Object.entries(uniforms).forEach(([name, value]) => {
-    const location = gl.getUniformLocation(program, `u_${name}`);
-    if (location === null) return;
-
-    if (typeof value === 'number') {
-      if (Number.isInteger(value)) {
-        gl.uniform1i(location, value);
-      } else {
-        gl.uniform1f(location, value);
-      }
-    }
-  });
-}
-
-// Helper: Compile shader with better error reporting
 function compileShader(gl, type, source) {
   const shader = gl.createShader(type);
   gl.shaderSource(shader, source);
@@ -1258,17 +1254,119 @@ function compileShader(gl, type, source) {
   return shader;
 }
 
-// Helper: Default fragment shader
-function getDefaultFragmentShader() {
-  return `#version 300 es
-    precision highp float;
-    out vec4 fragColor;
+function setWebGLUniforms(gl, program, uniforms) {
+  Object.entries(uniforms).forEach(([name, value]) => {
+    const location = gl.getUniformLocation(program, `u_${name}`);
+    if (location === null) return;
 
-    void main() {
-      fragColor = vec4(1.0);
+    if (typeof value === 'number') {
+      if (Number.isInteger(value)) {
+        gl.uniform1i(location, value);
+      } else {
+        gl.uniform1f(location, value);
+      }
     }
-  `;
+  });
 }
+// Fallback for WGSL chunks without WebGL shaders (basic conversion)
+async function executeWebGLWithWGSLFallback(gl, chunk, t0) {
+  console.warn(`[WebGL] WGSL fallback not fully implemented - WebGL requires GLSL shaders`);
+  throw new Error('WebGL execution requires WebGL-specific shaders from strategy. WGSL->GLSL conversion not implemented.');
+}
+
+/**
+ * Task-agnostic WebGL input setup.
+ * Supports:
+ *  - spec.type === 'texture'  (default): uploads each input as an R32F texture, sets u_input_i samplers
+ *  - spec.type === 'attribute': uploads Float32 buffers and enables attributes as specified
+ *
+ * Strategy can pass:
+ *   chunk.webglInputSpec = {
+ *     type: 'texture' | 'attribute',
+ *     internalFormat: 'R32F',   // optional, defaults to R32F
+ *     textureShape: [w, h],     // optional; if omitted, uses metadata.block_size for square
+ *     attributes: [             // for 'attribute' type
+ *       { name: 'a_input0', size: 1 }, // gl.vertexAttribPointer(size, FLOAT)
+ *       ...
+ *     ]
+ *   }
+ */
+function setupWebGLInputs(gl, program, chunk) {
+  const spec = chunk.webglInputSpec || { type: 'texture', internalFormat: 'R32F' };
+  const inputs = chunk.inputs || [];
+  const resources = { textures: null, attributeBuffers: null };
+
+  if (spec.type === 'texture') {
+    const textures = [];
+    for (let i = 0; i < inputs.length; i++) {
+      const input = inputs[i];
+      if (!input?.data) continue;
+
+      const bytes  = Uint8Array.from(atob(input.data), c => c.charCodeAt(0));
+      // If this is float data, interpret as Float32Array; you may extend to other formats as needed
+      const floats = new Float32Array(bytes.buffer, bytes.byteOffset, Math.floor(bytes.byteLength / 4));
+
+      // Choose width/height: from spec.textureShape, metadata.block_size, or a square fallback
+      let width, height;
+
+      console.log(`[WebGL INPUT DEBUG] Input ${i} processing:`, {
+        hasTextureShape: Array.isArray(spec.textureShape),
+        textureShapeLength: spec.textureShape?.length,
+        hasBlockSize: !!chunk.metadata?.block_size,
+        blockSize: chunk.metadata?.block_size,
+        floatsLength: floats.length
+      });
+
+      if (Array.isArray(spec.textureShape) && spec.textureShape.length === 2) {
+        [width, height] = spec.textureShape;
+      } else if (chunk.metadata?.block_size) {
+        width = height = chunk.metadata.block_size;
+      } else {
+        const n = Math.floor(Math.sqrt(floats.length));
+        width = height = Math.max(1, n);
+      }
+
+      const tex = gl.createTexture();
+      gl.bindTexture(gl.TEXTURE_2D, tex);
+      gl.texImage2D(gl.TEXTURE_2D, 0, gl.R32F, width, height, 0, gl.RED, gl.FLOAT, floats);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+      textures.push(tex);
+    }
+    resources.textures = textures;
+  } else if (spec.type === 'attribute') {
+    // Map each declared attribute to a corresponding input[i]
+    const attributeBuffers = [];
+    const attributes = spec.attributes || [];
+    for (let i = 0; i < attributes.length; i++) {
+      const attr = attributes[i];
+      const input = inputs[i];
+      if (!attr?.name || !input?.data) continue;
+
+      const loc = gl.getAttribLocation(program, attr.name);
+      if (loc === -1) continue;
+
+      const bytes  = Uint8Array.from(atob(input.data), c => c.charCodeAt(0));
+      const floats = new Float32Array(bytes.buffer, bytes.byteOffset, Math.floor(bytes.byteLength / 4));
+
+      const buf = gl.createBuffer();
+      gl.bindBuffer(gl.ARRAY_BUFFER, buf);
+      gl.bufferData(gl.ARRAY_BUFFER, floats, gl.STATIC_DRAW);
+
+      const comps = Math.max(1, Math.min(4, attr.size || 1));
+      gl.enableVertexAttribArray(loc);
+      gl.vertexAttribPointer(loc, comps, gl.FLOAT, false, 0, 0);
+
+      attributeBuffers.push({ buffer: buf, location: loc });
+    }
+    resources.attributeBuffers = attributeBuffers;
+  }
+
+  return resources;
+}
+
 function bindWorkloadListener() {
   if (workloadListenerBound) return;
   workloadListenerBound = true;

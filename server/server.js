@@ -1508,7 +1508,21 @@ function handleClientDisconnect(clientId) {
   matrixState.clients.delete(clientId);
   matrixState.stats.activeClients = matrixState.clients.size;
 }
+function ensureProcessingTimes(workload) {
+  if (!workload.processingTimes) {
+    workload.processingTimes = [];
+  }
+  return workload;
+}
 
+// Helper function to safely add processing time
+function addProcessingTime(workload, timeData) {
+  if (!workload) return;
+  ensureProcessingTimes(workload);
+  workload.processingTimes.push(timeData);
+}
+
+// Fixed checkTaskTimeouts function
 function checkTaskTimeouts() {
   const now = Date.now();
 
@@ -1531,19 +1545,20 @@ function checkTaskTimeouts() {
         cd.activeAssignments.delete(timedOutClient);
         cd.assignedTo = null;
         cd.assignedAt = null;
+
+        // FIXED: Use helper function to safely add processing time
         const parent = customWorkloads.get(cd.parentId);
-        if (parent) {
-          parent.processingTimes.push({
-            chunkId: cd.chunkId,
-            error: 'timeout',
-            assignedTo: timedOutClient,
-            timedOutAt: now
-          });
-        }
+        addProcessingTime(parent, {
+          chunkId: cd.chunkId,
+          error: 'timeout',
+          assignedTo: timedOutClient,
+          timedOutAt: now
+        });
       }
     });
   });
 }
+
 
 setInterval(() => {
   checkTaskTimeouts();
@@ -1899,7 +1914,7 @@ io.on('connection', socket => {
       buffers: checksumData.buffers
     };
 
-    parent.processingTimes.push({ clientId: socket.id, chunkId, timeMs: processingTime });
+    addProcessingTime(parent, { clientId: socket.id, chunkId, timeMs: processingTime });
 
     const verifyRes = verifyAndRecordChunkSubmission(parent, store, cd, submission, chunkOrderIndex, ADMIN_K_PARAMETER);
 
@@ -2035,8 +2050,8 @@ io.on('connection', socket => {
       buffers: checksumData.buffers
     };
 
-    parent.processingTimes.push({ clientId: submission.clientId, chunkId, timeMs: processingTime });
-
+    //parent.processingTimes.push();
+    addProcessingTime(parent, { clientId: submission.clientId, chunkId, timeMs: processingTime })
     const verifyRes = verifyAndRecordChunkSubmission(parent, store, cd, submission, cd.chunkOrderIndex, ADMIN_K_PARAMETER);
 
     if (verifyRes.verified) {
@@ -2109,10 +2124,17 @@ io.on('connection', socket => {
       if (cd) {
         cd.activeAssignments.delete(socket.id);
         const parent = customWorkloads.get(parentId);
-        if (parent) {
-          parent.processingTimes.push({ chunkId, clientId: socket.id, error: message });
-          saveCustomWorkloads(); saveCustomWorkloadChunks(); broadcastCustomWorkloadList();
-        }
+
+        // FIXED: Use helper function to safely add processing time
+        addProcessingTime(parent, {
+          chunkId,
+          clientId: socket.id,
+          error: message
+        });
+
+        saveCustomWorkloads();
+        saveCustomWorkloadChunks();
+        broadcastCustomWorkloadList();
       }
     }
   });

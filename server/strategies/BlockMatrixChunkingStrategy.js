@@ -156,6 +156,7 @@ export default class BlockMatrixChunkingStrategy extends BaseChunkingStrategy {
       assemblyMetadata: { outputBlockRow: i, outputBlockCol: j, kIndex: k }
     };
     console.log(`[STRATEGY DEBUG] Base descriptor created, framework: ${framework}`);
+
     switch (framework) {
       case 'webgpu':
         return {
@@ -165,7 +166,6 @@ export default class BlockMatrixChunkingStrategy extends BaseChunkingStrategy {
           workgroupCount: [Math.ceil(blockSize / 16), Math.ceil(blockSize / 16), 1]
         };
 
-
       case 'webgl':
         console.log(`[STRATEGY DEBUG] Creating WebGL descriptor`);
         const webglVertexShader = this.getWebGLVertexShader();
@@ -173,10 +173,6 @@ export default class BlockMatrixChunkingStrategy extends BaseChunkingStrategy {
         console.log(`[STRATEGY DEBUG] Retrieved WebGL shaders:`);
         console.log(`[STRATEGY DEBUG] - Vertex shader length:`, webglVertexShader ? webglVertexShader.length : 'undefined');
         console.log(`[STRATEGY DEBUG] - Fragment shader length:`, webglFragmentShader ? webglFragmentShader.length : 'undefined');
-        console.log(`[STRATEGY DEBUG] Creating WebGL descriptor for ${framework}:`);
-        console.log(`[STRATEGY DEBUG] Vertex shader length: ${webglVertexShader ? webglVertexShader.length : 'undefined'}`);
-        console.log(`[STRATEGY DEBUG] Fragment shader length: ${webglFragmentShader ? webglFragmentShader.length : 'undefined'}`);
-        console.log(`[STRATEGY DEBUG] Vertex shader preview: ${webglVertexShader ? webglVertexShader.substring(0, 100) + '...' : 'undefined'}`);
 
         const descriptor = {
           ...baseDescriptor,
@@ -195,8 +191,17 @@ export default class BlockMatrixChunkingStrategy extends BaseChunkingStrategy {
 
         console.log(`[STRATEGY DEBUG] Final descriptor keys:`, Object.keys(descriptor));
         console.log(`[STRATEGY DEBUG] Has webglVertexShader:`, !!descriptor.webglVertexShader);
-
         return descriptor;
+
+      case 'vulkan':  // NEW: Add Vulkan support
+        console.log(`[STRATEGY DEBUG] Creating Vulkan descriptor`);
+        return {
+          ...baseDescriptor,
+          kernel: this.getVulkanShader(),
+          entry: 'main',
+          workgroupCount: [Math.ceil(blockSize / 16), Math.ceil(blockSize / 16), 1],
+          shaderType: 'glsl'  // Indicate this is GLSL for Vulkan
+        };
 
       case 'cuda':
         return {
@@ -218,7 +223,6 @@ export default class BlockMatrixChunkingStrategy extends BaseChunkingStrategy {
         throw new Error(`Unsupported framework: ${framework}`);
     }
   }
-
   // WebGPU shader (existing)
   getWebGPUShader() {
     return `
@@ -254,48 +258,32 @@ export default class BlockMatrixChunkingStrategy extends BaseChunkingStrategy {
   getWebGLVertexShader() {
     return `#version 300 es
       precision highp float;
+      precision highp sampler2D;
 
       in float a_index;
-
       uniform int u_block_size;
-      uniform int u_matrix_size;
-      uniform sampler2D u_input_0; // matrix_a_block as texture
-      uniform sampler2D u_input_1; // matrix_b_block as texture
+      uniform sampler2D u_input_0; // A block, size = block_size x block_size
+      uniform sampler2D u_input_1; // B block, size = block_size x block_size
 
       out float v_result;
 
       void main() {
-        int index = int(a_index);
-        int block_size = u_block_size;
-
-        int local_row = index / block_size;
-        int local_col = index % block_size;
-
-        if (local_row >= block_size || local_col >= block_size) {
-          v_result = 0.0;
-          return;
-        }
+        int idx = int(a_index);
+        int n = u_block_size;
+        int r = idx / n;
+        int c = idx % n;
 
         float sum = 0.0;
-        for (int k = 0; k < block_size; k++) {
-          // Sample from block textures
-          float a_coord_x = (float(k) + 0.5) / float(block_size);
-          float a_coord_y = (float(local_row) + 0.5) / float(block_size);
-          float a_val = texture(u_input_0, vec2(a_coord_x, a_coord_y)).r;
-
-          float b_coord_x = (float(local_col) + 0.5) / float(block_size);
-          float b_coord_y = (float(k) + 0.5) / float(block_size);
-          float b_val = texture(u_input_1, vec2(b_coord_x, b_coord_y)).r;
-
+        for (int k = 0; k < n; ++k) {
+          float a_val = texelFetch(u_input_0, ivec2(k, r), 0).r; // A[r,k]
+          float b_val = texelFetch(u_input_1, ivec2(c, k), 0).r; // B[k,c]
           sum += a_val * b_val;
         }
-
         v_result = sum;
-
-        // Required vertex position (not used)
-        gl_Position = vec4(0.0);
+        gl_Position = vec4(0.0);   // rasterizer discard will be enabled
         gl_PointSize = 1.0;
       }
+
     `;
   }
 
@@ -339,7 +327,7 @@ export default class BlockMatrixChunkingStrategy extends BaseChunkingStrategy {
   // NEW: OpenCL kernel
   getOpenCLKernel() {
     return `
-      __kernel void block_matrix_multiply(
+      __kernel void main(
           __global const float* block_a,
           __global const float* block_b,
           __global float* partial_result,
@@ -360,7 +348,45 @@ export default class BlockMatrixChunkingStrategy extends BaseChunkingStrategy {
       }
     `;
   }
+      getVulkanShader() {
+      return `#version 450
+    layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
 
+    layout(set = 0, binding = 0) uniform BlockParams {
+      uint block_size;
+      uint matrix_size;
+    } params;
+
+    layout(set = 0, binding = 1) readonly buffer BlockA {
+      float block_a[];
+    };
+
+    layout(set = 0, binding = 2) readonly buffer BlockB {
+      float block_b[];
+    };
+
+    layout(set = 0, binding = 3) writeonly buffer PartialResult {
+      float partial_result[];
+    };
+
+    void main() {
+      uint row = gl_GlobalInvocationID.x;
+      uint col = gl_GlobalInvocationID.y;
+
+      if (row >= params.block_size || col >= params.block_size) {
+        return;
+      }
+
+      float sum = 0.0;
+      for (uint k = 0; k < params.block_size; k++) {
+        float a_val = block_a[row * params.block_size + k];
+        float b_val = block_b[k * params.block_size + col];
+        sum = sum + a_val * b_val;
+      }
+
+      partial_result[row * params.block_size + col] = sum;
+    }`;
+    }
   // Existing helper methods remain unchanged
   async readBlockFromHandle(fileHandle, matrixType, blockCoords, blockSize, matrixSize) {
     const floatSize = 4;
@@ -430,3 +456,4 @@ export default class BlockMatrixChunkingStrategy extends BaseChunkingStrategy {
     return { valid: true };
   }
 }
+

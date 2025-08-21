@@ -33,6 +33,8 @@ struct TaskData {
 
     json compilationOptions;
     json chunkUniforms;
+    json metadata;  // ADD: Metadata for uniforms/parameters from server
+
     bool isChunk = false;
     std::string chunkId;
     int chunkOrderIndex = -1;
@@ -116,7 +118,7 @@ public:
 
 /*
 cmake_minimum_required(VERSION 3.18)
-project(MultiFrameworkClient LANGUAGES CXX CUDA)
+project(MultiFrameworkClient LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 
@@ -126,45 +128,119 @@ find_package(OpenSSL REQUIRED)
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(JSONCPP jsoncpp)
 
-# CUDA
-find_package(CUDAToolkit REQUIRED)
-enable_language(CUDA)
+# Vulkan
+find_package(Vulkan REQUIRED)
 
-# OpenCL
-find_package(OpenCL REQUIRED)
+# CUDA (optional)
+find_package(CUDAToolkit QUIET)
+if(CUDAToolkit_FOUND)
+    enable_language(CUDA)
+    add_compile_definitions(HAVE_CUDA)
+endif()
+
+# OpenCL (optional)
+find_package(OpenCL QUIET)
+if(OpenCL_FOUND)
+    add_compile_definitions(HAVE_OPENCL)
+endif()
+
+# shaderc for Vulkan GLSL compilation
+find_package(PkgConfig REQUIRED)
+pkg_check_modules(SHADERC shaderc)
+if(SHADERC_FOUND)
+    add_compile_definitions(HAVE_SHADERC)
+endif()
 
 # Include directories
 include_directories(${CMAKE_CURRENT_SOURCE_DIR})
 
-# Create executables for each framework
-add_executable(cuda_client
+# Create Vulkan client
+add_executable(vulkan_client
     main.cpp
     common/framework_client.cpp
     common/websocket_client.cpp
-    cuda/cuda_executor.cpp
+    vulkan/vulkan_executor.cpp
 )
 
-target_link_libraries(cuda_client
+target_link_libraries(vulkan_client
     ${Boost_LIBRARIES}
     OpenSSL::SSL
     OpenSSL::Crypto
-    CUDA::cuda_driver
-    CUDA::nvrtc
+    Vulkan::Vulkan
+    ${SHADERC_LIBRARIES}
     pthread
 )
 
-add_executable(opencl_client
-    main.cpp
-    common/framework_client.cpp
-    common/websocket_client.cpp
-    opencl/opencl_executor.cpp
-)
+target_include_directories(vulkan_client PRIVATE ${SHADERC_INCLUDE_DIRS})
+target_compile_options(vulkan_client PRIVATE ${SHADERC_CFLAGS_OTHER})
 
-target_link_libraries(opencl_client
-    ${Boost_LIBRARIES}
-    OpenSSL::SSL
-    OpenSSL::Crypto
-    OpenCL::OpenCL
-    pthread
-)
+# CUDA client (if available)
+if(CUDAToolkit_FOUND)
+    add_executable(cuda_client
+        main.cpp
+        common/framework_client.cpp
+        common/websocket_client.cpp
+        cuda/cuda_executor.cpp
+    )
+
+    target_link_libraries(cuda_client
+        ${Boost_LIBRARIES}
+        OpenSSL::SSL
+        OpenSSL::Crypto
+        CUDA::cuda_driver
+        CUDA::nvrtc
+        pthread
+    )
+
+    target_compile_definitions(cuda_client PRIVATE HAVE_CUDA CLIENT_CUDA)
+endif()
+
+# OpenCL client (if available)
+if(OpenCL_FOUND)
+    add_executable(opencl_client
+        main.cpp
+        common/framework_client.cpp
+        common/websocket_client.cpp
+        opencl/opencl_executor.cpp
+    )
+
+    target_link_libraries(opencl_client
+        ${Boost_LIBRARIES}
+        OpenSSL::SSL
+        OpenSSL::Crypto
+        OpenCL::OpenCL
+        pthread
+    )
+
+    target_compile_definitions(opencl_client PRIVATE HAVE_OPENCL CLIENT_OPENCL)
+endif()
+
+# Universal client (if all frameworks available)
+if(CUDAToolkit_FOUND AND OpenCL_FOUND AND SHADERC_FOUND)
+    add_executable(universal_client
+        main.cpp
+        common/framework_client.cpp
+        common/websocket_client.cpp
+        vulkan/vulkan_executor.cpp
+        cuda/cuda_executor.cpp
+        opencl/opencl_executor.cpp
+    )
+
+    target_link_libraries(universal_client
+        ${Boost_LIBRARIES}
+        OpenSSL::SSL
+        OpenSSL::Crypto
+        Vulkan::Vulkan
+        ${SHADERC_LIBRARIES}
+        CUDA::cuda_driver
+        CUDA::nvrtc
+        OpenCL::OpenCL
+        pthread
+    )
+
+    target_include_directories(universal_client PRIVATE ${SHADERC_INCLUDE_DIRS})
+    target_compile_options(universal_client PRIVATE ${SHADERC_CFLAGS_OTHER})
+    target_compile_definitions(universal_client PRIVATE
+        HAVE_VULKAN HAVE_CUDA HAVE_OPENCL HAVE_SHADERC CLIENT_UNIVERSAL)
+endif()
 */

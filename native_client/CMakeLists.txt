@@ -301,7 +301,7 @@ if(HAVE_VULKAN)
 
     target_link_libraries(vulkan_client PRIVATE ${VULKAN_LIBS})
 
-    target_compile_definitions(vulkan_client PRIVATE HAVE_VULKAN=1  CLIENT_VULKAN=1)
+    target_compile_definitions(vulkan_client PRIVATE HAVE_VULKAN=1  CLIENT_VULKAN=1 HAVE_SHADERC=1)
 
     set_target_properties(vulkan_client PROPERTIES
         RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
@@ -347,7 +347,7 @@ if(HAVE_CUDA OR HAVE_OPENCL OR HAVE_VULKAN)
     )
 
     target_link_libraries(universal_client PRIVATE ${UNIVERSAL_LIBS})
-    target_compile_definitions(universal_client PRIVATE ${UNIVERSAL_DEFS}   CLIENT_UNIVERSAL=1)
+    target_compile_definitions(universal_client PRIVATE ${UNIVERSAL_DEFS}   CLIENT_UNIVERSAL=1 HAVE_SHADERC=1)
 
     set_target_properties(universal_client PROPERTIES
         RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
