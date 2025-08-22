@@ -1,14 +1,14 @@
+// cuda_executor.hpp
 #pragma once
 #include "../common/framework_client.hpp"
-#include <cuda_runtime.h>
+#ifdef HAVE_CUDA
 #include <cuda.h>
 #include <nvrtc.h>
 #include <vector>
 #include <memory>
 #include <map>
 #include <string>
-
-
+#include <cstdint>
 
 class CudaExecutor : public IFrameworkExecutor {
 public:
@@ -16,7 +16,6 @@ public:
     ~CudaExecutor() override;
 
     bool initialize(const json& config = {}) override;
-    // Note: cleanup() no longer destroys the CUDA context; it clears caches only.
     void cleanup() override;
 
     TaskResult executeTask(const TaskData& task) override;
@@ -24,19 +23,26 @@ public:
     std::string getFrameworkName() const override { return "cuda"; }
     json getCapabilities() const override;
 
-    // --- Public types so helpers in .cpp can use them safely ---
+    // Scalar kinds we support for uniforms (kernel params)
     enum class UniformType {
         INT32,
         UINT32,
-        FLOAT
+        FLOAT32,
+        INT64,
+        UINT64,
+        FLOAT64
     };
 
     struct UniformValue {
         std::string name;
         UniformType type;
-        int32_t  intValue   = 0;
-        uint32_t uintValue  = 0;
-        float    floatValue = 0.0f;
+        // store as separate fields
+        int32_t   i32  = 0;
+        uint32_t  u32  = 0;
+        float     f32  = 0.0f;
+        int64_t   i64  = 0;
+        uint64_t  u64  = 0;
+        double    f64  = 0.0;
     };
 
 private:
@@ -44,7 +50,7 @@ private:
     CUcontext context = nullptr;
     bool initialized = false;
 
-    // Basic device info (queried via Driver API)
+    // Basic device info (Driver API)
     std::string deviceName;
     int computeMajor = 0;
     int computeMinor = 0;
@@ -68,22 +74,24 @@ private:
     bool ensureDriverLoaded();
     bool ensureContextCurrent();
 
-    // Build a cache key from source+entry
     static std::string makeCacheKey(const std::string& source, const std::string& entry);
 
-    // NVRTC compile -> PTX -> module+function
     bool compileKernel(const std::string& source,
                        const std::string& entryPoint,
                        const json& compileOpts,
                        CompiledKernel& result);
 
-    // Task-agnostic metadata processing (uniforms)
-    bool processMetadataUniforms(const TaskData& task, std::vector<UniformValue>& uniforms);
+    // Kernel-agnostic uniform collection from metadata/schema
+    bool buildUniformList(const TaskData& task, std::vector<UniformValue>& uniforms);
 
-    // Two-pass, reallocation-safe: reserves storage before taking addresses
+    // Reallocation-safe: reserves storage and then takes addresses
     void addUniformsToKernelArgs(const std::vector<UniformValue>& uniforms,
                                  std::vector<void*>& kernelArgs,
-                                 std::vector<int32_t>& intStorage,
-                                 std::vector<uint32_t>& uintStorage,
-                                 std::vector<float>& floatStorage);
+                                 std::vector<int32_t>&  i32Store,
+                                 std::vector<uint32_t>& u32Store,
+                                 std::vector<float>&    f32Store,
+                                 std::vector<int64_t>&  i64Store,
+                                 std::vector<uint64_t>& u64Store,
+                                 std::vector<double>&   f64Store);
 };
+#endif
