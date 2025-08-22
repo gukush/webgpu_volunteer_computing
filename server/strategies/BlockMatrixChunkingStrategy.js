@@ -474,5 +474,112 @@ export default class BlockMatrixChunkingStrategy extends BaseChunkingStrategy {
 
     return { valid: true };
   }
+  static buildChunks({ A, B, N, blockSize }) {
+    if (!(A instanceof Float32Array) || !(B instanceof Float32Array)) {
+      throw new Error("A and B must be Float32Array");
+    }
+    if (A.length !== N * N || B.length !== N * N) {
+      throw new Error("A and B must be N*N in length");
+    }
+    if (N % blockSize !== 0) {
+      throw new Error("N must be divisible by blockSize");
+    }
+
+    const tiles = N / blockSize;
+    const kernelSrc = this.getCUDAKernel();
+    const entry = "block_matrix_multiply";
+    const outBytes = blockSize * blockSize * 4; // float32
+
+    const chunks = [];
+    let chunkCounter = 0;
+
+    // helper: copy a tile (r0..r0+bs-1, c0..c0+bs-1) into a compact Float32Array
+    const sliceTile = (src, r0, c0) => {
+      const bs = blockSize;
+      const tile = new Float32Array(bs * bs);
+      for (let r = 0; r < bs; r++) {
+        const srcOff = (r0 + r) * N + c0;
+        tile.set(src.subarray(srcOff, srcOff + bs), r * bs);
+      }
+      return tile;
+    };
+
+    // Produce chunks for every (i,j,k)
+    for (let bi = 0; bi < tiles; bi++) {
+      for (let bj = 0; bj < tiles; bj++) {
+        for (let bk = 0; bk < tiles; bk++) {
+          // Tiles: A(i,k) and B(k,j)
+          const aTile = sliceTile(A, bi * blockSize, bk * blockSize);
+          const bTile = sliceTile(B, bk * blockSize, bj * blockSize);
+
+          // Pack as bytes for transport (executors receive raw bytes)
+          const aBytes = new Uint8Array(aTile.buffer.slice(0)); // copy
+          const bBytes = new Uint8Array(bTile.buffer.slice(0)); // copy
+
+          // ID: block-i-j-kk (k-index tagged)
+          const chunkId = `block-${bi}-${bj}-k${bk}`;
+
+          // Metadata: declare uniforms explicitly (order + types), plus launch dims.
+          // - CUDA uses blockDim/gridDim
+          // - OpenCL/WebGPU can use workgroupCount = [blockSize, blockSize, 1]
+          const metadata = {
+            strategy: "block_matrix",
+            // Explicit ABI for uniforms (no special-casing needed in executors)
+            schema: {
+              uniforms: [
+                { name: "block_size",  type: "int32" },
+                { name: "matrix_size", type: "int32" }
+              ]
+            },
+            // Values for the uniforms declared above:
+            block_size: blockSize,
+            matrix_size: N,
+
+            // Launch hints:
+            blockDim: [blockSize, blockSize, 1],
+            gridDim:  [1, 1, 1],
+
+            // For OpenCL/WebGPU-style executors that use "global size":
+            workgroupCount: [blockSize, blockSize, 1],
+
+            // Optional descriptive fields (ignored by executors but helpful upstream)
+            tile: { row: bi, col: bj, k: bk, size: blockSize }
+          };
+
+          // Chunk payload
+          const chunk = {
+            id: chunkId,
+
+            // Kernel source & entry symbol:
+            kernel: kernelSrc,
+            entry,
+
+            // Multi-input & multi-output model:
+            inputs: [aBytes, bBytes],
+            outputs: [],                // not used; we specify sizes instead
+            outputSizes: [outBytes],    // one output buffer (partial C tile) in bytes
+
+            // Executor-independent metadata:
+            metadata
+          };
+
+          chunks.push(chunk);
+          chunkCounter++;
+        }
+      }
+    }
+
+    return { chunks, tiles, chunkCount: chunkCounter, blockSize, N };
+  }
+
+  // Convenience: build from JS arrays
+  static buildFromArrays({ A, B, N, blockSize }) {
+    return this.buildChunks({
+      A: A instanceof Float32Array ? A : new Float32Array(A),
+      B: B instanceof Float32Array ? B : new Float32Array(B),
+      N,
+      blockSize
+    });
+  }
 }
 
