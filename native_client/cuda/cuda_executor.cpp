@@ -4,7 +4,7 @@
 #include <chrono>
 #include <algorithm>
 #include <sstream>
-#include <iomanip>
+#include <set>
 
 // ================= Error helpers =================
 void CudaExecutor::logCuError(const char* where, CUresult r) {
@@ -31,28 +31,54 @@ bool CudaExecutor::nvrtcCheck(nvrtcResult r, const char* where, const std::strin
 }
 
 // ================= Small helpers =================
-static inline int jsonToInt(const json& j, int def = 0) {
-    if (j.is_number_integer())  return static_cast<int>(j.get<int64_t>());
-    if (j.is_number_unsigned()) return static_cast<int>(j.get<uint64_t>());
-    return def;
-}
-static inline unsigned jsonToUnsigned(const json& j, unsigned def = 0) {
-    if (j.is_number_unsigned()) return static_cast<unsigned>(j.get<uint64_t>());
-    if (j.is_number_integer())  return static_cast<unsigned>(j.get<int64_t>());
-    return def;
-}
-static inline float jsonToFloat(const json& j, float def = 0.f) {
-    if (j.is_number_float())   return static_cast<float>(j.get<double>());
-    if (j.is_number_integer()) return static_cast<float>(j.get<int64_t>());
-    return def;
-}
 static inline std::string getUniformValueStr(const CudaExecutor::UniformValue& uv) {
+    using UT = CudaExecutor::UniformType;
     switch (uv.type) {
-        case CudaExecutor::UniformType::FLOAT:  return std::to_string(uv.floatValue);
-        case CudaExecutor::UniformType::UINT32: return std::to_string(uv.uintValue);
-        case CudaExecutor::UniformType::INT32:  return std::to_string(uv.intValue);
+        case UT::FLOAT32: return std::to_string(uv.f32);
+        case UT::FLOAT64: return std::to_string(uv.f64);
+        case UT::UINT32:  return std::to_string(uv.u32);
+        case UT::UINT64:  return std::to_string(uv.u64);
+        case UT::INT32:   return std::to_string(uv.i32);
+        case UT::INT64:   return std::to_string(uv.i64);
     }
     return "?";
+}
+static inline CudaExecutor::UniformType inferTypeFromJson(const json& v) {
+    using UT = CudaExecutor::UniformType;
+    if (v.is_number_float()) return UT::FLOAT32; // default f32 unless schema says f64
+    if (v.is_number_unsigned()) {
+        uint64_t u = v.get<uint64_t>();
+        return (u <= 0xFFFFFFFFULL) ? UT::UINT32 : UT::UINT64;
+    }
+    if (v.is_number_integer()) {
+        int64_t i = v.get<int64_t>();
+        return (i >= INT32_MIN && i <= INT32_MAX) ? UT::INT32 : UT::INT64;
+    }
+    // default to int32 if not numeric (shouldn't happen, caller filters)
+    return UT::INT32;
+}
+static inline bool isLikelyNonUniformKey(const std::string& k) {
+    static const std::set<std::string> skip = {
+        "blockDim","gridDim","workgroupCount",
+        "inputs","outputs","outputSizes","outputSize",
+        "kernel","wgsl","entry","webglShaderType","webglVertexShader","webglFragmentShader",
+        "webglVaryings","webglNumElements","webglInputSpec",
+        "globalWorkSize","localWorkSize",
+        "openclKernel","vulkanShader","computeShader","cudaKernel",
+        "chunkingStrategy","assemblyStrategy","schema"
+    };
+    return skip.count(k) > 0;
+}
+static inline CudaExecutor::UniformType parseTypeString(const std::string& s) {
+    using UT = CudaExecutor::UniformType;
+    if (s == "int32"  || s == "i32") return UT::INT32;
+    if (s == "uint32" || s == "u32") return UT::UINT32;
+    if (s == "float32"|| s == "f32") return UT::FLOAT32;
+    if (s == "int64"  || s == "i64") return UT::INT64;
+    if (s == "uint64" || s == "u64") return UT::UINT64;
+    if (s == "float64"|| s == "f64" || s == "double") return UT::FLOAT64;
+    // default
+    return UT::INT32;
 }
 
 std::string CudaExecutor::makeCacheKey(const std::string& source, const std::string& entry) {
@@ -68,15 +94,10 @@ std::string CudaExecutor::makeCacheKey(const std::string& source, const std::str
 CudaExecutor::CudaExecutor(int devId) : deviceId(devId) {}
 
 CudaExecutor::~CudaExecutor() {
-    // Unload cached modules
     for (auto& kv : kernelCache) {
-        if (kv.second.module) {
-            cuModuleUnload(kv.second.module);
-        }
+        if (kv.second.module) cuModuleUnload(kv.second.module);
     }
     kernelCache.clear();
-
-    // Destroy context on shutdown
     if (context) {
         cuCtxDestroy(context);
         context = nullptr;
@@ -111,7 +132,6 @@ bool CudaExecutor::initialize(const json& /*config*/) {
     CUdevice device;
     if (!cuCheck(cuDeviceGet(&device, deviceId), "cuDeviceGet")) return false;
 
-    // Query device info via Driver API
     char nameBuf[256] = {0};
     cuDeviceGetName(nameBuf, sizeof(nameBuf), device);
     deviceName = nameBuf;
@@ -140,14 +160,11 @@ bool CudaExecutor::ensureContextCurrent() {
     return cuCheck(cuCtxSetCurrent(context), "cuCtxSetCurrent");
 }
 
-// cleanup() NO LONGER DESTROYS THE CONTEXT (kept across tasks)
 void CudaExecutor::cleanup() {
-    // Optionally evict compiled modules to save memory
     for (auto& kv : kernelCache) {
         if (kv.second.module) cuModuleUnload(kv.second.module);
     }
     kernelCache.clear();
-    // Keep context alive for subsequent tasks.
 }
 
 // ================= NVRTC compilation =================
@@ -159,9 +176,7 @@ bool CudaExecutor::compileKernel(const std::string& source,
     nvrtcResult nres = nvrtcCreateProgram(&prog, source.c_str(), "kernel.cu", 0, nullptr, nullptr);
     if (!nvrtcCheck(nres, "nvrtcCreateProgram")) return false;
 
-    // Build options
     std::vector<std::string> optStrings;
-    // Target current device architecture
     {
         std::ostringstream arch;
         arch << "--gpu-architecture=compute_" << computeMajor << computeMinor;
@@ -169,7 +184,6 @@ bool CudaExecutor::compileKernel(const std::string& source,
     }
     optStrings.push_back("--std=c++14");
 
-    // Custom options (if provided)
     if (compileOpts.contains("optimization") && compileOpts["optimization"].is_string()) {
         optStrings.push_back(compileOpts["optimization"].get<std::string>());
     }
@@ -183,30 +197,23 @@ bool CudaExecutor::compileKernel(const std::string& source,
     optsC.reserve(optStrings.size());
     for (auto& s : optStrings) optsC.push_back(s.c_str());
 
-    // Compile
     nres = nvrtcCompileProgram(prog, static_cast<int>(optsC.size()), optsC.data());
 
-    // Collect log
     size_t logSize = 0;
     nvrtcGetProgramLogSize(prog, &logSize);
     std::string log;
-    if (logSize > 1) {
-        log.resize(logSize);
-        nvrtcGetProgramLog(prog, log.data());
-    }
+    if (logSize > 1) { log.resize(logSize); nvrtcGetProgramLog(prog, log.data()); }
     if (!nvrtcCheck(nres, "nvrtcCompileProgram", log)) {
         nvrtcDestroyProgram(&prog);
         return false;
     }
 
-    // Get PTX
     size_t ptxSize = 0;
     nvrtcGetPTXSize(prog, &ptxSize);
     result.ptx.resize(ptxSize);
     nvrtcGetPTX(prog, result.ptx.data());
     nvrtcDestroyProgram(&prog);
 
-    // Load module and function
     if (!cuCheck(cuModuleLoadDataEx(&result.module, result.ptx.c_str(), 0, nullptr, nullptr),
                  "cuModuleLoadDataEx")) {
         return false;
@@ -220,95 +227,121 @@ bool CudaExecutor::compileKernel(const std::string& source,
     return true;
 }
 
-// ================= Uniform handling =================
-bool CudaExecutor::processMetadataUniforms(const TaskData& task, std::vector<CudaExecutor::UniformValue>& uniforms) {
-    const json* sourceData = nullptr;
-    std::string sourceType;
+// ================= Kernel-agnostic uniform handling =================
+//
+// Priority:
+// 1) metadata.schema.uniforms: array of { name, type }  --> use this order & types
+// 2) metadata.uniformOrder:    array of names           --> use this order (infer types)
+// 3) Fallback: iterate metadata's numeric fields in insertion order,
+//    excluding non-uniform keys.
+//
+bool CudaExecutor::buildUniformList(const TaskData& task, std::vector<UniformValue>& uniforms) {
+    const json& md = task.metadata;
+    uniforms.clear();
 
-    if (!task.metadata.empty()) {
-        sourceData = &task.metadata;
-        sourceType = "metadata";
-        std::cout << "Processing metadata uniforms..." << std::endl;
-    } else if (!task.chunkUniforms.empty()) {
-        sourceData = &task.chunkUniforms;
-        sourceType = "legacy chunk uniforms";
-        std::cout << "Processing legacy chunk uniforms..." << std::endl;
-    } else {
-        std::cout << "No uniforms to process" << std::endl;
+    auto pushUniform = [&](const std::string& name, UniformType t, const json* val) {
+        UniformValue uv; uv.name = name; uv.type = t;
+        if (val && val->is_number()) {
+            switch (t) {
+                case UniformType::INT32:   uv.i32 = static_cast<int32_t>(val->get<int64_t>()); break;
+                case UniformType::UINT32:  uv.u32 = static_cast<uint32_t>(val->get<uint64_t>()); break;
+                case UniformType::FLOAT32: uv.f32 = static_cast<float>(val->is_number_float() ? val->get<double>() : static_cast<double>(val->get<int64_t>())); break;
+                case UniformType::INT64:   uv.i64 = val->get<int64_t>(); break;
+                case UniformType::UINT64:  uv.u64 = val->get<uint64_t>(); break;
+                case UniformType::FLOAT64: uv.f64 = val->is_number_float() ? val->get<double>() : static_cast<double>(val->get<int64_t>()); break;
+            }
+        }
+        uniforms.push_back(uv);
+    };
+
+    // 1) schema.uniforms
+    if (md.contains("schema") && md["schema"].is_object()) {
+        const json& sch = md["schema"];
+        if (sch.contains("uniforms") && sch["uniforms"].is_array()) {
+            for (const auto& u : sch["uniforms"]) {
+                if (!u.is_object()) continue;
+                if (!u.contains("name")) continue;
+                std::string name = u["name"].get<std::string>();
+                UniformType t = UniformType::INT32;
+                if (u.contains("type") && u["type"].is_string()) {
+                    t = parseTypeString(u["type"].get<std::string>());
+                } else if (md.contains(name)) {
+                    t = inferTypeFromJson(md[name]);
+                }
+                const json* vptr = md.contains(name) ? &md[name] : nullptr;
+                pushUniform(name, t, vptr);
+                std::cout << "  uniform (schema) " << name << " = "
+                          << (vptr ? getUniformValueStr(uniforms.back()) : std::string("<unset>"))
+                          << " (" << (u.contains("type") ? u["type"].get<std::string>() : "inferred") << ")"
+                          << std::endl;
+            }
+            return true;
+        }
+    }
+
+    // 2) uniformOrder
+    if (md.contains("uniformOrder") && md["uniformOrder"].is_array()) {
+        for (const auto& n : md["uniformOrder"]) {
+            if (!n.is_string()) continue;
+            std::string name = n.get<std::string>();
+            const json* vptr = md.contains(name) ? &md[name] : nullptr;
+            UniformType t = vptr ? inferTypeFromJson(*vptr) : UniformType::INT32;
+            pushUniform(name, t, vptr);
+            std::cout << "  uniform (order) " << name << " = "
+                      << (vptr ? getUniformValueStr(uniforms.back()) : std::string("<unset>"))
+                      << " (inferred)" << std::endl;
+        }
         return true;
     }
 
-    // Preferred ordering for common fields
-    std::vector<std::string> fieldOrder = {
-        "block_size", "matrix_size", "matrix_n", "matrixSize",
-        "tile_start_row", "tile_start_col", "tile_rows", "tile_cols",
-        "tile_size", "tileSize"
-    };
-
-    auto pushUniform = [&](const std::string& key, const json& v, const char* originTag) {
-        if (!v.is_number()) return;
-        UniformValue uv;
-        uv.name = key;
-        if (v.is_number_float()) {
-            uv.type = UniformType::FLOAT;   uv.floatValue = jsonToFloat(v);
-        } else if (v.is_number_unsigned()) {
-            uv.type = UniformType::UINT32;  uv.uintValue  = jsonToUnsigned(v);
-        } else { // integer
-            uv.type = UniformType::INT32;   uv.intValue   = jsonToInt(v);
-        }
-        uniforms.push_back(uv);
-        std::cout << "  " << key << " = " << getUniformValueStr(uv)
-                  << " (" << originTag << ")" << std::endl;
-    };
-
-    for (const auto& field : fieldOrder) {
-        if (sourceData->contains(field)) {
-            pushUniform(field, (*sourceData)[field], sourceType.c_str());
-        }
-    }
-
-    // Append any remaining numeric fields not already added
-    for (auto it = sourceData->begin(); it != sourceData->end(); ++it) {
+    // 3) Fallback: insertion-order numeric fields, excluding known non-uniform keys
+    for (auto it = md.begin(); it != md.end(); ++it) {
+        if (isLikelyNonUniformKey(it.key())) continue;
         if (!it.value().is_number()) continue;
-        if (std::find(fieldOrder.begin(), fieldOrder.end(), it.key()) != fieldOrder.end()) continue;
-        pushUniform(it.key(), it.value(), ("extra " + sourceType).c_str());
+        UniformType t = inferTypeFromJson(it.value());
+        pushUniform(it.key(), t, &it.value());
+        std::cout << "  uniform (fallback) " << it.key() << " = "
+                  << getUniformValueStr(uniforms.back()) << " (inferred)" << std::endl;
     }
     return true;
 }
 
-// Two-pass, reallocation-safe: reserve() first, then push values & take addresses
+// Reallocation-safe: reserve before taking addresses
 void CudaExecutor::addUniformsToKernelArgs(const std::vector<UniformValue>& uniforms,
                                            std::vector<void*>& kernelArgs,
-                                           std::vector<int32_t>& intStorage,
-                                           std::vector<uint32_t>& uintStorage,
-                                           std::vector<float>& floatStorage) {
-    // Count types
-    size_t nI = 0, nU = 0, nF = 0;
-    for (const auto& u : uniforms) {
-        if (u.type == UniformType::INT32)   ++nI;
-        else if (u.type == UniformType::UINT32) ++nU;
-        else ++nF;
-    }
-    // Reserve to avoid reallocation (which would invalidate addresses)
-    intStorage.reserve(intStorage.size() + nI);
-    uintStorage.reserve(uintStorage.size() + nU);
-    floatStorage.reserve(floatStorage.size() + nF);
-
-    // Second pass: push values & take addresses in the requested order
+                                           std::vector<int32_t>&  i32Store,
+                                           std::vector<uint32_t>& u32Store,
+                                           std::vector<float>&    f32Store,
+                                           std::vector<int64_t>&  i64Store,
+                                           std::vector<uint64_t>& u64Store,
+                                           std::vector<double>&   f64Store) {
+    using UT = UniformType;
+    size_t nI32=0,nU32=0,nF32=0,nI64=0,nU64=0,nF64=0;
     for (const auto& u : uniforms) {
         switch (u.type) {
-            case UniformType::INT32:
-                intStorage.push_back(u.intValue);
-                kernelArgs.push_back(&intStorage.back());
-                break;
-            case UniformType::UINT32:
-                uintStorage.push_back(u.uintValue);
-                kernelArgs.push_back(&uintStorage.back());
-                break;
-            case UniformType::FLOAT:
-                floatStorage.push_back(u.floatValue);
-                kernelArgs.push_back(&floatStorage.back());
-                break;
+            case UT::INT32:   ++nI32; break;
+            case UT::UINT32:  ++nU32; break;
+            case UT::FLOAT32: ++nF32; break;
+            case UT::INT64:   ++nI64; break;
+            case UT::UINT64:  ++nU64; break;
+            case UT::FLOAT64: ++nF64; break;
+        }
+    }
+    i32Store.reserve(i32Store.size()+nI32);
+    u32Store.reserve(u32Store.size()+nU32);
+    f32Store.reserve(f32Store.size()+nF32);
+    i64Store.reserve(i64Store.size()+nI64);
+    u64Store.reserve(u64Store.size()+nU64);
+    f64Store.reserve(f64Store.size()+nF64);
+
+    for (const auto& u : uniforms) {
+        switch (u.type) {
+            case UT::INT32:   i32Store.push_back(u.i32); kernelArgs.push_back(&i32Store.back()); break;
+            case UT::UINT32:  u32Store.push_back(u.u32); kernelArgs.push_back(&u32Store.back()); break;
+            case UT::FLOAT32: f32Store.push_back(u.f32); kernelArgs.push_back(&f32Store.back()); break;
+            case UT::INT64:   i64Store.push_back(u.i64); kernelArgs.push_back(&i64Store.back()); break;
+            case UT::UINT64:  u64Store.push_back(u.u64); kernelArgs.push_back(&u64Store.back()); break;
+            case UT::FLOAT64: f64Store.push_back(u.f64); kernelArgs.push_back(&f64Store.back()); break;
         }
     }
 }
@@ -330,8 +363,8 @@ TaskResult CudaExecutor::executeTask(const TaskData& task) {
     }
 
     try {
-        // ---- Compile or retrieve kernel (ASSUMES CUDA C++ IN task.kernel) ----
-        const std::string& src = task.kernel;   // authoritative: kernel is CUDA code
+        // ---- Compile or retrieve kernel (task.kernel = CUDA C++) ----
+        const std::string& src = task.kernel;
         const std::string& entry = task.entry.empty() ? std::string("kernel") : task.entry;
 
         std::string cacheKey = makeCacheKey(src, entry);
@@ -351,100 +384,41 @@ TaskResult CudaExecutor::executeTask(const TaskData& task) {
             kfun = &it->second;
         }
 
-        // ---- Determine input/output counts ----
+        // ---- Determine IO counts ----
         const bool useMultipleInputs  = task.hasMultipleInputs();
         const bool useMultipleOutputs = task.hasMultipleOutputs();
-        const bool hasUniforms = !task.metadata.empty() || !task.chunkUniforms.empty();
 
         const size_t inputCount  = useMultipleInputs  ? task.inputData.size()
                                : (!task.legacyInputData.empty() ? 1 : 0);
         const size_t outputCount = useMultipleOutputs ? task.outputSizes.size()
                                : (task.legacyOutputSize ? 1 : 0);
 
-        std::cout << "CUDA Task " << task.id << " - Inputs: " << inputCount
-                  << ", Outputs: " << outputCount
-                  << ", Has uniforms: " << (hasUniforms ? 1 : 0) << std::endl;
-
-        // Debug: first 4 floats of inputs (if present)
-        if (useMultipleInputs) {
-            for (size_t i = 0; i < task.inputData.size(); i++) {
-                const auto& inputData = task.inputData[i];
-                if (!inputData.empty() && inputData.size() >= 16) {
-                    const float* f = reinterpret_cast<const float*>(inputData.data());
-                    std::cout << "Input " << i << " first 4 values: ";
-                    for (int j = 0; j < 4 && j < static_cast<int>(inputData.size()/4); j++) {
-                        std::cout << f[j] << " ";
-                    }
-                    std::cout << std::endl;
-                }
-            }
-        } else if (!task.legacyInputData.empty() && task.legacyInputData.size() >= 16) {
-            const float* f = reinterpret_cast<const float*>(task.legacyInputData.data());
-            std::cout << "Legacy input first 4 values: ";
-            for (int j = 0; j < 4 && j < static_cast<int>(task.legacyInputData.size()/4); j++) {
-                std::cout << f[j] << " ";
-            }
-            std::cout << std::endl;
-        }
-
-        // ---- Build uniforms (first in the kernel arg list) ----
-        std::vector<void*>   kernelArgs;
-        std::vector<int32_t> intStorage;
-        std::vector<uint32_t> uintStorage;
-        std::vector<float>   floatStorage;
+        // ---- Build uniforms (order according to schema/uniformOrder/fallback) ----
+        std::vector<void*> kernelArgs;
+        std::vector<int32_t>  i32Store;
+        std::vector<uint32_t> u32Store;
+        std::vector<float>    f32Store;
+        std::vector<int64_t>  i64Store;
+        std::vector<uint64_t> u64Store;
+        std::vector<double>   f64Store;
         std::vector<UniformValue> uniforms;
 
-        int bsVal = -1;
-        int msVal = -1;
-
-        if (hasUniforms) {
-            // Populate raw uniforms (parsed & typed)
-            processMetadataUniforms(task, uniforms);
-
-            // Extract known ABI uniforms for front-of-list placement
-            auto takeUniform = [&](const char* name, int& outVal) -> bool {
-                for (auto itU = uniforms.begin(); itU != uniforms.end(); ++itU) {
-                    if (itU->name == name) {
-                        // coerce to int32 for ABI
-                        if (itU->type == UniformType::FLOAT)   outVal = static_cast<int>(itU->floatValue);
-                        else if (itU->type == UniformType::UINT32) outVal = static_cast<int>(itU->uintValue);
-                        else outVal = static_cast<int>(itU->intValue);
-                        uniforms.erase(itU); // remove from generic list (to avoid duplication)
-                        return true;
-                    }
-                }
-                return false;
-            };
-
-            bool haveBS = takeUniform("block_size", bsVal);
-            bool haveMS = takeUniform("matrix_size", msVal);
-
-            // Reserve storages for uniform scalars (we'll add BS/MS first if present)
-            size_t genericInts = 0, genericUints = 0, genericFloats = 0;
-            for (const auto& u : uniforms) {
-                if (u.type == UniformType::INT32) ++genericInts;
-                else if (u.type == UniformType::UINT32) ++genericUints;
-                else ++genericFloats;
-            }
-            intStorage.reserve(intStorage.size() + (haveBS?1:0) + (haveMS?1:0) + genericInts);
-            uintStorage.reserve(uintStorage.size() + genericUints);
-            floatStorage.reserve(floatStorage.size() + genericFloats);
-
-            // Push ABI uniforms first, by value, with stable addresses
-            if (haveBS) {
-                intStorage.push_back(bsVal);
-                kernelArgs.push_back(&intStorage.back());
-            }
-            if (haveMS) {
-                intStorage.push_back(msVal);
-                kernelArgs.push_back(&intStorage.back());
+        if (!task.metadata.empty() || !task.chunkUniforms.empty()) {
+            // Prefer task.metadata if present; otherwise legacy chunkUniforms
+            const bool fromMeta = !task.metadata.empty();
+            const json& savedMeta = fromMeta ? task.metadata : task.chunkUniforms;
+            if (fromMeta) {
+                std::cout << "Processing uniforms from metadata..." << std::endl;
+            } else {
+                std::cout << "Processing uniforms from legacy chunk uniforms..." << std::endl;
             }
 
-            // Then push any remaining uniforms in insertion order (reallocation-safe)
-            addUniformsToKernelArgs(uniforms, kernelArgs, intStorage, uintStorage, floatStorage);
-
-            std::cout << "Set " << ( (haveBS?1:0) + (haveMS?1:0) + uniforms.size() )
-                      << " uniform arguments" << std::endl;
+            // Build from metadata
+            buildUniformList(task, uniforms);
+            addUniformsToKernelArgs(uniforms, kernelArgs, i32Store, u32Store, f32Store, i64Store, u64Store, f64Store);
+            std::cout << "Set " << uniforms.size() << " uniform arguments" << std::endl;
+        } else {
+            std::cout << "No uniforms to process" << std::endl;
         }
 
         // ---- Allocate/upload inputs ----
@@ -537,25 +511,18 @@ TaskResult CudaExecutor::executeTask(const TaskData& task) {
             std::cout << "Legacy output: " << task.legacyOutputSize << " bytes" << std::endl;
         }
 
-        // ---- Push inputs/outputs to kernel args AFTER vectors are fully populated ----
-        for (auto& d : dInputs)  kernelArgs.push_back(&d);   // pass ADDRESS of CUdeviceptr
-        for (auto& d : dOutputs) kernelArgs.push_back(&d);   // same for outputs
+        // ---- Append buffer args (after uniforms) ----
+        for (auto& d : dInputs)  kernelArgs.push_back(&d);
+        for (auto& d : dOutputs) kernelArgs.push_back(&d);
 
-        // ---- Resolve grid/block from metadata (fallbacks preserved) ----
+        // ---- Launch dims ----
         std::vector<int> gridDim  = task.workgroupCount.empty() ? std::vector<int>{1, 1, 1} : task.workgroupCount;
-        std::vector<int> blockDim = {16, 16, 1};  // default
+        std::vector<int> blockDim = {16, 16, 1};
 
         if (task.metadata.contains("blockDim") && task.metadata["blockDim"].is_array()) {
             auto bdim = task.metadata["blockDim"].get<std::vector<int>>();
             if (bdim.size() >= 3) blockDim = bdim;
             std::cout << "Using metadata blockDim: " << blockDim[0] << "," << blockDim[1] << "," << blockDim[2] << std::endl;
-        } else if (bsVal > 0) {
-            // If no explicit blockDim, and block_size is known, prefer block=(bs,bs,1) if it fits.
-            long long threads2D = 1LL * bsVal * bsVal;
-            if (threads2D <= maxThreadsPerBlock) {
-                blockDim = { bsVal, bsVal, 1 };
-                std::cout << "Auto blockDim from block_size: " << blockDim[0] << "," << blockDim[1] << "," << blockDim[2] << std::endl;
-            }
         }
         if (task.metadata.contains("gridDim") && task.metadata["gridDim"].is_array()) {
             auto gdim = task.metadata["gridDim"].get<std::vector<int>>();
@@ -563,27 +530,17 @@ TaskResult CudaExecutor::executeTask(const TaskData& task) {
             std::cout << "Using metadata gridDim: " << gridDim[0] << "," << gridDim[1] << "," << gridDim[2] << std::endl;
         }
 
-        // ---- Prelaunch logging (uniforms & args) ----
-        std::cout << "Block size from uniforms (host): ";
-        if (bsVal > 0) std::cout << bsVal << "\n"; else std::cout << "(not provided)\n";
-
+        // ---- Logs ----
+        std::cout << "Uniforms (" << uniforms.size() << "):" << std::endl;
+        for (size_t i = 0; i < uniforms.size(); ++i) {
+            std::cout << "  [" << i << "] " << uniforms[i].name << " = " << getUniformValueStr(uniforms[i]) << std::endl;
+        }
         std::cout << "Final kernel launch parameters:\n";
         std::cout << "  Grid: ("  << gridDim[0]  << "," << gridDim[1]  << "," << gridDim[2]  << ")\n";
         std::cout << "  Block: (" << blockDim[0] << "," << blockDim[1] << "," << blockDim[2] << ")\n";
         std::cout << "  Total threads: " << (gridDim[0] * blockDim[0]) << "x" << (gridDim[1] * blockDim[1]) << std::endl;
-
-        // Helpful: print arg mapping
-        size_t numUniformArgs = (bsVal > -1 ? 1 : 0) + (msVal > -1 ? 1 : 0);
-        numUniformArgs += 0; // plus any remaining uniforms added by addUniformsToKernelArgs
-        numUniformArgs += (size_t)std::count_if(kernelArgs.begin(), kernelArgs.end(),
-            [&](void* p){
-                // We can't easily distinguish scalars after packing,
-                // so just report counts we know:
-                return false;
-            });
-
         std::cout << "Total kernel arguments: " << kernelArgs.size()
-                  << " (uniforms:~" << ((bsVal>-1)+(msVal>-1)) /* + others unknown here */
+                  << " (uniforms:" << uniforms.size()
                   << " + inputs:" << dInputs.size()
                   << " + outputs:" << dOutputs.size() << ")" << std::endl;
 
@@ -603,7 +560,6 @@ TaskResult CudaExecutor::executeTask(const TaskData& task) {
             return result;
         }
 
-        // ---- Sync ----
         if (!cuCheck(cuCtxSynchronize(), "cuCtxSynchronize")) {
             freeAll();
             result.success = false;
@@ -626,7 +582,6 @@ TaskResult CudaExecutor::executeTask(const TaskData& task) {
                 }
                 std::cout << "Retrieved output " << i << ": " << bytes << " bytes" << std::endl;
             }
-            // Back-compat: set legacyOutputData to first output, if any
             if (!result.outputData.empty()) result.legacyOutputData = result.outputData[0];
         } else {
             result.legacyOutputData.resize(task.legacyOutputSize);
@@ -641,7 +596,6 @@ TaskResult CudaExecutor::executeTask(const TaskData& task) {
             std::cout << "Retrieved legacy output: " << task.legacyOutputSize << " bytes" << std::endl;
         }
 
-        // ---- Free device memory ----
         freeAll();
 
         auto endTime = std::chrono::high_resolution_clock::now();
@@ -670,8 +624,9 @@ json CudaExecutor::getCapabilities() const {
     caps["maxInputs"]  = 8;
     caps["maxOutputs"] = 4;
     caps["supportsUniforms"] = true;
+    caps["uniformTypes"] = {"int32","uint32","float32","int64","uint64","float64"};
     caps["taskAgnostic"] = true;
-    caps["expectsKernelIn"] = "kernel";   // important: CUDA source is in `kernel`
+    caps["expectsKernelIn"] = "kernel";
 
     if (initialized) {
         caps["device"] = {
