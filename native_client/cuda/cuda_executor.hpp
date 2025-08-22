@@ -79,6 +79,8 @@ private:
 
     // Task-agnostic metadata processing (uniforms)
     bool processMetadataUniforms(const TaskData& task, std::vector<UniformValue>& uniforms);
+
+    // Two-pass, reallocation-safe: reserves storage before taking addresses
     void addUniformsToKernelArgs(const std::vector<UniformValue>& uniforms,
                                  std::vector<void*>& kernelArgs,
                                  std::vector<int32_t>& intStorage,

@@ -147,7 +147,7 @@ void CudaExecutor::cleanup() {
         if (kv.second.module) cuModuleUnload(kv.second.module);
     }
     kernelCache.clear();
-    // Do NOT destroy context; keep executor initialized for subsequent tasks.
+    // Keep context alive for subsequent tasks.
 }
 
 // ================= NVRTC compilation =================
@@ -167,7 +167,6 @@ bool CudaExecutor::compileKernel(const std::string& source,
         arch << "--gpu-architecture=compute_" << computeMajor << computeMinor;
         optStrings.push_back(arch.str());
     }
-    // Standard & (optional) fast math
     optStrings.push_back("--std=c++14");
 
     // Custom options (if provided)
@@ -277,11 +276,25 @@ bool CudaExecutor::processMetadataUniforms(const TaskData& task, std::vector<Cud
     return true;
 }
 
+// Two-pass, reallocation-safe: reserve() first, then push values & take addresses
 void CudaExecutor::addUniformsToKernelArgs(const std::vector<UniformValue>& uniforms,
                                            std::vector<void*>& kernelArgs,
                                            std::vector<int32_t>& intStorage,
                                            std::vector<uint32_t>& uintStorage,
                                            std::vector<float>& floatStorage) {
+    // Count types
+    size_t nI = 0, nU = 0, nF = 0;
+    for (const auto& u : uniforms) {
+        if (u.type == UniformType::INT32)   ++nI;
+        else if (u.type == UniformType::UINT32) ++nU;
+        else ++nF;
+    }
+    // Reserve to avoid reallocation (which would invalidate addresses)
+    intStorage.reserve(intStorage.size() + nI);
+    uintStorage.reserve(uintStorage.size() + nU);
+    floatStorage.reserve(floatStorage.size() + nF);
+
+    // Second pass: push values & take addresses in the requested order
     for (const auto& u : uniforms) {
         switch (u.type) {
             case UniformType::INT32:
@@ -381,13 +394,60 @@ TaskResult CudaExecutor::executeTask(const TaskData& task) {
         std::vector<float>   floatStorage;
         std::vector<UniformValue> uniforms;
 
+        int bsVal = -1;
+        int msVal = -1;
+
         if (hasUniforms) {
+            // Populate raw uniforms (parsed & typed)
             processMetadataUniforms(task, uniforms);
+
+            // Extract known ABI uniforms for front-of-list placement
+            auto takeUniform = [&](const char* name, int& outVal) -> bool {
+                for (auto itU = uniforms.begin(); itU != uniforms.end(); ++itU) {
+                    if (itU->name == name) {
+                        // coerce to int32 for ABI
+                        if (itU->type == UniformType::FLOAT)   outVal = static_cast<int>(itU->floatValue);
+                        else if (itU->type == UniformType::UINT32) outVal = static_cast<int>(itU->uintValue);
+                        else outVal = static_cast<int>(itU->intValue);
+                        uniforms.erase(itU); // remove from generic list (to avoid duplication)
+                        return true;
+                    }
+                }
+                return false;
+            };
+
+            bool haveBS = takeUniform("block_size", bsVal);
+            bool haveMS = takeUniform("matrix_size", msVal);
+
+            // Reserve storages for uniform scalars (we'll add BS/MS first if present)
+            size_t genericInts = 0, genericUints = 0, genericFloats = 0;
+            for (const auto& u : uniforms) {
+                if (u.type == UniformType::INT32) ++genericInts;
+                else if (u.type == UniformType::UINT32) ++genericUints;
+                else ++genericFloats;
+            }
+            intStorage.reserve(intStorage.size() + (haveBS?1:0) + (haveMS?1:0) + genericInts);
+            uintStorage.reserve(uintStorage.size() + genericUints);
+            floatStorage.reserve(floatStorage.size() + genericFloats);
+
+            // Push ABI uniforms first, by value, with stable addresses
+            if (haveBS) {
+                intStorage.push_back(bsVal);
+                kernelArgs.push_back(&intStorage.back());
+            }
+            if (haveMS) {
+                intStorage.push_back(msVal);
+                kernelArgs.push_back(&intStorage.back());
+            }
+
+            // Then push any remaining uniforms in insertion order (reallocation-safe)
             addUniformsToKernelArgs(uniforms, kernelArgs, intStorage, uintStorage, floatStorage);
-            std::cout << "Set " << uniforms.size() << " uniform arguments" << std::endl;
+
+            std::cout << "Set " << ( (haveBS?1:0) + (haveMS?1:0) + uniforms.size() )
+                      << " uniform arguments" << std::endl;
         }
 
-        // ---- Allocate/upload inputs (use Driver API; no mixing with runtime) ----
+        // ---- Allocate/upload inputs ----
         std::vector<CUdeviceptr> dInputs;
         std::vector<CUdeviceptr> dOutputs;
         dInputs.reserve(inputCount);
@@ -419,7 +479,7 @@ TaskResult CudaExecutor::executeTask(const TaskData& task) {
                     }
                     std::cout << "Input " << i << ": " << bytes << " bytes" << std::endl;
                 }
-                dInputs.push_back(d); // can be 0 if empty buffer
+                dInputs.push_back(d);
             }
         } else if (!task.legacyInputData.empty()) {
             CUdeviceptr d = 0;
@@ -489,6 +549,13 @@ TaskResult CudaExecutor::executeTask(const TaskData& task) {
             auto bdim = task.metadata["blockDim"].get<std::vector<int>>();
             if (bdim.size() >= 3) blockDim = bdim;
             std::cout << "Using metadata blockDim: " << blockDim[0] << "," << blockDim[1] << "," << blockDim[2] << std::endl;
+        } else if (bsVal > 0) {
+            // If no explicit blockDim, and block_size is known, prefer block=(bs,bs,1) if it fits.
+            long long threads2D = 1LL * bsVal * bsVal;
+            if (threads2D <= maxThreadsPerBlock) {
+                blockDim = { bsVal, bsVal, 1 };
+                std::cout << "Auto blockDim from block_size: " << blockDim[0] << "," << blockDim[1] << "," << blockDim[2] << std::endl;
+            }
         }
         if (task.metadata.contains("gridDim") && task.metadata["gridDim"].is_array()) {
             auto gdim = task.metadata["gridDim"].get<std::vector<int>>();
@@ -496,26 +563,27 @@ TaskResult CudaExecutor::executeTask(const TaskData& task) {
             std::cout << "Using metadata gridDim: " << gridDim[0] << "," << gridDim[1] << "," << gridDim[2] << std::endl;
         }
 
-        std::cout << "Block size from uniforms: ";
-        bool printed = false;
-        for (const auto& u : uniforms) {
-            if (u.name == "block_size") {
-                std::cout << (u.type == UniformType::FLOAT ? u.floatValue
-                                 : (u.type == UniformType::UINT32 ? static_cast<float>(u.uintValue)
-                                                                  : static_cast<float>(u.intValue)));
-                printed = true;
-                break;
-            }
-        }
-        if (!printed) std::cout << "(not provided)";
-        std::cout << std::endl;
+        // ---- Prelaunch logging (uniforms & args) ----
+        std::cout << "Block size from uniforms (host): ";
+        if (bsVal > 0) std::cout << bsVal << "\n"; else std::cout << "(not provided)\n";
 
         std::cout << "Final kernel launch parameters:\n";
         std::cout << "  Grid: ("  << gridDim[0]  << "," << gridDim[1]  << "," << gridDim[2]  << ")\n";
         std::cout << "  Block: (" << blockDim[0] << "," << blockDim[1] << "," << blockDim[2] << ")\n";
         std::cout << "  Total threads: " << (gridDim[0] * blockDim[0]) << "x" << (gridDim[1] * blockDim[1]) << std::endl;
+
+        // Helpful: print arg mapping
+        size_t numUniformArgs = (bsVal > -1 ? 1 : 0) + (msVal > -1 ? 1 : 0);
+        numUniformArgs += 0; // plus any remaining uniforms added by addUniformsToKernelArgs
+        numUniformArgs += (size_t)std::count_if(kernelArgs.begin(), kernelArgs.end(),
+            [&](void* p){
+                // We can't easily distinguish scalars after packing,
+                // so just report counts we know:
+                return false;
+            });
+
         std::cout << "Total kernel arguments: " << kernelArgs.size()
-                  << " (uniforms:" << uniforms.size()
+                  << " (uniforms:~" << ((bsVal>-1)+(msVal>-1)) /* + others unknown here */
                   << " + inputs:" << dInputs.size()
                   << " + outputs:" << dOutputs.size() << ")" << std::endl;
 
@@ -592,7 +660,7 @@ TaskResult CudaExecutor::executeTask(const TaskData& task) {
     return result;
 }
 
-// Capabilities
+// ================= Capabilities =================
 json CudaExecutor::getCapabilities() const {
     json caps;
     caps["framework"] = "cuda";
