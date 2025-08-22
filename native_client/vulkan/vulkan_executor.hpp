@@ -1,10 +1,12 @@
 #pragma once
+#include "../common/framework_client.hpp"
+#ifdef HAVE_VULKAN
 #include <vulkan/vulkan.h>
 #include <vector>
 #include <string>
 #include <optional>
 #include <memory>
-#include "framework_client.hpp"
+
 
 // Vulkan executor implementing Multi-Input / Multi-Output (MIMO) interface used by the framework.
 class VulkanExecutor final : public IFrameworkExecutor {
@@ -49,3 +51,4 @@ private:
     Buffer makeHostBuffer(VkDeviceSize size, VkBufferUsageFlags usage) const;
     void destroyBuffer(Buffer& b) const;
 };
+#endif

@@ -16,7 +16,9 @@ ENV VCPKG_ROOT=/opt/vcpkg
 RUN git clone --depth=1 https://github.com/microsoft/vcpkg.git ${VCPKG_ROOT} \
  && ${VCPKG_ROOT}/bootstrap-vcpkg.sh -disableMetrics
 
+# FIXED: Define VCPKG_TRIPLET as ARG and ENV
 ARG VCPKG_TRIPLET=x64-linux
+ENV VCPKG_TRIPLET=${VCPKG_TRIPLET}
 
 # Install only what we need — rely on system libvulkan loader
 RUN ${VCPKG_ROOT}/vcpkg install --triplet=${VCPKG_TRIPLET} \
@@ -56,12 +58,19 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     ocl-icd-libopencl1 \
     && rm -rf /var/lib/apt/lists/*
 
+# FIXED: Set VCPKG_TRIPLET in runtime stage
+ARG VCPKG_TRIPLET=x64-linux
+ENV VCPKG_TRIPLET=${VCPKG_TRIPLET}
+
 COPY --from=build /opt/mfc /opt/mfc
 COPY --from=build /opt/vcpkg/installed /opt/vcpkg/installed
-ENV LD_LIBRARY_PATH=/opt/vcpkg/installed/${VCPKG_TRIPLET}/lib:/opt/vcpkg/installed/${VCPKG_TRIPLET}/lib/manual-link:${LD_LIBRARY_PATH}
+
+# FIXED: Set LD_LIBRARY_PATH properly with fallback
+ENV LD_LIBRARY_PATH=/opt/vcpkg/installed/${VCPKG_TRIPLET}/lib:/opt/vcpkg/installed/${VCPKG_TRIPLET}/lib/manual-link:/usr/local/lib:/usr/lib
 
 WORKDIR /opt/mfc/bin
 
-ENV FRAMEWORK=vulkan
-ENV SERVER_URL=https://localhost:3000
-ENTRYPOINT ["/bin/sh", "-lc", "exec ./${FRAMEWORK}_client --server ${SERVER_URL}"]
+#ENV FRAMEWORK=vulkan
+#ENV CLIENT_TYPE=vulkan
+#ENV SERVER_URL=https://localhost:3000
+#ENTRYPOINT ["/bin/sh"]

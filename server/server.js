@@ -9,6 +9,8 @@ import crypto from 'crypto';
 import os from 'os';
 import Busboy from 'busboy';
 import { pipeline } from 'stream/promises';
+import { WebSocketServer } from 'ws';
+import url from 'url';
 
 // Enhanced: Import chunking system
 import { EnhancedChunkingManager } from './strategies/EnhancedChunkingManager.js';
@@ -127,6 +129,500 @@ const io = new SocketIOServer(server, {
     credentials: true
   }
 });
+
+// RAW WEBSOCKET SERVER FOR NATIVE CLIENTS
+const wss = new WebSocketServer({
+  server,
+  path: '/ws-native',
+  verifyClient: (info) => {
+    console.log(`[WS-NATIVE] Connection attempt from ${info.origin || 'unknown'}`);
+    return true; // Accept all connections
+  }
+});
+
+// WebSocket client wrapper to mimic Socket.IO client interface
+class WebSocketClientWrapper {
+  constructor(ws, clientId) {
+    this.ws = ws;
+    this.id = clientId;
+    this.connected = true;
+    this.joinedAt = Date.now();
+    this.lastActive = Date.now();
+    this.completedTasks = 0;
+    this.gpuInfo = null;
+    this.supportedFrameworks = [];
+    this.clientType = 'native';
+    this.isBusyWithMatrixTask = false;
+    this.isBusyWithCustomChunk = false;
+    this.isBusyWithNonChunkedWGSL = false;
+    this.hasJoined = false;
+
+    // Message handlers
+    this.eventHandlers = new Map();
+
+    // Set up WebSocket event handlers
+    this.ws.on('message', (data) => {
+      try {
+        const message = JSON.parse(data.toString());
+        console.log(`[WS-NATIVE] Received from ${this.id}:`, message.type);
+
+        if (message.type && this.eventHandlers.has(message.type)) {
+          this.eventHandlers.get(message.type)(message.data || {});
+        }
+      } catch (err) {
+        console.error(`[WS-NATIVE] Failed to parse message from ${this.id}:`, err);
+      }
+    });
+
+    this.ws.on('close', () => {
+      console.log(`[WS-NATIVE] Client ${this.id} disconnected`);
+      this.connected = false;
+      handleClientDisconnect(this.id);
+      broadcastClientList();
+      broadcastStatus();
+    });
+
+    this.ws.on('error', (err) => {
+      console.error(`[WS-NATIVE] WebSocket error for ${this.id}:`, err);
+    });
+  }
+
+  // Mimic Socket.IO interface
+  on(event, handler) {
+    this.eventHandlers.set(event, handler);
+  }
+
+  emit(event, data = {}) {
+    if (this.connected && this.ws.readyState === this.ws.OPEN) {
+      try {
+        const message = JSON.stringify({ type: event, data });
+        this.ws.send(message);
+        console.log(`[WS-NATIVE] Sent to ${this.id}:`, event);
+      } catch (err) {
+        console.error(`[WS-NATIVE] Failed to send to ${this.id}:`, err);
+      }
+    }
+  }
+
+  off(event) {
+    this.eventHandlers.delete(event);
+  }
+}
+
+// Handle WebSocket connections
+wss.on('connection', (ws, request) => {
+  const clientId = `ws-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
+  console.log(`[WS-NATIVE] New native client connected: ${clientId}`);
+
+  // Create wrapper that mimics Socket.IO client
+  const client = new WebSocketClientWrapper(ws, clientId);
+
+  // Add to clients map (same as Socket.IO clients)
+  matrixState.clients.set(clientId, client);
+  matrixState.stats.totalClients++;
+  matrixState.stats.activeClients = matrixState.clients.size;
+
+  // Send initial registration
+  client.emit('register', { clientId });
+  client.emit('admin:k_update', ADMIN_K_PARAMETER);
+
+  // === EVENT HANDLERS (same as Socket.IO) ===
+
+  // Client join with capabilities
+  client.on('client:join', (data) => {
+    if (client.hasJoined) return;
+
+    client.hasJoined = true;
+    client.gpuInfo = data.gpuInfo;
+    client.hasWebGPU = !!data.hasWebGPU;
+    client.supportedFrameworks = data.supportedFrameworks || ['vulkan'];
+    client.clientType = data.clientType || 'native';
+
+    console.log(`[WS-NATIVE] Client ${clientId} joined; supports frameworks: ${client.supportedFrameworks.join(', ')}`);
+    broadcastClientList();
+  });
+
+  // Matrix task request
+  client.on('task:request', () => {
+    if (client && matrixState.isRunning && !client.isBusyWithCustomChunk && !client.isBusyWithMatrixTask) {
+      const task = assignMatrixTask(clientId);
+      if (task) client.emit('task:assign', task);
+    }
+  });
+
+  // Matrix task completion
+  client.on('task:complete', (data) => {
+    if (!client || !client.connected) return;
+
+    client.isBusyWithMatrixTask = false;
+    client.lastActive = Date.now();
+
+    const { assignmentId, taskId, result: received, processingTime, reportedChecksum } = data;
+    const inst = matrixState.activeTasks.get(assignmentId);
+    if (!inst || inst.logicalTaskId !== taskId || inst.assignedTo !== clientId) {
+      return;
+    }
+    matrixState.activeTasks.delete(assignmentId);
+
+    const tdef = matrixState.tasks.find(t => t.id === taskId);
+    if (!tdef || tdef.status === 'completed') return;
+
+    const serverChecksum = checksumMatrixRowsFloat32LE(received);
+
+    if (!matrixResultBuffer.has(taskId)) matrixResultBuffer.set(taskId, []);
+    matrixResultBuffer.get(taskId).push({
+      clientId: clientId,
+      result: received,
+      processingTime,
+      submissionTime: Date.now(),
+      reportedChecksum: reportedChecksum,
+      serverChecksum
+    });
+
+    const entries = matrixResultBuffer.get(taskId);
+    const tally = tallyKByChecksum(
+      entries.map(e => ({
+        clientId: e.clientId,
+        serverChecksum: e.serverChecksum,
+        reportedChecksum: e.reportedChecksum
+      })),
+      undefined,
+      ADMIN_K_PARAMETER
+    );
+
+    let verified = false;
+    let finalData = null;
+    let contributors = [];
+    if (tally.ok) {
+      const winner = entries.find(e => e.serverChecksum === tally.winningChecksum);
+      finalData = winner?.result;
+      contributors = Array.from(tally.voters).slice(0, ADMIN_K_PARAMETER);
+      verified = !!finalData;
+    }
+
+    if (verified) {
+      const ok = processMatrixTaskResult(taskId, finalData, contributors.slice(0, ADMIN_K_PARAMETER));
+      if (ok) {
+        contributors.forEach(cid => {
+          const cl = matrixState.clients.get(cid);
+          if (cl) cl.emit('task:verified', { taskId, type: 'matrixMultiply' });
+        });
+        broadcastStatus();
+      }
+    } else {
+      client.emit('task:submitted', { taskId, type: 'matrixMultiply' });
+    }
+  });
+
+  // Non-chunked workload completion
+  client.on('workload:done', ({ id, result, results, processingTime, reportedChecksum }) => {
+    const wl = customWorkloads.get(id);
+    if (!wl || wl.isChunkParent) {
+      client.emit('workload:error', { id, message: 'Invalid workload ID or is chunk parent.' });
+      return;
+    }
+
+    client.isBusyWithNonChunkedWGSL = false;
+    wl.activeAssignments.delete(clientId);
+
+    let finalResults = results || [result];
+    if (!Array.isArray(finalResults)) finalResults = [finalResults];
+
+    const checksumData = checksumFromResults(finalResults);
+    wl.results.push({
+      clientId: clientId,
+      results: finalResults,
+      result: finalResults[0],
+      submissionTime: Date.now(),
+      processingTime,
+      reportedChecksum: reportedChecksum,
+      serverChecksum: checksumData.serverChecksum,
+      byteLength: checksumData.byteLength
+    });
+    wl.processingTimes.push({ clientId: clientId, timeMs: processingTime });
+
+    const expectedSize = wl.outputSizes ? wl.outputSizes.reduce((a, b) => a + b, 0) : wl.outputSize;
+    const tally = tallyKByChecksum(
+      wl.results.map(r => ({
+        clientId: r.clientId,
+        serverChecksum: r.serverChecksum,
+        reportedChecksum: r.reportedChecksum,
+        byteLength: r.byteLength
+      })),
+      expectedSize,
+      ADMIN_K_PARAMETER
+    );
+
+    if (tally.ok) {
+      const winner = wl.results.find(r => r.serverChecksum === tally.winningChecksum);
+      wl.status = 'complete';
+      wl.finalResults = winner.results;
+      wl.finalResultBase64 = Buffer.concat(winner.results.map(r => Buffer.from(r, 'base64'))).toString('base64');
+      wl.completedAt = Date.now();
+      console.log(`✅ ${wl.framework} workload ${id} VERIFIED & COMPLETE.`);
+
+      // Broadcast to ALL clients (Socket.IO and WebSocket)
+      io.emit('workload:complete', {
+        id,
+        label: wl.label,
+        finalResults: wl.finalResults,
+        finalResultBase64: wl.finalResultBase64
+      });
+
+      // Also broadcast to native WebSocket clients
+      matrixState.clients.forEach(cl => {
+        if (cl.clientType === 'native') {
+          cl.emit('workload:complete', {
+            id,
+            label: wl.label,
+            finalResults: wl.finalResults,
+            finalResultBase64: wl.finalResultBase64
+          });
+        }
+      });
+    } else {
+      wl.status = 'processing';
+      console.log(`${wl.framework} ${id}: ${wl.results.length} submissions, awaiting ${ADMIN_K_PARAMETER}.`);
+    }
+    saveCustomWorkloads();
+    broadcastCustomWorkloadList();
+  });
+
+  // Enhanced chunk completion
+  client.on('workload:chunk_done_enhanced', ({ parentId, chunkId, results, result, processingTime, strategy, metadata, reportedChecksum }) => {
+    console.log(`[CHUNK RESULT] Enhanced chunk ${chunkId} completed by native client ${clientId}`);
+
+    client.isBusyWithCustomChunk = false;
+
+    const workloadState = customWorkloads.get(parentId);
+    const chunkStore = customWorkloadChunks.get(parentId);
+
+    if (!workloadState || !chunkStore) {
+      console.error(`[CHUNK RESULT] Workload ${parentId} not found for chunk ${chunkId}`);
+      return;
+    }
+
+    if (!chunkStore.enhanced) {
+      console.error(`[CHUNK RESULT] Chunk ${chunkId} received enhanced completion but store is not enhanced`);
+      return;
+    }
+
+    const cd = chunkStore.allChunkDefs.find(c => c.chunkId === chunkId);
+    if (!cd) {
+      console.warn(`[CHUNK RESULT] Enhanced chunk ${chunkId} not found in store for parent ${parentId}`);
+      return;
+    }
+
+    let finalResults = results || [result];
+    if (!Array.isArray(finalResults)) finalResults = [finalResults];
+
+    console.log(`[CHUNK RESULT] Processing ${finalResults.length} results for chunk ${chunkId}`);
+
+    let checksumData;
+    try {
+      checksumData = checksumFromResults(finalResults);
+      console.log(`[CHUNK RESULT] Chunk ${chunkId} checksum: ${checksumData.serverChecksum.slice(0, 8)}... (${checksumData.byteLength} bytes)`);
+    } catch (err) {
+      console.error(`[CHUNK RESULT] Enhanced chunk ${chunkId} from ${clientId} invalid base64:`, err);
+      return;
+    }
+
+    const submission = {
+      clientId: clientId,
+      results: finalResults,
+      processingTime,
+      reportedChecksum: reportedChecksum,
+      serverChecksum: checksumData.serverChecksum,
+      byteLength: checksumData.byteLength,
+      buffers: checksumData.buffers
+    };
+
+    const verifyRes = verifyAndRecordChunkSubmission(workloadState, chunkStore, cd, submission, cd.chunkOrderIndex, ADMIN_K_PARAMETER);
+
+    if (verifyRes.verified) {
+      console.log(`✅ Enhanced chunk ${chunkId} VERIFIED by K=${ADMIN_K_PARAMETER} (checksum ${verifyRes.winningChecksum.slice(0,8)}…)`);
+
+      const verifiedResults = cd.verified_results;
+
+      console.log(`[CHUNK RESULT] Calling chunkingManager.handleChunkCompletion for ${chunkId}`);
+
+      try {
+        const assemblyResult = chunkingManager.handleChunkCompletion(parentId, chunkId, verifiedResults, processingTime);
+        console.log(`[CHUNK RESULT] Assembly result for ${chunkId}:`, {
+          success: assemblyResult.success,
+          status: assemblyResult.status,
+          error: assemblyResult.error
+        });
+
+        if (assemblyResult.success && assemblyResult.status === 'complete') {
+          console.log(`🎉 Enhanced workload ${parentId} COMPLETED!`);
+
+          workloadState.status = 'complete';
+          workloadState.completedAt = Date.now();
+          workloadState.assemblyStats = assemblyResult.stats;
+
+          let finalBase64 = null;
+          if (assemblyResult.finalResult) {
+            if (typeof assemblyResult.finalResult === 'string') {
+              finalBase64 = assemblyResult.finalResult;
+            } else if (assemblyResult.finalResult.data) {
+              finalBase64 = typeof assemblyResult.finalResult.data === 'string'
+                ? assemblyResult.finalResult.data
+                : Buffer.from(assemblyResult.finalResult.data).toString('base64');
+            }
+          }
+
+          workloadState.finalResultBase64 = finalBase64;
+
+          console.log(`[CHUNK RESULT] Cleaning up workload ${parentId}`);
+          try {
+            chunkingManager.cleanupWorkload(parentId);
+          } catch (cleanupError) {
+            console.warn(`[CHUNK RESULT] Cleanup warning for ${parentId}:`, cleanupError.message);
+          }
+
+          customWorkloadChunks.delete(parentId);
+          saveCustomWorkloads();
+          saveCustomWorkloadChunks();
+
+          console.log(`✅ Enhanced workload ${parentId} completed with ${assemblyResult.stats?.chunkingStrategy}/${assemblyResult.stats?.assemblyStrategy}`);
+
+          // Broadcast to both Socket.IO and native WebSocket clients
+          const completionData = {
+            id: parentId,
+            label: workloadState.label,
+            finalResultBase64: finalBase64,
+            finalResultUrl: finalBase64 ? null : `/api/workloads/${parentId}/download/final`,
+            enhanced: true,
+            stats: assemblyResult.stats
+          };
+
+          io.emit('workload:complete', completionData);
+
+          matrixState.clients.forEach(cl => {
+            if (cl.clientType === 'native') {
+              cl.emit('workload:complete', completionData);
+            }
+          });
+        } else if (!assemblyResult.success) {
+          console.error(`❌ Enhanced chunk processing failed for ${parentId}: ${assemblyResult.error}`);
+          workloadState.status = 'error';
+          workloadState.error = assemblyResult.error;
+          saveCustomWorkloads();
+          saveCustomWorkloadChunks();
+          broadcastCustomWorkloadList();
+        } else {
+          console.log(`⏳ Enhanced workload ${parentId} still processing (${assemblyResult.status})`);
+          workloadState.status = 'processing_chunks';
+          saveCustomWorkloads();
+          saveCustomWorkloadChunks();
+          broadcastCustomWorkloadList();
+        }
+      } catch (assemblyError) {
+        console.error(`❌ Assembly error for chunk ${chunkId}:`, assemblyError);
+        workloadState.status = 'error';
+        workloadState.error = assemblyError.message;
+        saveCustomWorkloads();
+        saveCustomWorkloadChunks();
+        broadcastCustomWorkloadList();
+      }
+    } else {
+      console.log(`⏳ Enhanced chunk ${chunkId} waiting for more submissions (${cd.submissions?.length || 0}/${ADMIN_K_PARAMETER})`);
+      workloadState.status = 'processing_chunks';
+      saveCustomWorkloads();
+      saveCustomWorkloadChunks();
+      broadcastCustomWorkloadList();
+    }
+  });
+
+  // Error handlers
+  client.on('workload:busy', ({ id, reason }) => {
+    client.isBusyWithNonChunkedWGSL = false;
+    const wl = customWorkloads.get(id);
+    if (wl && !wl.isChunkParent) {
+      wl.activeAssignments.delete(clientId);
+      if (wl.status !== 'complete') wl.status = 'pending_dispatch';
+      console.warn(`WGSL ${id} declined by native client ${clientId} (${reason||'busy'})`);
+      saveCustomWorkloads();
+      saveCustomWorkloadChunks();
+      broadcastCustomWorkloadList();
+    }
+    tryDispatchNonChunkedWorkloads();
+  });
+
+  client.on('workload:error', ({ id, message }) => {
+    client.isBusyWithNonChunkedWGSL = false;
+    const wl = customWorkloads.get(id);
+    if (wl && !wl.isChunkParent) {
+      wl.activeAssignments.delete(clientId);
+      if (wl.status !== 'complete') wl.status = 'pending_dispatch';
+      console.warn(`WGSL ${id} errored on native client ${clientId}: ${message}`);
+      saveCustomWorkloads();
+      saveCustomWorkloadChunks();
+      broadcastCustomWorkloadList();
+    }
+    tryDispatchNonChunkedWorkloads();
+  });
+
+  client.on('workload:chunk_error', ({ parentId, chunkId, message }) => {
+    client.isBusyWithCustomChunk = false;
+    console.warn(`Chunk error ${chunkId} from native client ${clientId}: ${message}`);
+    const store = customWorkloadChunks.get(parentId);
+    if (store) {
+      const cd = store.allChunkDefs.find(c => c.chunkId === chunkId);
+      if (cd) {
+        cd.activeAssignments.delete(clientId);
+        const parent = customWorkloads.get(parentId);
+        addProcessingTime(parent, {
+          chunkId,
+          clientId: clientId,
+          error: message
+        });
+        saveCustomWorkloads();
+        saveCustomWorkloadChunks();
+        broadcastCustomWorkloadList();
+      }
+    }
+  });
+
+  console.log(`[WS-NATIVE] Client ${clientId} event handlers registered`);
+});
+
+// Update broadcastClientList to include native clients
+function broadcastClientListEnhanced() {
+  const list = Array.from(matrixState.clients.values()).map(c => ({
+    id: c.id,
+    joinedAt: c.joinedAt,
+    completedTasks: c.completedTasks,
+    gpuInfo: c.gpuInfo,
+    supportedFrameworks: c.supportedFrameworks,
+    clientType: c.clientType,
+    lastActive: c.lastActive,
+    connected: c.connected,
+    usingCpu: c.gpuInfo?.isCpuComputation || false,
+    isPuppeteer: c.isPuppeteer || false,
+    isBusyWithMatrixTask: c.isBusyWithMatrixTask,
+    isBusyWithCustomChunk: c.isBusyWithCustomChunk,
+    isBusyWithNonChunkedWGSL: c.isBusyWithNonChunkedWGSL
+  }));
+
+  // Broadcast to Socket.IO clients
+  io.emit('clients:update', { clients: list });
+
+  // Broadcast to native WebSocket clients
+  matrixState.clients.forEach(client => {
+    if (client.clientType === 'native' && client.connected) {
+      client.emit('clients:update', { clients: list });
+    }
+  });
+}
+
+// Replace the original broadcastClientList function
+const originalBroadcastClientList = broadcastClientList;
+broadcastClientList = broadcastClientListEnhanced;
+
+console.log('🔌 Raw WebSocket server initialized on /ws-native endpoint');
+
 
 app.use((req, res, next) => {
   res.header('Access-Control-Allow-Origin', '*');
@@ -1237,14 +1733,15 @@ function assignCustomChunkToAvailableClients() {
     client.gpuInfo &&
     !client.isBusyWithCustomChunk &&
     !client.isBusyWithMatrixTask &&
-    client.socket
+    (client.socket || client.emit) // Support both Socket.IO and native WebSocket clients
   );
 
   for (const [clientId, client] of availableClients) {
     for (const parent of customWorkloads.values()) {
       if (!parent.isChunkParent || !['assigning_chunks', 'processing_chunks'].includes(parent.status)) continue;
 
-      if (!client.supportedFrameworks.includes(parent.framework)) {
+      // Check if client supports the framework
+      if (!client.supportedFrameworks || !client.supportedFrameworks.includes(parent.framework)) {
         continue;
       }
 
@@ -1273,89 +1770,154 @@ function assignCustomChunkToAvailableClients() {
             hasOutputs: !!cd.outputs,
             outputsLength: cd.outputs ? cd.outputs.length : 0,
             hasSchema: !!cd.schema,
-            hasMetadata: !!cd.metadata
+            hasMetadata: !!cd.metadata,
+            clientType: client.clientType || 'unknown'
           });
 
           // Create unified task data that the client expects
           const taskData = {
-          // Basic chunk info
-          parentId: cd.parentId,
-          chunkId: cd.chunkId,
-          chunkOrderIndex: cd.chunkOrderIndex,
-          framework: parent.framework,
-          enhanced: parent.enhanced,
+            // Basic chunk info
+            parentId: cd.parentId,
+            chunkId: cd.chunkId,
+            chunkOrderIndex: cd.chunkOrderIndex,
+            framework: parent.framework,
+            enhanced: parent.enhanced,
 
-          // Shader code (WebGPU)
-          kernel: cd.kernel || parent.metadata?.customShader,
-          wgsl: cd.wgsl || cd.kernel || parent.metadata?.customShader,
-          entry: cd.entry || 'main',
-          workgroupCount: cd.workgroupCount || [1, 1, 1],
+            // Shader code (WebGPU)
+            kernel: cd.kernel || parent.metadata?.customShader,
+            wgsl: cd.wgsl || cd.kernel || parent.metadata?.customShader,
+            entry: cd.entry || 'main',
+            workgroupCount: cd.workgroupCount || [1, 1, 1],
 
-          // NEW: WebGL-specific properties (copy from chunk descriptor)
-          webglShaderType: cd.webglShaderType,
-          webglVertexShader: cd.webglVertexShader,
-          webglFragmentShader: cd.webglFragmentShader,
-          webglVaryings: cd.webglVaryings,
-          webglNumElements: cd.webglNumElements,
-          webglInputSpec: cd.webglInputSpec,
+            // WebGL-specific properties (copy from chunk descriptor)
+            webglShaderType: cd.webglShaderType,
+            webglVertexShader: cd.webglVertexShader,
+            webglFragmentShader: cd.webglFragmentShader,
+            webglVaryings: cd.webglVaryings,
+            webglNumElements: cd.webglNumElements,
+            webglInputSpec: cd.webglInputSpec,
 
-          // NEW: CUDA-specific properties (for future)
-          blockDim: cd.blockDim,
-          gridDim: cd.gridDim,
+            // CUDA-specific properties
+            blockDim: cd.blockDim,
+            gridDim: cd.gridDim,
+            cudaKernel: cd.cudaKernel,
 
-          // NEW: OpenCL-specific properties (for future)
-          globalWorkSize: cd.globalWorkSize,
-          localWorkSize: cd.localWorkSize,
+            // OpenCL-specific properties
+            globalWorkSize: cd.globalWorkSize,
+            localWorkSize: cd.localWorkSize,
+            openclKernel: cd.openclKernel,
 
-          // Data and outputs
-          inputs: cd.inputs || [],           // Array of {name, data} objects
-          outputs: cd.outputs || [],         // Array of {name, size} objects
-          metadata: cd.metadata || {},       // Strategy-specific uniforms data
-          schema: cd.schema,                 // Binding schema
+            // Vulkan-specific properties
+            vulkanShader: cd.vulkanShader,
+            computeShader: cd.computeShader,
+            specializationConstants: cd.specializationConstants,
+            pushConstants: cd.pushConstants,
 
-          // Legacy compatibility
-          outputSizes: cd.outputs ? cd.outputs.map(o => o.size) : [cd.outputSize],
-          outputSize: cd.outputs ? cd.outputs[0]?.size : cd.outputSize,
+            // Data and outputs
+            inputs: cd.inputs || [],           // Array of {name, data} objects
+            outputs: cd.outputs || [],         // Array of {name, size} objects
+            metadata: cd.metadata || {},       // Strategy-specific uniforms data
+            schema: cd.schema,                 // Binding schema
 
-          // Debug info
-          chunkingStrategy: parent.chunkingStrategy,
-          assemblyStrategy: parent.assemblyStrategy
-        };
+            // Legacy compatibility
+            outputSizes: cd.outputs ? cd.outputs.map(o => o.size) : [cd.outputSize],
+            outputSize: cd.outputs ? cd.outputs[0]?.size : cd.outputSize,
+
+            // Debug info
+            chunkingStrategy: parent.chunkingStrategy,
+            assemblyStrategy: parent.assemblyStrategy
+          };
 
           // Debug: Log the complete task data being sent
-          console.log(`[CHUNK DEBUG] Sending chunk ${cd.chunkId} to ${clientId}:`, {
+          console.log(`[CHUNK DEBUG] Sending chunk ${cd.chunkId} to ${clientId} (${client.clientType || 'browser'}):`, {
             inputs: taskData.inputs?.length,
             outputs: taskData.outputs?.length,
             hasKernel: !!taskData.kernel,
             hasSchema: !!taskData.schema,
-            workgroupCount: taskData.workgroupCount
+            workgroupCount: taskData.workgroupCount,
+            framework: parent.framework
           });
 
           console.log(`[SERVER DEBUG] Sending chunk ${cd.chunkId} to ${clientId}:`);
           console.log(`[SERVER DEBUG] Framework: ${parent.framework}`);
+          console.log(`[SERVER DEBUG] Client type: ${client.clientType || 'browser'}`);
           console.log(`[SERVER DEBUG] TaskData keys:`, Object.keys(taskData));
-          console.log(`[SERVER DEBUG] Has webglVertexShader:`, !!taskData.webglVertexShader);
-          console.log(`[SERVER DEBUG] Has webglFragmentShader:`, !!taskData.webglFragmentShader);
+
+          // Framework-specific debug logging
+          if (parent.framework === 'webgl') {
+            console.log(`[SERVER DEBUG] Has webglVertexShader:`, !!taskData.webglVertexShader);
+            console.log(`[SERVER DEBUG] Has webglFragmentShader:`, !!taskData.webglFragmentShader);
+            if (taskData.webglVertexShader) {
+              console.log(`[SERVER DEBUG] WebGL vertex shader length:`, taskData.webglVertexShader.length);
+              console.log(`[SERVER DEBUG] WebGL vertex shader preview:`, taskData.webglVertexShader.substring(0, 100) + '...');
+            }
+          } else if (parent.framework === 'vulkan') {
+            console.log(`[SERVER DEBUG] Has vulkanShader:`, !!taskData.vulkanShader);
+            console.log(`[SERVER DEBUG] Has computeShader:`, !!taskData.computeShader);
+          } else if (parent.framework === 'cuda') {
+            console.log(`[SERVER DEBUG] Has cudaKernel:`, !!taskData.cudaKernel);
+            console.log(`[SERVER DEBUG] blockDim:`, taskData.blockDim);
+            console.log(`[SERVER DEBUG] gridDim:`, taskData.gridDim);
+          } else if (parent.framework === 'opencl') {
+            console.log(`[SERVER DEBUG] Has openclKernel:`, !!taskData.openclKernel);
+            console.log(`[SERVER DEBUG] globalWorkSize:`, taskData.globalWorkSize);
+          }
+
           console.log(`[SERVER DEBUG] Has kernel:`, !!taskData.kernel);
 
-          if (taskData.webglVertexShader) {
-            console.log(`[SERVER DEBUG] WebGL vertex shader length:`, taskData.webglVertexShader.length);
-            console.log(`[SERVER DEBUG] WebGL vertex shader preview:`, taskData.webglVertexShader.substring(0, 100) + '...');
+          // Send chunk assignment based on client type
+          if (client.socket) {
+            // Socket.IO client (browser)
+            console.log(`[DISPATCH] Sending to Socket.IO client ${clientId}`);
+            client.socket.emit('workload:chunk_assign', taskData);
+          } else if (client.emit) {
+            // Native WebSocket client (C++/native)
+            console.log(`[DISPATCH] Sending to native WebSocket client ${clientId}`);
+            client.emit('workload:chunk_assign', taskData);
+          } else {
+            // Fallback: try both methods (shouldn't happen with updated filter)
+            console.warn(`[DISPATCH] Client ${clientId} has no emit method, attempting fallback`);
+            if (typeof client.send === 'function') {
+              // Try direct WebSocket send with JSON message format
+              const message = JSON.stringify({
+                type: 'workload:chunk_assign',
+                data: taskData
+              });
+              client.send(message);
+            } else {
+              console.error(`[DISPATCH] No viable dispatch method for client ${clientId}`);
+              // Revert chunk assignment state
+              cd.dispatchesMade--;
+              cd.activeAssignments.delete(clientId);
+              cd.assignedClients.delete(clientId);
+              cd.status = 'queued';
+              cd.assignedTo = null;
+              cd.assignedAt = null;
+              client.isBusyWithCustomChunk = false;
+              continue;
+            }
           }
-
-          if (taskData.webglFragmentShader) {
-            console.log(`[SERVER DEBUG] WebGL fragment shader length:`, taskData.webglFragmentShader.length);
-          }
-
-          // Also debug the original chunk descriptor
-          console.log(`[SERVER DEBUG] Original cd keys:`, Object.keys(cd));
-          console.log(`[SERVER DEBUG] Original cd.webglVertexShader:`, !!cd.webglVertexShader);
-          console.log(`[SERVER DEBUG] Original cd.kernel:`, !!cd.kernel);
-          client.socket.emit('workload:chunk_assign', taskData);
 
           const inputCount = taskData.inputs?.length || 0;
           const outputCount = taskData.outputs?.length || 0;
-          console.log(`Assigned ${parent.framework} chunk ${cd.chunkId} to ${clientId} (${inputCount} inputs, ${outputCount} outputs)`);
+          const clientTypeStr = client.clientType || 'browser';
+
+          console.log(`✅ Assigned ${parent.framework} chunk ${cd.chunkId} to ${clientTypeStr} client ${clientId} (${inputCount} inputs, ${outputCount} outputs)`);
+
+          // Emit assignment event for monitoring
+          try {
+            io.emit('chunk:assigned', {
+              chunkId: cd.chunkId,
+              parentId: cd.parentId,
+              clientId: clientId,
+              clientType: clientTypeStr,
+              framework: parent.framework,
+              timestamp: Date.now()
+            });
+          } catch (emitError) {
+            console.warn(`[DISPATCH] Failed to emit assignment event:`, emitError.message);
+          }
+
           break;
         }
       }
@@ -1364,6 +1926,141 @@ function assignCustomChunkToAvailableClients() {
     }
   }
 }
+
+// Enhanced function to dispatch to both client types with framework filtering
+function dispatchToAllClients(eventName, eventData, frameworkFilter = null) {
+  let socketIoCount = 0;
+  let nativeWsCount = 0;
+
+  matrixState.clients.forEach((client, clientId) => {
+    if (!client.connected) return;
+
+    // Apply framework filter if specified
+    if (frameworkFilter && (!client.supportedFrameworks || !client.supportedFrameworks.includes(frameworkFilter))) {
+      return;
+    }
+
+    try {
+      if (client.socket) {
+        // Socket.IO client
+        client.socket.emit(eventName, eventData);
+        socketIoCount++;
+      } else if (client.emit) {
+        // Native WebSocket client
+        client.emit(eventName, eventData);
+        nativeWsCount++;
+      }
+    } catch (error) {
+      console.warn(`[DISPATCH] Failed to send ${eventName} to client ${clientId}:`, error.message);
+    }
+  });
+
+  if (frameworkFilter) {
+    console.log(`[DISPATCH] Sent ${eventName} to ${socketIoCount} Socket.IO + ${nativeWsCount} native clients supporting ${frameworkFilter}`);
+  } else {
+    console.log(`[DISPATCH] Sent ${eventName} to ${socketIoCount} Socket.IO + ${nativeWsCount} native clients`);
+  }
+}
+
+// Helper function to get client statistics
+function getClientStatistics() {
+  const stats = {
+    total: 0,
+    socketIO: 0,
+    nativeWS: 0,
+    byFramework: {},
+    busy: { matrix: 0, chunk: 0, workload: 0 }
+  };
+
+  matrixState.clients.forEach(client => {
+    if (!client.connected) return;
+
+    stats.total++;
+
+    if (client.socket) {
+      stats.socketIO++;
+    } else if (client.emit) {
+      stats.nativeWS++;
+    }
+
+    // Count by framework
+    if (client.supportedFrameworks) {
+      client.supportedFrameworks.forEach(framework => {
+        stats.byFramework[framework] = (stats.byFramework[framework] || 0) + 1;
+      });
+    }
+
+    // Count busy clients
+    if (client.isBusyWithMatrixTask) stats.busy.matrix++;
+    if (client.isBusyWithCustomChunk) stats.busy.chunk++;
+    if (client.isBusyWithNonChunkedWGSL) stats.busy.workload++;
+  });
+
+  return stats;
+}
+
+// Enhanced tryDispatchNonChunkedWorkloads for dual client support
+function tryDispatchNonChunkedWorkloads() { // Enhanced
+  for (const [clientId, client] of matrixState.clients.entries()) {
+    if (!client.connected || !client.gpuInfo || client.isBusyWithCustomChunk ||
+        client.isBusyWithMatrixTask || client.isBusyWithNonChunkedWGSL ||
+        (!client.socket && !client.emit)) {
+      continue;
+    }
+
+    for (const wl of customWorkloads.values()) {
+      if (!wl.isChunkParent && ['pending_dispatch', 'pending'].includes(wl.status)
+        && !wl.finalResultBase64 && wl.dispatchesMade < ADMIN_K_PARAMETER
+        && !wl.activeAssignments.has(clientId)) {
+
+        if (!client.supportedFrameworks || !client.supportedFrameworks.includes(wl.framework)) {
+          continue;
+        }
+
+        wl.dispatchesMade++;
+        wl.activeAssignments.add(clientId);
+        client.isBusyWithNonChunkedWGSL = true;
+
+        const clientTypeStr = client.clientType || 'browser';
+        console.log(`Dispatching ${wl.framework} workload ${wl.label} to ${clientTypeStr} client ${clientId}`);
+
+        let parsedInputs = {};
+        if (wl.input) {
+          try {
+            if (typeof wl.input === 'string' && wl.input.startsWith('{')) {
+              parsedInputs = JSON.parse(wl.input);
+            } else {
+              parsedInputs = { input: wl.input };
+            }
+          } catch (e) {
+            parsedInputs = { input: wl.input };
+          }
+        }
+
+        const taskData = {
+          ...wl,
+          compilationOptions: wl.compilationOptions,
+          inputs: Object.values(parsedInputs),
+          outputSizes: wl.outputSizes || [wl.outputSize]
+        };
+
+        // Send based on client type
+        if (client.socket) {
+          client.socket.emit('workload:new', taskData);
+        } else if (client.emit) {
+          client.emit('workload:new', taskData);
+        }
+
+        break;
+      }
+    }
+  }
+}
+
+// Replace the original function
+//const originalTryDispatchNonChunkedWorkloads = tryDispatchNonChunkedWorkloads;
+//function tryDispatchNonChunkedWorkloads = tryDispatchNonChunkedWorkloadsEnhanced;
+
 
 function debugMatrixTiledChunk(chunkDef, parentWorkload) {
   console.log(`[MATRIX TILED DEBUG] Chunk ${chunkDef.chunkId}:`, {
@@ -1419,7 +2116,7 @@ function generateTaskSchema(inputs, outputSizes) {
 
   return schema;
 }
-
+/*
 function tryDispatchNonChunkedWorkloads() {
   for (const [clientId, client] of matrixState.clients.entries()) {
     if (!client.connected || !client.gpuInfo || client.isBusyWithCustomChunk ||
@@ -1467,6 +2164,7 @@ function tryDispatchNonChunkedWorkloads() {
     }
   }
 }
+*/
 
 function handleClientDisconnect(clientId) {
   const client = matrixState.clients.get(clientId);

@@ -2,8 +2,12 @@
 #include <fstream>
 #include <memory>
 #include <csignal>
+#include <chrono>
+#include <thread>
 #include <nlohmann/json.hpp>
 #include "common/framework_client.hpp"
+#include "common/base64.hpp"
+#include "common/websocket_client.hpp"
 
 // Framework-specific includes
 #if defined(HAVE_VULKAN) && (defined(CLIENT_VULKAN) || defined(CLIENT_UNIVERSAL))
@@ -18,11 +22,23 @@
 
 using nlohmann::json;
 
-std::unique_ptr<FrameworkClient> globalClient;
+// Global state for signal handling
+std::unique_ptr<FrameworkClient> globalFrameworkClient;
+std::unique_ptr<WebSocketClient> globalWebSocketClient;
+std::unique_ptr<IFrameworkExecutor> globalExecutor;
+bool shutdownRequested = false;
 
 void signalHandler(int signum) {
     std::cout << "\nReceived signal " << signum << ", shutting down..." << std::endl;
-    if (globalClient) globalClient->disconnect();
+    shutdownRequested = true;
+
+    if (globalWebSocketClient) {
+        globalWebSocketClient->disconnect();
+    }
+    if (globalFrameworkClient) {
+        globalFrameworkClient->disconnect();
+    }
+
     std::exit(signum);
 }
 
@@ -45,8 +61,428 @@ static void printUsage(const char* programName) {
               << "  --device <0>                  Device ID\n"
               << "  --config <file.json>          Configuration file\n"
               << "  --insecure                    Accept self-signed certificates\n"
+              << "  --legacy                      Use legacy FrameworkClient instead of WebSocket\n"
               << std::endl;
 }
+
+
+
+// WebSocket-based client implementation
+class WebSocketFrameworkClient {
+private:
+    std::unique_ptr<WebSocketClient> wsClient;
+    std::unique_ptr<IFrameworkExecutor> executor;
+    std::string clientId;
+    json capabilities;
+    bool isConnected = false;
+    bool isProcessing = false;
+    std::string framework;
+
+public:
+    WebSocketFrameworkClient(std::unique_ptr<IFrameworkExecutor> exec, const std::string& fw)
+        : executor(std::move(exec)), framework(fw) {
+        wsClient = std::make_unique<WebSocketClient>();
+        //setupCapabilities();
+        setupEventHandlers();
+    }
+
+    void setupCapabilities() {
+         if (!executor) {
+            std::cerr << "❌ Executor is null in setupCapabilities" << std::endl;
+            // Create fallback capabilities
+            // ?? capabilities = { ... };
+            return;
+        }
+        try {
+            capabilities = executor->getCapabilities();
+            // Ensure supportedFrameworks array is present
+            if (!capabilities.contains("supportedFrameworks")) {
+                capabilities["supportedFrameworks"] = json::array({framework});
+            }
+        } catch (const std::exception& e) {
+            std::cerr << "Warning: Could not get executor capabilities: " << e.what() << std::endl;
+            // Create minimal capabilities
+            capabilities = {
+                {"framework", framework},
+                {"initialized", true},
+                {"supportedFrameworks", {framework}},
+                {"device", {{"name", "Unknown Device"}}}
+            };
+        }
+    }
+    bool initialize() {
+    if (!executor) return false;  // Null check first
+        setupCapabilities();          // Safe to call now
+        return true;
+    }
+    void setupEventHandlers() {
+        wsClient->setOnConnected([this]() {
+            std::cout << "✅ Connected! Starting event loop..." << std::endl;
+            isConnected = true;
+
+            // Automatically join computation when connected
+            wsClient->joinComputation(capabilities);
+        });
+
+        wsClient->setOnDisconnected([this]() {
+            std::cout << "❌ Disconnected from server" << std::endl;
+            isConnected = false;
+            isProcessing = false;
+        });
+
+        wsClient->setOnRegister([this](const json& data) {
+            clientId = data.value("clientId", "");
+            std::cout << "📝 Registered with client ID: " << clientId << std::endl;
+        });
+
+        wsClient->setOnTaskAssigned([this](const json& task) {
+            std::cout << "📋 Received matrix task: " << task.value("id", "") << std::endl;
+            handleMatrixTask(task);
+        });
+
+        wsClient->setOnWorkloadAssigned([this](const json& workload) {
+            std::cout << "🔧 Received workload: " << workload.value("id", "") << std::endl;
+            handleWorkload(workload);
+        });
+
+        wsClient->setOnChunkAssigned([this](const json& chunk) {
+            std::cout << "🧩 Received chunk: " << chunk.value("chunkId", "") << std::endl;
+            handleChunk(chunk);
+        });
+
+        wsClient->setOnTaskVerified([this](const json& data) {
+            std::cout << "✅ Task verified: " << data.value("taskId", "") << std::endl;
+            isProcessing = false;
+            requestNextTask();
+        });
+
+        wsClient->setOnTaskSubmitted([this](const json& data) {
+            std::cout << "📤 Task submitted, waiting for verification: " << data.value("taskId", "") << std::endl;
+            isProcessing = false;
+            requestNextTask();
+        });
+
+        wsClient->setOnWorkloadComplete([this](const json& data) {
+            std::cout << "🎉 Workload completed: " << data.value("label", "") << std::endl;
+            isProcessing = false;
+            requestNextTask();
+        });
+    }
+
+    bool connect(const std::string& serverUrl) {
+        // Parse URL to extract host and port
+        std::string host = "localhost";
+        std::string port = "3000";
+
+        // Simple URL parsing for wss://host:port format
+        if (serverUrl.find("wss://") == 0) {
+            std::string hostPort = serverUrl.substr(6); // Remove "wss://"
+            size_t colonPos = hostPort.find(':');
+            if (colonPos != std::string::npos) {
+                host = hostPort.substr(0, colonPos);
+                port = hostPort.substr(colonPos + 1);
+            } else {
+                host = hostPort;
+                port = "443"; // Default HTTPS port
+            }
+        }
+
+        std::cout << "🔌 Connecting to server: " << serverUrl << std::endl;
+
+        if (wsClient->connect(host, port, "/ws-native")) {
+            std::cout << "✅ Connected to server" << std::endl;
+            return true;
+        } else {
+            std::cerr << "❌ Failed to connect to server" << std::endl;
+            return false;
+        }
+    }
+
+    void run() {
+        std::cout << "🚀 Client ready to receive " << framework << " workloads" << std::endl;
+        std::cout << "Press Ctrl+C to shutdown gracefully" << std::endl;
+
+        // Start requesting tasks periodically
+        while (isConnected && !shutdownRequested) {
+            if (!isProcessing) {
+                requestNextTask();
+            }
+            std::this_thread::sleep_for(std::chrono::seconds(5));
+        }
+    }
+
+private:
+    // Helper methods for converting between JSON and TaskData structures
+    TaskData convertJsonToTaskData(const json& data, bool isChunk) {
+        TaskData task;
+
+        if (isChunk) {
+            task.id = data.value("chunkId", "");
+            task.parentId = data.value("parentId", "");
+            task.chunkId = data.value("chunkId", "");
+            task.chunkOrderIndex = data.value("chunkOrderIndex", -1);
+            task.isChunk = true;
+        } else {
+            task.id = data.value("id", "");
+        }
+
+        task.framework = data.value("framework", framework);
+
+        // Get shader/kernel code
+        if (data.contains("kernel")) {
+            task.kernel = data["kernel"];
+        } else if (data.contains("wgsl")) {
+            task.kernel = data["wgsl"];
+        } else if (data.contains("vulkanShader")) {
+            task.kernel = data["vulkanShader"];
+        } else if (data.contains("openclKernel")) {
+            task.kernel = data["openclKernel"];
+        } else if (data.contains("cudaKernel")) {
+            task.kernel = data["cudaKernel"];
+        }
+
+        task.entry = data.value("entry", "main");
+        task.bindLayout = data.value("bindLayout", "");
+        task.compilationOptions = data.value("compilationOptions", json::object());
+
+        // Handle metadata and uniforms
+        if (data.contains("metadata") && data["metadata"].is_object()) {
+            task.metadata = data["metadata"];
+            // Copy metadata into chunkUniforms for executor compatibility
+            for (auto it = data["metadata"].begin(); it != data["metadata"].end(); ++it) {
+                task.chunkUniforms[it.key()] = it.value();
+            }
+        }
+
+        if (data.contains("chunkUniforms") && data["chunkUniforms"].is_object()) {
+            for (auto it = data["chunkUniforms"].begin(); it != data["chunkUniforms"].end(); ++it) {
+                task.chunkUniforms[it.key()] = it.value();
+            }
+        }
+
+        // Work group sizes
+        if (data.contains("globalWorkSize") && data["globalWorkSize"].is_array()) {
+            task.workgroupCount = data["globalWorkSize"].get<std::vector<int>>();
+        } else if (data.contains("workgroupCount") && data["workgroupCount"].is_array()) {
+            task.workgroupCount = data["workgroupCount"].get<std::vector<int>>();
+        } else {
+            task.workgroupCount = {1, 1, 1};
+        }
+
+        // Decode inputs
+        task.inputData = decodeInputs(data);
+
+        // Parse output sizes
+        if (data.contains("outputs") && data["outputs"].is_array()) {
+            for (const auto& output : data["outputs"]) {
+                if (output.contains("size")) {
+                    task.outputSizes.push_back(output["size"]);
+                }
+            }
+        } else if (data.contains("outputSizes") && data["outputSizes"].is_array()) {
+            task.outputSizes = data["outputSizes"].get<std::vector<size_t>>();
+        } else if (data.contains("outputSize")) {
+            task.outputSizes = {data["outputSize"].get<size_t>()};
+        } else {
+            task.outputSizes = {1024}; // Default
+        }
+
+        // Set legacy fields for backward compatibility
+        if (!task.inputData.empty()) {
+            task.legacyInputData = task.inputData[0];
+        }
+        if (!task.outputSizes.empty()) {
+            task.legacyOutputSize = task.outputSizes[0];
+        }
+
+        return task;
+    }
+
+    std::vector<std::vector<uint8_t>> decodeInputs(const json& data) {
+        std::vector<std::vector<uint8_t>> inputs;
+
+        // Preferred: inputs as array of { name, data }
+        if (data.contains("inputs") && data["inputs"].is_array()) {
+            for (const auto& item : data["inputs"]) {
+                if (item.is_object() && item.contains("data") && item["data"].is_string()) {
+                    auto b64 = item["data"].get<std::string>();
+                    if (!b64.empty()) inputs.push_back(base64_decode(b64));
+                } else if (item.is_string()) {
+                    auto b64 = item.get<std::string>();
+                    if (!b64.empty()) inputs.push_back(base64_decode(b64));
+                }
+            }
+        }
+        // Legacy single input fallbacks
+        else if (data.contains("input") && data["input"].is_string()) {
+            auto b64 = data["input"].get<std::string>();
+            if (!b64.empty()) inputs.push_back(base64_decode(b64));
+        } else if (data.contains("inputData") && data["inputData"].is_string()) {
+            auto b64 = data["inputData"].get<std::string>();
+            if (!b64.empty()) inputs.push_back(base64_decode(b64));
+        }
+
+        return inputs;
+    }
+
+    json convertTaskResultToJson(const TaskResult& result) {
+        if (result.hasMultipleOutputs()) {
+            json results = json::array();
+            for (const auto& output : result.outputData) {
+                results.push_back(base64_encode(output));
+            }
+            return results;
+        } else {
+            if (!result.outputData.empty()) {
+                return base64_encode(result.outputData[0]);
+            } else if (!result.legacyOutputData.empty()) {
+                return base64_encode(result.legacyOutputData);
+            }
+        }
+        return json::array();
+    }
+
+    std::string generateResultChecksum(const TaskResult& result) {
+        // Simple checksum generation - you may want to implement SHA256 here
+        std::string combined = "";
+        if (result.hasMultipleOutputs()) {
+            for (const auto& output : result.outputData) {
+                combined += std::to_string(output.size()) + "_";
+            }
+        } else {
+            if (!result.outputData.empty()) {
+                combined = std::to_string(result.outputData[0].size());
+            } else if (!result.legacyOutputData.empty()) {
+                combined = std::to_string(result.legacyOutputData.size());
+            }
+        }
+        return "checksum_" + std::to_string(std::hash<std::string>{}(combined));
+    }
+
+    void requestNextTask() {
+        if (isConnected && !isProcessing) {
+            wsClient->requestTask();
+        }
+    }
+
+    void handleMatrixTask(const json& task) {
+        isProcessing = true;
+
+        try {
+            std::string assignmentId = task.value("assignmentId", "");
+            std::string taskId = task.value("id", "");
+
+            // Convert JSON task to TaskData struct
+            TaskData taskData = convertJsonToTaskData(task, false);
+            taskData.id = taskId;
+
+            auto start = std::chrono::high_resolution_clock::now();
+            TaskResult result = executor->executeTask(taskData);
+            auto end = std::chrono::high_resolution_clock::now();
+
+            if (result.success) {
+                // Convert result back to expected format for matrix task
+                json matrixResult = convertTaskResultToJson(result);
+
+                std::string checksum = generateResultChecksum(result);
+                wsClient->submitTaskResult(assignmentId, taskId, matrixResult, result.processingTime, checksum);
+            } else {
+                wsClient->reportError(taskId, result.errorMessage);
+            }
+
+        } catch (const std::exception& e) {
+            std::cerr << "❌ Error processing matrix task: " << e.what() << std::endl;
+            wsClient->reportError(task.value("id", ""), e.what());
+        }
+
+        isProcessing = false;
+    }
+
+    void handleWorkload(const json& workload) {
+        isProcessing = true;
+
+        try {
+            std::string workloadId = workload.value("id", "");
+
+            // Convert JSON workload to TaskData struct
+            TaskData taskData = convertJsonToTaskData(workload, false);
+            taskData.id = workloadId;
+
+            TaskResult result = executor->executeTask(taskData);
+
+            if (result.success) {
+                // For single output workloads, send the first output
+                std::string resultData = "";
+                if (!result.outputData.empty()) {
+                    resultData = base64_encode(result.outputData[0]);
+                } else if (!result.legacyOutputData.empty()) {
+                    resultData = base64_encode(result.legacyOutputData);
+                }
+
+                std::string checksum = generateResultChecksum(result);
+                wsClient->submitWorkloadResult(workloadId, resultData, result.processingTime, checksum);
+            } else {
+                wsClient->reportError(workloadId, result.errorMessage);
+            }
+
+        } catch (const std::exception& e) {
+            std::cerr << "❌ Error processing workload: " << e.what() << std::endl;
+            wsClient->reportError(workload.value("id", ""), e.what());
+        }
+
+        isProcessing = false;
+    }
+
+    void handleChunk(const json& chunk) {
+        isProcessing = true;
+
+        try {
+            std::string parentId = chunk.value("parentId", "");
+            std::string chunkId = chunk.value("chunkId", "");
+            std::string strategy = chunk.value("chunkingStrategy", "");
+            json metadata = chunk.value("metadata", json::object());
+
+            // Convert JSON chunk to TaskData struct
+            TaskData taskData = convertJsonToTaskData(chunk, true);
+            taskData.parentId = parentId;
+            taskData.chunkId = chunkId;
+            taskData.chunkOrderIndex = chunk.value("chunkOrderIndex", -1);
+
+            TaskResult result = executor->executeTask(taskData);
+
+            if (result.success) {
+                // Convert multi-output results to JSON array
+                json results = json::array();
+                if (result.hasMultipleOutputs()) {
+                    for (const auto& output : result.outputData) {
+                        results.push_back(base64_encode(output));
+                    }
+                } else {
+                    // Single output - add to array for consistency
+                    if (!result.outputData.empty()) {
+                        results.push_back(base64_encode(result.outputData[0]));
+                    } else if (!result.legacyOutputData.empty()) {
+                        results.push_back(base64_encode(result.legacyOutputData));
+                    }
+                }
+
+                std::string checksum = generateResultChecksum(result);
+
+                wsClient->submitChunkResult(parentId, chunkId, results, result.processingTime,
+                                           strategy, metadata, checksum);
+            } else {
+                wsClient->reportChunkError(parentId, chunkId, result.errorMessage);
+            }
+
+        } catch (const std::exception& e) {
+            std::cerr << "❌ Error processing chunk: " << e.what() << std::endl;
+            wsClient->reportChunkError(chunk.value("parentId", ""),
+                                      chunk.value("chunkId", ""), e.what());
+        }
+
+        isProcessing = false;
+    }
+};
 
 int main(int argc, char* argv[]) {
     if (argc < 2) {
@@ -59,6 +495,7 @@ int main(int argc, char* argv[]) {
     int deviceId = 0;
     std::string configFile;
     bool insecure = false;
+    bool useLegacy = false;
 
     for (int i = 2; i < argc; i++) {
         std::string arg = argv[i];
@@ -74,11 +511,13 @@ int main(int argc, char* argv[]) {
         else if (arg == "--insecure") {
             insecure = true;
         }
+        else if (arg == "--legacy") {
+            useLegacy = true;
+        }
     }
 
     // Set insecure SSL if requested
     if (insecure) {
-        // This would typically set an environment variable or config
         std::cout << "Warning: Accepting self-signed certificates" << std::endl;
     }
 
@@ -170,26 +609,50 @@ int main(int argc, char* argv[]) {
                   << e.what() << ")" << std::endl;
     }
 
-    // Create client
-    globalClient = std::make_unique<FrameworkClient>(std::move(executor));
+    // Set up signal handlers
     std::signal(SIGINT,  signalHandler);
     std::signal(SIGTERM, signalHandler);
 
-    std::cout << "Connecting to server: " << serverUrl << std::endl;
-    if (!globalClient->connect(serverUrl)) {
-        std::cerr << "Failed to connect to server" << std::endl;
-        std::cerr << "Troubleshooting:" << std::endl;
-        std::cerr << "  - Check server is running on " << serverUrl << std::endl;
-        std::cerr << "  - If using self-signed certs, try --insecure flag" << std::endl;
-        std::cerr << "  - Verify network connectivity and firewall settings" << std::endl;
-        return 1;
+    // Choose client implementation
+    if (useLegacy) {
+        std::cout << "Using legacy FrameworkClient..." << std::endl;
+        globalFrameworkClient = std::make_unique<FrameworkClient>(std::move(executor));
+        globalExecutor = nullptr; // Moved to FrameworkClient
+
+        std::cout << "Connecting to server: " << serverUrl << std::endl;
+        if (!globalFrameworkClient->connect(serverUrl)) {
+            std::cerr << "Failed to connect to server" << std::endl;
+            return 1;
+        }
+
+        std::cout << "✅ Connected! Starting event loop..." << std::endl;
+        std::cout << "Framework: " << framework << std::endl;
+        std::cout << "Client ready to receive " << framework << " workloads" << std::endl;
+        std::cout << "Press Ctrl+C to shutdown gracefully" << std::endl;
+
+        globalFrameworkClient->run();
+    } else {
+        std::cout << "Using WebSocket client..." << std::endl;
+        //globalExecutor = std::move(executor);
+
+        auto wsFrameworkClient = std::make_unique<WebSocketFrameworkClient>(std::move(executor), framework);
+        if (!wsFrameworkClient->initialize()) {
+            std::cerr << "❌ Failed to initialize WebSocketFrameworkClient" << std::endl;
+            return 1;
+        }
+        if (!wsFrameworkClient->connect(serverUrl)) {
+            std::cerr << "Failed to connect to server" << std::endl;
+            std::cerr << "Troubleshooting:" << std::endl;
+            std::cerr << "  - Check server is running on " << serverUrl << std::endl;
+            std::cerr << "  - If using self-signed certs, try --insecure flag" << std::endl;
+            std::cerr << "  - Verify network connectivity and firewall settings" << std::endl;
+            std::cerr << "  - Try --legacy flag to use old client implementation" << std::endl;
+            return 1;
+        }
+
+        wsFrameworkClient->run();
     }
 
-    std::cout << "✅ Connected! Starting event loop..." << std::endl;
-    std::cout << "Framework: " << framework << std::endl;
-    std::cout << "Client ready to receive " << framework << " workloads" << std::endl;
-    std::cout << "Press Ctrl+C to shutdown gracefully" << std::endl;
-
-    globalClient->run();
+    std::cout << "👋 Client shutting down" << std::endl;
     return 0;
 }

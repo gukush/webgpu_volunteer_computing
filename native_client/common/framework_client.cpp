@@ -35,6 +35,7 @@ bool FrameworkClient::connect(const std::string& url) {
 
         // Add socket.io path if not present
         if (target.find("socket.io") == std::string::npos) {
+            if (!target.empty() && target.back() != '/') target.push_back('/');
             target += "socket.io/?EIO=4&transport=websocket";
         }
 
@@ -63,7 +64,7 @@ void FrameworkClient::run() {
 void FrameworkClient::onConnected() {
     connected = true;
     std::cout << "Connected to server" << std::endl;
-
+    /*
     // Send initial registration
     json registerMsg = {
         {"type", "client:join"},
@@ -75,9 +76,11 @@ void FrameworkClient::onConnected() {
         }}
     };
 
-    // Socket.io message format: "42" + JSON
-    std::string message = "42" + registerMsg.dump();
+    // Socket.io message format: "42" + JSON - FIXED: Added missing quotes around client:join
+    std::string message = ("42[\"client:join\", " + registerMsg.dump() + "]");
     wsClient->send(message);
+    */
+   joinSent = false;
 }
 
 void FrameworkClient::onDisconnected() {
@@ -87,7 +90,18 @@ void FrameworkClient::onDisconnected() {
 
 void FrameworkClient::onMessage(const std::string& message) {
     try {
-        // Parse Socket.io message format
+        if (message.rfind("40", 0) == 0 && !joinSent) {
+            json joinPayload = {
+                {"gpuInfo", executor->getCapabilities()},
+                {"hasWebGPU", false},
+                {"supportedFrameworks", {executor->getFrameworkName()}},
+                {"clientType", "native"}
+            };
+            std::string joinMsg = std::string("42[\"client:join\",") + joinPayload.dump() + "]";
+            wsClient->send(joinMsg);
+            joinSent = true;
+            return;
+        }
         if (message.length() < 2 || message.substr(0, 2) != "42") {
             return; // Not a data message
         }
@@ -128,33 +142,52 @@ void FrameworkClient::onMessage(const std::string& message) {
 std::vector<std::vector<uint8_t>> FrameworkClient::decodeInputs(const json& data) {
     std::vector<std::vector<uint8_t>> inputs;
 
-    // NEW: Check for multi-input format first
+    // Preferred: inputs as array of { name, data }
     if (data.contains("inputs") && data["inputs"].is_array()) {
-        // Multi-input format: ["base64_1", "base64_2", ...]
-        for (const auto& inputBase64 : data["inputs"]) {
-            if (inputBase64.is_string() && !inputBase64.get<std::string>().empty()) {
-                inputs.push_back(base64_decode(inputBase64.get<std::string>()));
-            } else {
-                inputs.push_back(std::vector<uint8_t>()); // Empty input
+        for (const auto& item : data["inputs"]) {
+            if (item.is_object() && item.contains("data") && item["data"].is_string()) {
+                auto b64 = item["data"].get<std::string>();
+                if (!b64.empty()) inputs.push_back(base64_decode(b64));
+            } else if (item.is_string()) {
+                auto b64 = item.get<std::string>();
+                if (!b64.empty()) inputs.push_back(base64_decode(b64));
             }
         }
-    } else if (data.contains("input") && !data["input"].is_null()) {
-        // Legacy single input format
-        std::string inputBase64 = data["input"];
-        if (!inputBase64.empty()) {
-            inputs.push_back(base64_decode(inputBase64));
+    }
+    // Alternative: chunkInputs object, optionally guided by schema.inputs order
+    else if (data.contains("chunkInputs") && data["chunkInputs"].is_object()) {
+        if (data.contains("schema") && data["schema"].contains("inputs") && data["schema"]["inputs"].is_array()) {
+            for (const auto& def : data["schema"]["inputs"]) {
+                if (!def.contains("name")) continue;
+                auto name = def["name"].get<std::string>();
+                auto it = data["chunkInputs"].find(name);
+                if (it != data["chunkInputs"].end() && it->is_string()) {
+                    auto b64 = it->get<std::string>();
+                    if (!b64.empty()) inputs.push_back(base64_decode(b64));
+                }
+            }
+        } else {
+            for (auto it = data["chunkInputs"].begin(); it != data["chunkInputs"].end(); ++it) {
+                if (it.value().is_string()) {
+                    auto b64 = it.value().get<std::string>();
+                    if (!b64.empty()) inputs.push_back(base64_decode(b64));
+                }
+            }
         }
-    } else if (data.contains("inputData") && !data["inputData"].is_null()) {
-        // Chunk format single input
-        std::string inputBase64 = data["inputData"];
-        if (!inputBase64.empty()) {
-            inputs.push_back(base64_decode(inputBase64));
-        }
+    }
+    // Legacy single-field fallbacks
+    else if (data.contains("input") && data["input"].is_string()) {
+        auto b64 = data["input"].get<std::string>();
+        if (!b64.empty()) inputs.push_back(base64_decode(b64));
+    } else if (data.contains("inputData") && data["inputData"].is_string()) {
+        auto b64 = data["inputData"].get<std::string>();
+        if (!b64.empty()) inputs.push_back(base64_decode(b64));
     }
 
     return inputs;
 }
 
+// FIXED: Added missing opening brace
 TaskData FrameworkClient::parseTaskData(const json& data, bool isChunk) {
     TaskData task;
 
@@ -170,19 +203,27 @@ TaskData FrameworkClient::parseTaskData(const json& data, bool isChunk) {
 
     task.framework = data["framework"];
     task.kernel = data.contains("kernel") ? data["kernel"].get<std::string>() : data["wgsl"].get<std::string>();
-    task.entry = data["entry"];
+    task.entry = data.contains("entry") ? data["entry"].get<std::string>() : (task.framework == "opencl" ? std::string("block_matrix_multiply") : std::string("main"));
     task.bindLayout = data["bindLayout"];
     task.compilationOptions = data.value("compilationOptions", json::object());
 
     if (isChunk) {
         task.chunkUniforms = data.value("chunkUniforms", json::object());
     }
+    // Merge metadata (e.g., block_size, matrix_size) into uniforms for executors
+    if (data.contains("metadata") && data["metadata"].is_object()) {
+        for (auto it = data["metadata"].begin(); it != data["metadata"].end(); ++it) {
+            task.chunkUniforms[it.key()] = it.value();
+        }
+    }
 
-    // Parse workgroup count
-    if (data.contains("workgroupCount") && data["workgroupCount"].is_array()) {
+    // Work sizes: prefer OpenCL-style globalWorkSize, else fallback to workgroupCount
+    if (data.contains("globalWorkSize") && data["globalWorkSize"].is_array()) {
+        task.workgroupCount = data["globalWorkSize"].get<std::vector<int>>();
+    } else if (data.contains("workgroupCount") && data["workgroupCount"].is_array()) {
         task.workgroupCount = data["workgroupCount"].get<std::vector<int>>();
     } else {
-        task.workgroupCount = {1, 1, 1}; // Default
+        task.workgroupCount = {1, 1, 1};
     }
 
     // NEW: Parse multi-input data
