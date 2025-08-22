@@ -54,6 +54,20 @@ bool OpenCLExecutor::initialize(const json& config) {
     }
 
     err = clGetDeviceIDs(platform, deviceType, 0, nullptr, &numDevices);
+
+    if ((err != CL_SUCCESS || numDevices == 0) && deviceType == CL_DEVICE_TYPE_GPU) {
+        std::cout << "No GPU devices found, falling back to CPU devices..." << std::endl;
+        deviceType = CL_DEVICE_TYPE_CPU;
+        err = clGetDeviceIDs(platform, deviceType, 0, nullptr, &numDevices);
+    }
+
+    if ((err != CL_SUCCESS || numDevices == 0) && deviceType != CL_DEVICE_TYPE_ALL) {
+        std::cout << "No " << (deviceType == CL_DEVICE_TYPE_CPU ? "CPU" : "specific")
+                  << " devices found, trying all device types..." << std::endl;
+        deviceType = CL_DEVICE_TYPE_ALL;
+        err = clGetDeviceIDs(platform, deviceType, 0, nullptr, &numDevices);
+    }
+
     if (err != CL_SUCCESS || numDevices == 0) {
         std::cerr << "No suitable OpenCL devices found" << std::endl;
         return false;
@@ -233,51 +247,153 @@ bool OpenCLExecutor::createOutputBuffers(const TaskData& task, BufferSet& buffer
     return true;
 }
 
-bool OpenCLExecutor::setKernelArguments(cl_kernel kernel, const BufferSet& buffers, const TaskData& task) {
-    cl_int err;
-    int argIndex = 0;
+bool OpenCLExecutor::processMetadataUniforms(const TaskData& task, std::vector<UniformValue>& uniforms) {
+    // Process metadata first (enhanced chunking system)
+    if (!task.metadata.empty()) {
+        std::cout << "Processing metadata uniforms..." << std::endl;
 
-    // Set input buffers as arguments
-    for (size_t i = 0; i < buffers.inputBuffers.size(); i++) {
-        err = clSetKernelArg(kernel, argIndex++, sizeof(cl_mem), &buffers.inputBuffers[i]);
-        if (err != CL_SUCCESS) {
-            std::cerr << "Failed to set input buffer argument " << i << " at index " << (argIndex-1) << std::endl;
-            return false;
+        // Extract uniform values in consistent order (matching other frameworks)
+        std::vector<std::string> fieldOrder = {
+            "block_size", "matrix_size", "matrix_n", "matrixSize",
+            "tile_start_row", "tile_start_col", "tile_rows", "tile_cols",
+            "tile_size", "tileSize"
+        };
+
+        for (const auto& field : fieldOrder) {
+            if (task.metadata.contains(field)) {
+                UniformValue uv;
+                uv.name = field;
+                uv.type = UniformType::UINT32;
+                uv.uintValue = task.metadata[field].get<uint32_t>();
+                uniforms.push_back(uv);
+                std::cout << "  " << field << " = " << uv.uintValue << std::endl;
+            }
+        }
+
+        // Add any remaining numeric values not in fieldOrder
+        for (auto it = task.metadata.begin(); it != task.metadata.end(); ++it) {
+            if (it.value().is_number() &&
+                std::find(fieldOrder.begin(), fieldOrder.end(), it.key()) == fieldOrder.end()) {
+
+                UniformValue uv;
+                uv.name = it.key();
+
+                if (it.value().is_number_integer()) {
+                    uv.type = UniformType::INT32;
+                    uv.intValue = it.value().get<int32_t>();
+                } else if (it.value().is_number_unsigned()) {
+                    uv.type = UniformType::UINT32;
+                    uv.uintValue = it.value().get<uint32_t>();
+                } else {
+                    uv.type = UniformType::FLOAT;
+                    uv.floatValue = it.value().get<float>();
+                }
+
+                uniforms.push_back(uv);
+                std::cout << "  " << it.key() << " = " << (uv.type == UniformType::FLOAT ?
+                    std::to_string(uv.floatValue) : std::to_string(uv.intValue)) << " (extra)" << std::endl;
+            }
         }
     }
 
-    // Set output buffers as arguments
-    for (size_t i = 0; i < buffers.outputBuffers.size(); i++) {
-        err = clSetKernelArg(kernel, argIndex++, sizeof(cl_mem), &buffers.outputBuffers[i]);
-        if (err != CL_SUCCESS) {
-            std::cerr << "Failed to set output buffer argument " << i << " at index " << (argIndex-1) << std::endl;
-            return false;
-        }
-    }
-
-    // Set additional arguments from chunk uniforms if present
+    // Process legacy chunkUniforms for backward compatibility
     if (!task.chunkUniforms.empty()) {
+        std::cout << "Processing legacy chunk uniforms..." << std::endl;
+
         for (auto& [key, value] : task.chunkUniforms.items()) {
+            // Skip if already processed in metadata
+            bool alreadyProcessed = false;
+            for (const auto& existing : uniforms) {
+                if (existing.name == key) {
+                    alreadyProcessed = true;
+                    break;
+                }
+            }
+            if (alreadyProcessed) continue;
+
+            UniformValue uv;
+            uv.name = key;
+
             if (value.is_number_integer()) {
-                int intVal = value;
-                err = clSetKernelArg(kernel, argIndex++, sizeof(int), &intVal);
-            } else if (value.is_number_float()) {
-                float floatVal = value;
-                err = clSetKernelArg(kernel, argIndex++, sizeof(float), &floatVal);
+                uv.type = UniformType::INT32;
+                uv.intValue = value.get<int32_t>();
             } else if (value.is_number_unsigned()) {
-                unsigned int uintVal = value;
-                err = clSetKernelArg(kernel, argIndex++, sizeof(unsigned int), &uintVal);
+                uv.type = UniformType::UINT32;
+                uv.uintValue = value.get<uint32_t>();
+            } else if (value.is_number_float()) {
+                uv.type = UniformType::FLOAT;
+                uv.floatValue = value.get<float>();
             } else {
                 std::cerr << "Unsupported uniform type for key: " << key << std::endl;
                 continue;
             }
 
-            if (err != CL_SUCCESS) {
-                std::cerr << "Failed to set chunk uniform argument: " << key << " at index " << (argIndex-1) << std::endl;
-                return false;
-            }
+            uniforms.push_back(uv);
         }
     }
+
+    return true;
+}
+
+// Updated setKernelArguments with proper binding order
+bool OpenCLExecutor::setKernelArguments(cl_kernel kernel, const BufferSet& buffers, const TaskData& task) {
+    cl_int err;
+    int argIndex = 0;
+
+    // NEW: Process uniforms first (matching other frameworks)
+    std::vector<UniformValue> uniforms;
+    processMetadataUniforms(task, uniforms);
+
+    // Set uniform arguments first
+    for (const auto& uniform : uniforms) {
+        switch (uniform.type) {
+            case UniformType::INT32:
+                err = clSetKernelArg(kernel, argIndex++, sizeof(int32_t), &uniform.intValue);
+                break;
+            case UniformType::UINT32:
+                err = clSetKernelArg(kernel, argIndex++, sizeof(uint32_t), &uniform.uintValue);
+                break;
+            case UniformType::FLOAT:
+                err = clSetKernelArg(kernel, argIndex++, sizeof(float), &uniform.floatValue);
+                break;
+        }
+
+        if (err != CL_SUCCESS) {
+            std::cerr << "Failed to set uniform argument: " << uniform.name
+                      << " at index " << (argIndex-1) << std::endl;
+            return false;
+        }
+    }
+
+    std::cout << "Set " << uniforms.size() << " uniform arguments (bindings 0-"
+              << (uniforms.size()-1) << ")" << std::endl;
+
+    // Set input buffers as arguments (after uniforms)
+    for (size_t i = 0; i < buffers.inputBuffers.size(); i++) {
+        err = clSetKernelArg(kernel, argIndex++, sizeof(cl_mem), &buffers.inputBuffers[i]);
+        if (err != CL_SUCCESS) {
+            std::cerr << "Failed to set input buffer argument " << i
+                      << " at index " << (argIndex-1) << std::endl;
+            return false;
+        }
+    }
+
+    std::cout << "Set " << buffers.inputBuffers.size() << " input buffer arguments (bindings "
+              << uniforms.size() << "-" << (uniforms.size() + buffers.inputBuffers.size() - 1) << ")" << std::endl;
+
+    // Set output buffers as arguments (after inputs)
+    for (size_t i = 0; i < buffers.outputBuffers.size(); i++) {
+        err = clSetKernelArg(kernel, argIndex++, sizeof(cl_mem), &buffers.outputBuffers[i]);
+        if (err != CL_SUCCESS) {
+            std::cerr << "Failed to set output buffer argument " << i
+                      << " at index " << (argIndex-1) << std::endl;
+            return false;
+        }
+    }
+
+    std::cout << "Set " << buffers.outputBuffers.size() << " output buffer arguments (bindings "
+              << (uniforms.size() + buffers.inputBuffers.size()) << "-"
+              << (uniforms.size() + buffers.inputBuffers.size() + buffers.outputBuffers.size() - 1) << ")" << std::endl;
 
     return true;
 }
@@ -318,6 +434,26 @@ TaskResult OpenCLExecutor::executeTask(const TaskData& task) {
         return result;
     }
 
+    // Determine IO counts and metadata presence
+    const bool multipleInputs = !task.inputData.empty();
+    const bool multipleOutputs = !task.outputSizes.empty();
+    const bool hasUniforms = !task.metadata.empty() || !task.chunkUniforms.empty();
+
+    const size_t inputCount = multipleInputs ? task.inputData.size() :
+                             (task.legacyInputData.empty() ? 0 : 1);
+    const size_t outputCount = multipleOutputs ? task.outputSizes.size() :
+                              (task.legacyOutputSize ? 1 : 0);
+
+    std::cout << "Task " << task.id << " - Framework: " << task.framework
+              << ", Inputs: " << inputCount << ", Outputs: " << outputCount
+              << ", Has uniforms: " << hasUniforms << std::endl;
+
+    if (outputCount == 0) {
+        result.success = false;
+        result.errorMessage = "No outputs requested";
+        return result;
+    }
+
     BufferSet buffers;
 
     try {
@@ -327,6 +463,7 @@ TaskResult OpenCLExecutor::executeTask(const TaskData& task) {
         CompiledKernel* kernelPtr;
 
         if (it == kernelCache.end()) {
+            std::cout << "Compiling OpenCL kernel..." << std::endl;
             CompiledKernel newKernel;
             if (!compileKernel(task.kernel, task.entry, task.compilationOptions, newKernel)) {
                 result.success = false;
@@ -335,28 +472,40 @@ TaskResult OpenCLExecutor::executeTask(const TaskData& task) {
             }
             kernelCache[cacheKey] = std::move(newKernel);
             kernelPtr = &kernelCache[cacheKey];
+            std::cout << "Kernel compiled and cached successfully" << std::endl;
         } else {
             kernelPtr = &it->second;
+            std::cout << "Using cached kernel" << std::endl;
         }
 
-        std::cout << "Executing OpenCL kernel with " << task.getInputCount()
-                  << " inputs and " << task.getOutputCount() << " outputs" << std::endl;
-
         // Create input buffers
+        std::cout << "Creating input buffers..." << std::endl;
         if (!createInputBuffers(task, buffers)) {
             result.success = false;
             result.errorMessage = "Failed to create input buffers";
             return result;
         }
 
+        for (size_t i = 0; i < buffers.inputBuffers.size(); ++i) {
+            size_t inputSize = (i < task.inputData.size()) ? task.inputData[i].size() : task.legacyInputData.size();
+            std::cout << "Input buffer " << i << ": " << inputSize << " bytes" << std::endl;
+        }
+
         // Create output buffers
+        std::cout << "Creating output buffers..." << std::endl;
         if (!createOutputBuffers(task, buffers)) {
             result.success = false;
             result.errorMessage = "Failed to create output buffers";
             return result;
         }
 
-        // Set kernel arguments
+        for (size_t i = 0; i < buffers.outputBuffers.size(); ++i) {
+            size_t outputSize = (i < task.outputSizes.size()) ? task.outputSizes[i] : task.legacyOutputSize;
+            std::cout << "Output buffer " << i << ": " << outputSize << " bytes" << std::endl;
+        }
+
+        // Set kernel arguments (enhanced with proper binding order)
+        std::cout << "Setting kernel arguments..." << std::endl;
         if (!setKernelArguments(kernelPtr->kernel, buffers, task)) {
             result.success = false;
             result.errorMessage = "Failed to set kernel arguments";
@@ -364,13 +513,26 @@ TaskResult OpenCLExecutor::executeTask(const TaskData& task) {
         }
 
         // Execute kernel
-        size_t globalWorkSize[3] = {
-            static_cast<size_t>(task.workgroupCount.size() > 0 ? task.workgroupCount[0] : 1),
-            static_cast<size_t>(task.workgroupCount.size() > 1 ? task.workgroupCount[1] : 1),
-            static_cast<size_t>(task.workgroupCount.size() > 2 ? task.workgroupCount[2] : 1)
-        };
+        std::cout << "Executing OpenCL kernel..." << std::endl;
 
-        cl_int err = clEnqueueNDRangeKernel(queue, kernelPtr->kernel, 3, nullptr, globalWorkSize, nullptr, 0, nullptr, nullptr);
+        // Determine work dimensions and sizes
+        size_t workDim = 1;
+        size_t globalWorkSize[3] = {1, 1, 1};
+
+        if (!task.workgroupCount.empty()) {
+            workDim = std::min<size_t>(3, task.workgroupCount.size());
+            for (size_t i = 0; i < workDim; ++i) {
+                globalWorkSize[i] = static_cast<size_t>(std::max(1, task.workgroupCount[i]));
+            }
+        }
+
+        std::cout << "Dispatching kernel: " << globalWorkSize[0];
+        if (workDim > 1) std::cout << "x" << globalWorkSize[1];
+        if (workDim > 2) std::cout << "x" << globalWorkSize[2];
+        std::cout << " global work items" << std::endl;
+
+        cl_int err = clEnqueueNDRangeKernel(queue, kernelPtr->kernel, workDim, nullptr,
+                                           globalWorkSize, nullptr, 0, nullptr, nullptr);
         if (err != CL_SUCCESS) {
             result.success = false;
             result.errorMessage = "Kernel execution failed with error: " + std::to_string(err);
@@ -385,6 +547,8 @@ TaskResult OpenCLExecutor::executeTask(const TaskData& task) {
             return result;
         }
 
+        std::cout << "Kernel execution completed, reading results..." << std::endl;
+
         // Read results from all output buffers
         if (!readOutputBuffers(buffers, task, result)) {
             result.success = false;
@@ -392,14 +556,24 @@ TaskResult OpenCLExecutor::executeTask(const TaskData& task) {
             return result;
         }
 
+        // Log results
+        if (result.hasMultipleOutputs()) {
+            for (size_t i = 0; i < result.outputData.size(); ++i) {
+                std::cout << "Retrieved output " << i << ": " << result.outputData[i].size() << " bytes" << std::endl;
+            }
+        } else {
+            std::cout << "Retrieved legacy output: " << result.legacyOutputData.size() << " bytes" << std::endl;
+        }
+
         auto endTime = std::chrono::high_resolution_clock::now();
         result.processingTime = std::chrono::duration<double, std::milli>(endTime - startTime).count();
         result.success = true;
 
-        std::cout << "OpenCL execution completed: " << result.getOutputCount() << " outputs, "
+        std::cout << "Task " << task.id << " completed successfully in "
                   << result.processingTime << "ms" << std::endl;
 
     } catch (const std::exception& e) {
+        std::cout << "Task " << task.id << " failed: " << e.what() << std::endl;
         result.success = false;
         result.errorMessage = std::string("Exception: ") + e.what();
     }

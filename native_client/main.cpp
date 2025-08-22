@@ -1,4 +1,8 @@
 #include <iostream>
+#include <openssl/sha.h>
+#include <openssl/evp.h>
+#include <iomanip>
+#include <sstream>
 #include <fstream>
 #include <memory>
 #include <csignal>
@@ -342,21 +346,42 @@ private:
         return json::array();
     }
 
+    std::string sha256Hex(const std::vector<uint8_t>& data) {
+        EVP_MD_CTX* context = EVP_MD_CTX_new();
+        const EVP_MD* md = EVP_sha256();
+        unsigned char hash[EVP_MAX_MD_SIZE];
+        unsigned int lengthOfHash = 0;
+
+        EVP_DigestInit_ex(context, md, nullptr);
+        EVP_DigestUpdate(context, data.data(), data.size());
+        EVP_DigestFinal_ex(context, hash, &lengthOfHash);
+        EVP_MD_CTX_free(context);
+
+        std::stringstream ss;
+        for (unsigned int i = 0; i < lengthOfHash; ++i) {
+            ss << std::hex << std::setw(2) << std::setfill('0') << (int)hash[i];
+        }
+        return ss.str();
+    }
+
+
+    // Replace the existing generateResultChecksum function
     std::string generateResultChecksum(const TaskResult& result) {
-        // Simple checksum generation - you may want to implement SHA256 here
-        std::string combined = "";
         if (result.hasMultipleOutputs()) {
+            // Combine all outputs and hash
+            std::vector<uint8_t> combined;
             for (const auto& output : result.outputData) {
-                combined += std::to_string(output.size()) + "_";
+                combined.insert(combined.end(), output.begin(), output.end());
             }
+            return sha256Hex(combined);
         } else {
             if (!result.outputData.empty()) {
-                combined = std::to_string(result.outputData[0].size());
+                return sha256Hex(result.outputData[0]);
             } else if (!result.legacyOutputData.empty()) {
-                combined = std::to_string(result.legacyOutputData.size());
+                return sha256Hex(result.legacyOutputData);
             }
         }
-        return "checksum_" + std::to_string(std::hash<std::string>{}(combined));
+        return "";
     }
 
     void requestNextTask() {

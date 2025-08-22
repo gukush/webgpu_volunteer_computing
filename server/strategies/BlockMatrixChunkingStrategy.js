@@ -215,6 +215,7 @@ export default class BlockMatrixChunkingStrategy extends BaseChunkingStrategy {
         return {
           ...baseDescriptor,
           kernel: this.getOpenCLKernel(),
+          entry: 'block_matrix_multiply',
           globalWorkSize: [blockSize, blockSize],
           localWorkSize: [16, 16]
         };
@@ -327,12 +328,12 @@ export default class BlockMatrixChunkingStrategy extends BaseChunkingStrategy {
   // NEW: OpenCL kernel
   getOpenCLKernel() {
     return `
-      __kernel void main(
-          __global const float* block_a,
-          __global const float* block_b,
-          __global float* partial_result,
-          const int block_size,
-          const int matrix_size
+      __kernel void block_matrix_multiply(
+          const uint block_size,              // position 0 - uniforms first (matches executor)
+          const uint matrix_size,             // position 1
+          __global const float* block_a,      // position 2 - inputs second
+          __global const float* block_b,      // position 3
+          __global float* partial_result      // position 4 - outputs last
       ) {
           int row = get_global_id(0);
           int col = get_global_id(1);

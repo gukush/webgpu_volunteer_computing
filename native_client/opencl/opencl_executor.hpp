@@ -1,3 +1,5 @@
+// Add these additions to opencl_executor.hpp
+
 #pragma once
 #include "../common/framework_client.hpp"
 #ifdef HAVE_OPENCL
@@ -8,6 +10,7 @@
 #endif
 #include <vector>
 #include <memory>
+#include <algorithm>
 
 class OpenCLExecutor : public IFrameworkExecutor {
 private:
@@ -23,6 +26,23 @@ private:
     };
 
     std::map<std::string, CompiledKernel> kernelCache;
+
+    // NEW: Uniform value structure for enhanced metadata support
+    enum class UniformType {
+        INT32,
+        UINT32,
+        FLOAT
+    };
+
+    struct UniformValue {
+        std::string name;
+        UniformType type;
+        union {
+            int32_t intValue;
+            uint32_t uintValue;
+            float floatValue;
+        };
+    };
 
     bool compileKernel(const std::string& source, const std::string& entryPoint,
                       const json& compileOpts, CompiledKernel& result);
@@ -51,6 +71,9 @@ private:
     bool createOutputBuffers(const TaskData& task, BufferSet& buffers);
     bool setKernelArguments(cl_kernel kernel, const BufferSet& buffers, const TaskData& task);
     bool readOutputBuffers(const BufferSet& buffers, const TaskData& task, TaskResult& result);
+
+    // NEW: Enhanced metadata processing
+    bool processMetadataUniforms(const TaskData& task, std::vector<UniformValue>& uniforms);
 
 public:
     OpenCLExecutor();
