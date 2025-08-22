@@ -143,100 +143,76 @@ bool CudaExecutor::compileKernel(const std::string& source, const std::string& e
 
 // NEW: Task-agnostic metadata processing (matching OpenCL/Vulkan approach)
 bool CudaExecutor::processMetadataUniforms(const TaskData& task, std::vector<UniformValue>& uniforms) {
-    // Process metadata first (enhanced chunking system)
+    // NEW: Process metadata first, skip chunkUniforms if metadata exists
+    const json* sourceData = nullptr;
+    std::string sourceType;
+
     if (!task.metadata.empty()) {
+        sourceData = &task.metadata;
+        sourceType = "metadata";
         std::cout << "Processing metadata uniforms..." << std::endl;
-
-        // Extract uniform values in consistent order (matching other frameworks)
-        std::vector<std::string> fieldOrder = {
-            "block_size", "matrix_size", "matrix_n", "matrixSize",
-            "tile_start_row", "tile_start_col", "tile_rows", "tile_cols",
-            "tile_size", "tileSize"
-        };
-
-        for (const auto& field : fieldOrder) {
-            if (task.metadata.contains(field)) {
-                UniformValue uv;
-                uv.name = field;
-
-                if (task.metadata[field].is_number_integer()) {
-                    uv.type = UniformType::INT32;
-                    uv.intValue = task.metadata[field].get<int32_t>();
-                } else if (task.metadata[field].is_number_unsigned()) {
-                    uv.type = UniformType::UINT32;
-                    uv.uintValue = task.metadata[field].get<uint32_t>();
-                } else {
-                    uv.type = UniformType::FLOAT;
-                    uv.floatValue = task.metadata[field].get<float>();
-                }
-
-                uniforms.push_back(uv);
-                std::cout << "  " << field << " = " << (uv.type == UniformType::FLOAT ?
-                    std::to_string(uv.floatValue) : std::to_string(uv.intValue)) << std::endl;
-            }
-        }
-
-        // Add any remaining numeric values not in fieldOrder
-        for (auto it = task.metadata.begin(); it != task.metadata.end(); ++it) {
-            if (it.value().is_number() &&
-                std::find(fieldOrder.begin(), fieldOrder.end(), it.key()) == fieldOrder.end()) {
-
-                UniformValue uv;
-                uv.name = it.key();
-
-                if (it.value().is_number_integer()) {
-                    uv.type = UniformType::INT32;
-                    uv.intValue = it.value().get<int32_t>();
-                } else if (it.value().is_number_unsigned()) {
-                    uv.type = UniformType::UINT32;
-                    uv.uintValue = it.value().get<uint32_t>();
-                } else {
-                    uv.type = UniformType::FLOAT;
-                    uv.floatValue = it.value().get<float>();
-                }
-
-                uniforms.push_back(uv);
-                std::cout << "  " << it.key() << " = " << (uv.type == UniformType::FLOAT ?
-                    std::to_string(uv.floatValue) : std::to_string(uv.intValue)) << " (extra)" << std::endl;
-            }
-        }
+    } else if (!task.chunkUniforms.empty()) {
+        sourceData = &task.chunkUniforms;
+        sourceType = "legacy chunk uniforms";
+        std::cout << "Processing legacy chunk uniforms..." << std::endl;
+    } else {
+        std::cout << "No uniforms to process" << std::endl;
+        return true;
     }
 
-    // Process legacy chunkUniforms for backward compatibility
-    if (!task.chunkUniforms.empty()) {
-        std::cout << "Processing legacy chunk uniforms..." << std::endl;
+    // Extract uniform values in consistent order
+    std::vector<std::string> fieldOrder = {
+        "block_size", "matrix_size", "matrix_n", "matrixSize",
+        "tile_start_row", "tile_start_col", "tile_rows", "tile_cols",
+        "tile_size", "tileSize"
+    };
 
-        for (auto& [key, value] : task.chunkUniforms.items()) {
-            // Skip if already processed in metadata
-            bool alreadyProcessed = false;
-            for (const auto& existing : uniforms) {
-                if (existing.name == key) {
-                    alreadyProcessed = true;
-                    break;
-                }
-            }
-            if (alreadyProcessed) continue;
-
+    for (const auto& field : fieldOrder) {
+        if (sourceData->contains(field)) {
             UniformValue uv;
-            uv.name = key;
+            uv.name = field;
 
-            if (value.is_number_integer()) {
+            if ((*sourceData)[field].is_number_integer()) {
                 uv.type = UniformType::INT32;
-                uv.intValue = value.get<int32_t>();
-            } else if (value.is_number_unsigned()) {
+                uv.intValue = (*sourceData)[field].get<int32_t>();
+            } else if ((*sourceData)[field].is_number_unsigned()) {
                 uv.type = UniformType::UINT32;
-                uv.uintValue = value.get<uint32_t>();
-            } else if (value.is_number_float()) {
-                uv.type = UniformType::FLOAT;
-                uv.floatValue = value.get<float>();
+                uv.uintValue = (*sourceData)[field].get<uint32_t>();
             } else {
-                std::cerr << "Unsupported uniform type for key: " << key << std::endl;
-                continue;
+                uv.type = UniformType::FLOAT;
+                uv.floatValue = (*sourceData)[field].get<float>();
             }
 
             uniforms.push_back(uv);
-            std::cout << "  " << key << " = " << (uv.type == UniformType::FLOAT ?
-                std::to_string(uv.floatValue) : std::to_string(uv.intValue)) << " (legacy)" << std::endl;
+            std::cout << "  " << field << " = " << (uv.type == UniformType::FLOAT ?
+                std::to_string(uv.floatValue) : std::to_string(uv.intValue))
+                << " (" << sourceType << ")" << std::endl;
+        }
+    }
+
+    // Add any remaining numeric values not in fieldOrder
+    for (auto it = sourceData->begin(); it != sourceData->end(); ++it) {
+        if (it.value().is_number() &&
+            std::find(fieldOrder.begin(), fieldOrder.end(), it.key()) == fieldOrder.end()) {
+
+            UniformValue uv;
+            uv.name = it.key();
+
+            if (it.value().is_number_integer()) {
+                uv.type = UniformType::INT32;
+                uv.intValue = it.value().get<int32_t>();
+            } else if (it.value().is_number_unsigned()) {
+                uv.type = UniformType::UINT32;
+                uv.uintValue = it.value().get<uint32_t>();
+            } else {
+                uv.type = UniformType::FLOAT;
+                uv.floatValue = it.value().get<float>();
+            }
+
+            uniforms.push_back(uv);
+            std::cout << "  " << it.key() << " = " << (uv.type == UniformType::FLOAT ?
+                std::to_string(uv.floatValue) : std::to_string(uv.intValue))
+                << " (extra " << sourceType << ")" << std::endl;
         }
     }
 
@@ -312,6 +288,28 @@ TaskResult CudaExecutor::executeTask(const TaskData& task) {
         std::cout << "CUDA Task " << task.id << " - Inputs: " << inputCount
                   << ", Outputs: " << outputCount << ", Has uniforms: " << hasUniforms << std::endl;
 
+
+        if (useMultipleInputs) {
+            for (size_t i = 0; i < task.inputData.size(); i++) {
+                const auto& inputData = task.inputData[i];
+                if (!inputData.empty() && inputData.size() >= 16) {
+                    // Print first 4 floats of each input
+                    const float* floats = reinterpret_cast<const float*>(inputData.data());
+                    std::cout << "Input " << i << " first 4 values: ";
+                    for (int j = 0; j < 4 && j < (int)(inputData.size()/4); j++) {
+                        std::cout << floats[j] << " ";
+                    }
+                    std::cout << std::endl;
+                }
+            }
+        } else if (!task.legacyInputData.empty() && task.legacyInputData.size() >= 16) {
+            const float* floats = reinterpret_cast<const float*>(task.legacyInputData.data());
+            std::cout << "Legacy input first 4 values: ";
+            for (int j = 0; j < 4 && j < (int)(task.legacyInputData.size()/4); j++) {
+                std::cout << floats[j] << " ";
+            }
+            std::cout << std::endl;
+        }
         std::vector<CUdeviceptr> d_inputs;
         std::vector<CUdeviceptr> d_outputs;
         std::vector<void*> kernelArgs;
@@ -426,24 +424,57 @@ TaskResult CudaExecutor::executeTask(const TaskData& task) {
             std::cout << "Legacy output: " << task.legacyOutputSize << " bytes" << std::endl;
         }
 
+        if (useMultipleOutputs) {
+            for (size_t i = 0; i < result.outputData.size(); i++) {
+                if (!result.outputData[i].empty() && result.outputData[i].size() >= 16) {
+                    const float* floats = reinterpret_cast<const float*>(result.outputData[i].data());
+                    std::cout << "Output " << i << " first 4 values: ";
+                    for (int j = 0; j < 4 && j < (int)(result.outputData[i].size()/4); j++) {
+                        std::cout << floats[j] << " ";
+                    }
+                    std::cout << std::endl;
+                }
+            }
+        } else if (!result.legacyOutputData.empty() && result.legacyOutputData.size() >= 16) {
+            const float* floats = reinterpret_cast<const float*>(result.legacyOutputData.data());
+            std::cout << "Legacy output first 4 values: ";
+            for (int j = 0; j < 4 && j < (int)(result.legacyOutputData.size()/4); j++) {
+                std::cout << floats[j] << " ";
+            }
+            std::cout << std::endl;
+        }
         // Determine grid and block dimensions
-        std::vector<int> gridDim = task.workgroupCount;
+        std::vector<int> gridDim = task.workgroupCount.empty() ? std::vector<int>{1, 1, 1} : task.workgroupCount;
         std::vector<int> blockDim = {16, 16, 1};  // Default block size
 
-        // Override block/grid dims if specified in metadata
+        // PRIORITY: Use metadata blockDim/gridDim if specified
         if (task.metadata.contains("blockDim") && task.metadata["blockDim"].is_array()) {
             auto bdim = task.metadata["blockDim"].get<std::vector<int>>();
             if (bdim.size() >= 3) {
                 blockDim = bdim;
+                std::cout << "Using metadata blockDim: " << blockDim[0] << "," << blockDim[1] << "," << blockDim[2] << std::endl;
             }
         }
         if (task.metadata.contains("gridDim") && task.metadata["gridDim"].is_array()) {
             auto gdim = task.metadata["gridDim"].get<std::vector<int>>();
             if (gdim.size() >= 3) {
                 gridDim = gdim;
+                std::cout << "Using metadata gridDim: " << gridDim[0] << "," << gridDim[1] << "," << gridDim[2] << std::endl;
             }
         }
+        std::cout << "Block size from uniforms: ";
+        for (const auto& uniform : uniforms) {
+            if (uniform.name == "block_size") {
+                std::cout << (uniform.type == UniformType::INT32 ? uniform.intValue : uniform.uintValue);
+                break;
+            }
+        }
+        std::cout << std::endl;
 
+        std::cout << "Final kernel launch parameters:" << std::endl;
+        std::cout << "  Grid: (" << gridDim[0] << "," << gridDim[1] << "," << gridDim[2] << ")" << std::endl;
+        std::cout << "  Block: (" << blockDim[0] << "," << blockDim[1] << "," << blockDim[2] << ")" << std::endl;
+        std::cout << "  Total threads: " << (gridDim[0] * blockDim[0]) << "x" << (gridDim[1] * blockDim[1]) << std::endl;
         std::cout << "Kernel launch: grid(" << gridDim[0] << "," << gridDim[1] << "," << gridDim[2]
                   << ") block(" << blockDim[0] << "," << blockDim[1] << "," << blockDim[2] << ")" << std::endl;
         std::cout << "Total kernel arguments: " << kernelArgs.size()
