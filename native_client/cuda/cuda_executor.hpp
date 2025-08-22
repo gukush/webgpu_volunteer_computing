@@ -9,13 +9,42 @@
 #include <string>
 
 
+
 class CudaExecutor : public IFrameworkExecutor {
+public:
+    CudaExecutor(int deviceId = 0);
+    ~CudaExecutor() override;
+
+    bool initialize(const json& config = {}) override;
+    // Note: cleanup() no longer destroys the CUDA context; it clears caches only.
+    void cleanup() override;
+
+    TaskResult executeTask(const TaskData& task) override;
+
+    std::string getFrameworkName() const override { return "cuda"; }
+    json getCapabilities() const override;
+
+    // --- Public types so helpers in .cpp can use them safely ---
+    enum class UniformType {
+        INT32,
+        UINT32,
+        FLOAT
+    };
+
+    struct UniformValue {
+        std::string name;
+        UniformType type;
+        int32_t  intValue   = 0;
+        uint32_t uintValue  = 0;
+        float    floatValue = 0.0f;
+    };
+
 private:
     int deviceId = 0;
     CUcontext context = nullptr;
     bool initialized = false;
 
-    // Basic device info (queried via CUDA Driver API)
+    // Basic device info (queried via Driver API)
     std::string deviceName;
     int computeMajor = 0;
     int computeMinor = 0;
@@ -30,22 +59,6 @@ private:
     };
 
     std::map<std::string, CompiledKernel> kernelCache;
-
-    // Enhanced uniform support for task-agnostic operation
-    enum class UniformType {
-        INT32,
-        UINT32,
-        FLOAT
-    };
-
-    struct UniformValue {
-        std::string name;
-        UniformType type;
-        // store as separate fields (avoid anonymous union pitfalls)
-        int32_t  intValue   = 0;
-        uint32_t uintValue  = 0;
-        float    floatValue = 0.0f;
-    };
 
     // ---- Internal helpers ----
     static void logCuError(const char* where, CUresult r);
@@ -71,17 +84,4 @@ private:
                                  std::vector<int32_t>& intStorage,
                                  std::vector<uint32_t>& uintStorage,
                                  std::vector<float>& floatStorage);
-
-public:
-    CudaExecutor(int deviceId = 0);
-    ~CudaExecutor() override;
-
-    bool initialize(const json& config = {}) override;
-    // NOTE: cleanup() no longer destroys the CUDA context (kept across tasks)
-    void cleanup() override;
-
-    TaskResult executeTask(const TaskData& task) override;
-
-    std::string getFrameworkName() const override { return "cuda"; }
-    json getCapabilities() const override;
 };
