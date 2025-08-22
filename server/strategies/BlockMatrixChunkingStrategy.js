@@ -207,6 +207,7 @@ export default class BlockMatrixChunkingStrategy extends BaseChunkingStrategy {
         return {
           ...baseDescriptor,
           kernel: this.getCUDAKernel(),
+          entry: 'block_matrix_multiply',
           blockDim: [16, 16, 1],
           gridDim: [Math.ceil(blockSize / 16), Math.ceil(blockSize / 16), 1]
         };

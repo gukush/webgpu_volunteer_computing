@@ -21,8 +21,33 @@ private:
 
     std::map<std::string, CompiledKernel> kernelCache;
 
+    // NEW: Enhanced uniform support for task-agnostic operation
+    enum class UniformType {
+        INT32,
+        UINT32,
+        FLOAT
+    };
+
+    struct UniformValue {
+        std::string name;
+        UniformType type;
+        union {
+            int32_t intValue;
+            uint32_t uintValue;
+            float floatValue;
+        };
+    };
+
     bool compileKernel(const std::string& source, const std::string& entryPoint,
                       const json& compileOpts, CompiledKernel& result);
+
+    // NEW: Task-agnostic metadata processing
+    bool processMetadataUniforms(const TaskData& task, std::vector<UniformValue>& uniforms);
+    void addUniformsToKernelArgs(const std::vector<UniformValue>& uniforms,
+                                std::vector<void*>& kernelArgs,
+                                std::vector<int32_t>& intStorage,
+                                std::vector<uint32_t>& uintStorage,
+                                std::vector<float>& floatStorage);
 
 public:
     CudaExecutor(int deviceId = 0);
