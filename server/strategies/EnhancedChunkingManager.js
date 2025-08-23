@@ -108,38 +108,45 @@ export class EnhancedChunkingManager {
       }
 
       // Initialize streaming assembly if supported
+       const fullPlan = {
+         ...plan,
+         inputRefs: workload.inputRefs,
+         metadata: { ...plan.metadata, ...workload.metadata }
+       };
+      // Initialize streaming assembly if supported
       let assembler = null;
       if (streamingMode && this.supportsStreamingAssembly(workload.assemblyStrategy)) {
-        assembler = await this.initializeStreamingAssembly(workload, plan);
+        assembler = await this.initializeStreamingAssembly(workload, fullPlan);
         this.streamingAssemblers.set(workload.id, assembler);
       }
 
       // Register the workload for tracking
-      this.registerActiveWorkload(workload.id, plan, [], streamingMode);
+      this.registerActiveWorkload(workload.id, fullPlan, [], streamingMode);
 
       let result;
       if (streamingMode && typeof chunkingStrategy.createChunkDescriptorsStreaming === 'function') {
         // STREAMING MODE: Create and dispatch chunks on-demand
         const dispatchCallback = this.createDispatchCallback(workload.id);
-        result = await chunkingStrategy.createChunkDescriptorsStreaming(plan, dispatchCallback);
+        result = await chunkingStrategy.createChunkDescriptorsStreaming(fullPlan, dispatchCallback);
 
         console.log(`🚀 Streaming chunk creation started for ${workload.id}`);
 
         return {
           success: true,
-          plan,
+          plan: fullPlan,
           totalChunks: result.totalChunks,
           streamingMode: true,
           message: `Streaming mode: chunks being created and dispatched dynamically`
         };
       } else {
         // BATCH MODE: Create all chunks upfront
-        const fullPlan = {
+        // fullPlan already built above
+        /*const fullPlan = {
           ...plan,
           inputRefs: workload.inputRefs,
           metadata: { ...plan.metadata, ...workload.metadata }
         };
-
+        */
         let chunkDescriptors;
         if (typeof chunkingStrategy.createChunkDescriptors === 'function') {
           chunkDescriptors = await chunkingStrategy.createChunkDescriptors(fullPlan);

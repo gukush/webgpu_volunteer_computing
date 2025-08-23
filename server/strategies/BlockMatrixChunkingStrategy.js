@@ -139,6 +139,162 @@ export default class BlockMatrixChunkingStrategy extends BaseChunkingStrategy {
     }
   }
 
+
+
+/**
+ * STREAMING MODE: Create and dispatch chunk descriptors on-demand
+ * This method creates chunks one by one and immediately dispatches them via callback
+ */
+async createChunkDescriptorsStreaming(plan, dispatchCallback) {
+  const { matrixSize, blockSize, blocksPerDim, blockByteSize } = plan.metadata;
+  const framework = plan.framework || 'webgpu';
+
+  console.log(`🌊 [CHUNKING STRATEGY] Starting streaming chunk creation`);
+  console.log(`🌊 [CHUNKING STRATEGY] Framework: ${framework}`);
+  console.log(`🌊 [CHUNKING STRATEGY] Matrix: ${matrixSize}x${matrixSize}, Block: ${blockSize}x${blockSize}`);
+  console.log(`🌊 [CHUNKING STRATEGY] Expected chunks: ${blocksPerDim * blocksPerDim * blocksPerDim}`);
+
+  // Get input data (same logic as batch mode)
+  const inputFileRef = (plan.inputRefs || []).find(r => r.name === 'combined_matrix')
+                    || (plan.inputRefs || []).find(r => r.name === 'input');
+
+  let inlineCombinedBuffer = null;
+  if (!inputFileRef && plan.metadata?.inputData) {
+    inlineCombinedBuffer = Buffer.from(plan.metadata.inputData, 'base64');
+  }
+
+  if (!inputFileRef && !inlineCombinedBuffer) {
+    throw new Error('BlockMatrix streaming requires input file or inline inputData');
+  }
+
+  if (inputFileRef) {
+    const expectedSize = 4 + matrixSize * matrixSize * 2 * 4;
+    if (inputFileRef.size !== expectedSize) {
+      throw new Error(`Input file size mismatch: expected ${expectedSize} bytes, got ${inputFileRef.size} bytes`);
+    }
+  }
+
+  let fileHandle = null;
+  let chunkIndex = 0;
+  let dispatchedCount = 0;
+  let errors = [];
+
+  try {
+    // Open file if using file input
+    if (inputFileRef?.path) {
+      fileHandle = await fs.open(inputFileRef.path, 'r');
+      console.log(`📂 Opened input file: ${inputFileRef.path}`);
+    }
+
+    // Create and dispatch chunks one by one
+    for (let i = 0; i < blocksPerDim; i++) {
+      for (let j = 0; j < blocksPerDim; j++) {
+        for (let k = 0; k < blocksPerDim; k++) {
+          try {
+            // Read matrix blocks (same as batch mode)
+            const aCoords = { row: i, col: k };
+            const bCoords = { row: k, col: j };
+
+            let blockA, blockB;
+            if (fileHandle) {
+              blockA = await this.readBlockFromHandle(fileHandle, 'A', aCoords, blockSize, matrixSize);
+              blockB = await this.readBlockFromHandle(fileHandle, 'B', bCoords, blockSize, matrixSize);
+            } else if (inlineCombinedBuffer) {
+              blockA = this.extractBlockFromBuffer(inlineCombinedBuffer, 'A', aCoords, blockSize, matrixSize);
+              blockB = this.extractBlockFromBuffer(inlineCombinedBuffer, 'B', bCoords, blockSize, matrixSize);
+            } else {
+              throw new Error('No input data available');
+            }
+
+            // Create framework-specific descriptor
+            const descriptor = this.createFrameworkSpecificDescriptor(
+              framework, chunkIndex, i, j, k, blockA, blockB, blockSize, matrixSize, plan.parentId, blockByteSize
+            );
+
+            // Add streaming-specific metadata
+            descriptor.streamingMetadata = {
+              createdAt: Date.now(),
+              blockCoords: { i, j, k },
+              isStreaming: true,
+              totalChunks: blocksPerDim * blocksPerDim * blocksPerDim
+            };
+
+            console.log(`🚀 Dispatching chunk ${descriptor.chunkId} (${chunkIndex + 1}/${blocksPerDim * blocksPerDim * blocksPerDim})`);
+
+            // IMMEDIATELY dispatch this chunk
+            await dispatchCallback(descriptor);
+
+            dispatchedCount++;
+            chunkIndex++;
+
+            // Small delay to prevent overwhelming the system
+            if (chunkIndex % 10 === 0) {
+              await new Promise(resolve => setTimeout(resolve, 10));
+            }
+
+          } catch (chunkError) {
+            const errorMsg = `Failed to create/dispatch chunk (${i},${j},k${k}): ${chunkError.message}`;
+            console.error(`❌ ${errorMsg}`);
+            errors.push(errorMsg);
+
+            // Continue with next chunk instead of failing completely
+            chunkIndex++;
+            continue;
+          }
+        }
+      }
+    }
+
+    const totalExpected = blocksPerDim * blocksPerDim * blocksPerDim;
+
+    if (errors.length > 0) {
+      console.warn(`⚠️  Streaming completed with ${errors.length} errors out of ${totalExpected} chunks`);
+    }
+
+    console.log(`✅ Streaming chunk creation completed: ${dispatchedCount}/${totalExpected} chunks dispatched`);
+
+    return {
+      success: true,
+      mode: 'streaming',
+      totalChunks: totalExpected,
+      dispatchedChunks: dispatchedCount,
+      errors: errors.length > 0 ? errors : undefined,
+      framework,
+      strategy: this.name,
+      metadata: {
+        matrixSize,
+        blockSize,
+        blocksPerDim,
+        dispatchDuration: Date.now() - (plan.startTime || Date.now())
+      }
+    };
+
+  } catch (error) {
+    console.error(`💥 Streaming chunk creation failed:`, error);
+
+    return {
+      success: false,
+      error: `Streaming chunk creation failed: ${error.message}`,
+      partialResults: {
+        dispatchedChunks: dispatchedCount,
+        totalExpected: blocksPerDim * blocksPerDim * blocksPerDim,
+        errors
+      }
+    };
+
+  } finally {
+    // Always close file handle
+    if (fileHandle) {
+      try {
+        await fileHandle.close();
+        console.log(`📂 Closed input file`);
+      } catch (closeError) {
+        console.warn(`⚠️  Failed to close file handle:`, closeError.message);
+      }
+    }
+  }
+}
+
   // NEW: Create framework-specific chunk descriptors
   createFrameworkSpecificDescriptor(framework, chunkIndex, i, j, k, blockA, blockB, blockSize, matrixSize, parentId, blockByteSize) {
     console.log(`[STRATEGY DEBUG] createFrameworkSpecificDescriptor called with framework: ${framework}`);

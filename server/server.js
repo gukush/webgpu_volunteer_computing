@@ -831,11 +831,11 @@ app.post('/api/workloads/advanced', async (req, res) => {
     customAssemblyFile,
     customChunkingCode,
     customAssemblyCode,
-    streamingMode = false  // NEW: Add streaming mode support
+    streamingMode = false
   } = req.body;
 
   try {
-    // Register custom strategies if provided (existing code)
+    // Register custom strategies if provided
     if (req.body.customChunkingCode) {
       const result = chunkingManager.registerCustomStrategy(req.body.customChunkingCode, 'chunking', chunkingStrategy);
       if (!result.success) return res.status(400).json({ error: `Custom chunking strategy failed: ${result.error}` });
@@ -857,25 +857,25 @@ app.post('/api/workloads/advanced', async (req, res) => {
       metadata: {
         ...metadata,
         customShader,
-        streamingMode,  // NEW: Include streaming mode in metadata
+        streamingMode,
         memoryThreshold: metadata?.memoryThreshold || 512 * 1024 * 1024,
         batchSize: metadata?.batchSize || 10
       },
       createdAt: Date.now(),
       isChunkParent: true,
       enhanced: true,
-      streamingMode,  // NEW: Top-level streaming mode flag
+      streamingMode,
       inputRefs: [],
       outputSizes: req.body.outputSizes || []
     };
 
-    // PHASE 1: Validate and plan workload (no file access)
+    // PHASE 1: ONLY validate and plan workload (no file access, no processing)
     const validationResult = await chunkingManager.validateAndPlanWorkload(enhancedWorkload);
     if (!validationResult.success) {
       return res.status(400).json(validationResult);
     }
 
-    // Handle inline input if provided (existing code)
+    // Handle inline input if provided
     if (input) {
       try {
         const inputsDir = path.join(STORAGE_ROOT, workloadId, 'inputs');
@@ -916,55 +916,18 @@ app.post('/api/workloads/advanced', async (req, res) => {
     // Store the plan for later use
     enhancedWorkload.plan = validationResult.plan;
 
-    // NEW: Set up streaming callbacks if streaming mode enabled
-    if (streamingMode) {
-      console.log(`🌊 Setting up streaming mode for workload ${workloadId}`);
-
-      // Set up dispatch callback for streaming chunk creation
-      chunkingManager.setDispatchCallback(workloadId, async (chunkDescriptor) => {
-        console.log(`📤 Streaming dispatch: ${chunkDescriptor.chunkId}`);
-        return await dispatchStreamingChunkEnhanced(workloadId, chunkDescriptor);
-      });
-
-      // Set up server callbacks for streaming events
-      chunkingManager.setServerCallbacks({
-        onWorkloadComplete: async (workloadId, result) => {
-          await handleStreamingWorkloadComplete(workloadId, result);
-        },
-        onAssemblyProgress: (workloadId, progress) => {
-          // Emit real-time progress to clients
-          io.emit('assembly:progress', {
-            workloadId,
-            completedBlocks: progress.completedBlocks,
-            totalBlocks: progress.totalBlocks,
-            progress: progress.progress
-          });
-
-          // Also emit to native WebSocket clients
-          matrixState.clients.forEach(client => {
-            if (client.clientType === 'native' && client.connected) {
-              client.emit('assembly:progress', {
-                workloadId,
-                completedBlocks: progress.completedBlocks,
-                totalBlocks: progress.totalBlocks,
-                progress: progress.progress
-              });
-            }
-          });
-        }
-      });
-    }
-
-    // Store workload
+    // Store workload (metadata only - no processing yet!)
     customWorkloads.set(workloadId, enhancedWorkload);
     saveCustomWorkloads();
     broadcastCustomWorkloadList();
+
+    console.log(`✅ Created workload ${workloadId} (streaming: ${streamingMode}) - ready for compute-start`);
 
     return res.json({
       success: true,
       id: workloadId,
       status: enhancedWorkload.status,
-      streamingMode,  // NEW: Return streaming mode status
+      streamingMode,
       requiresFileUpload: validationResult.requiresFileUpload,
       message: enhancedWorkload.status === 'awaiting_input'
         ? `Workload created. Upload input files via POST /api/workloads/${workloadId}/inputs then start computation.`
@@ -1002,7 +965,7 @@ app.get('/api/streaming/queues', (req, res) => {
   });
 });
 
-// STEP 2: Enhanced compute-start endpoint - Process chunks AFTER files uploaded
+// Enhanced compute-start endpoint - Process chunks AFTER files uploaded
 app.post('/api/workloads/:id/compute-start', async (req, res) => {
   const wid = req.params.id;
   const wl = customWorkloads.get(wid);
@@ -1015,33 +978,86 @@ app.post('/api/workloads/:id/compute-start', async (req, res) => {
     return res.status(400).json({ error: `Cannot start workload in status: ${wl.status}` });
   }
 
-  // NEW: Extract streaming mode from request or workload
+  // Extract streaming mode from request or workload
   const streamingMode = req.body.streamingMode || wl.streamingMode || false;
   const batchSize = req.body.batchSize || wl.metadata?.batchSize || 10;
 
-  try {
-    // For enhanced workloads, ensure input requirements are met
-    if (wl.enhanced && wl.isChunkParent) {
-      // PHASE 2: Process chunks with uploaded files
-      console.log(`🔄 Processing chunks for workload ${wid} (streaming: ${streamingMode})...`);
+  console.log(`🚀 [COMPUTE START] Starting workload ${wid} (streaming: ${streamingMode})`);
 
+  try {
+    // For enhanced workloads, process chunks
+    if (wl.enhanced && wl.isChunkParent) {
+      console.log(`📄 [COMPUTE START] Processing chunks for workload ${wid}...`);
+
+      // CRITICAL: Set up streaming callbacks BEFORE processing if streaming mode
+      if (streamingMode) {
+        console.log(`🌊 [COMPUTE START] Setting up streaming callbacks for workload ${wid}`);
+
+        // Set up dispatch callback for streaming chunk creation
+        chunkingManager.setDispatchCallback(wid, async (chunkDescriptor) => {
+          console.log(`📤 [STREAMING] Immediate dispatch: ${chunkDescriptor.chunkId} (framework: ${chunkDescriptor.framework})`);
+          return await dispatchStreamingChunkEnhanced(wid, chunkDescriptor);
+        });
+
+        // Set up server callbacks for streaming events
+        chunkingManager.setServerCallbacks({
+          onWorkloadComplete: async (workloadId, result) => {
+            await handleStreamingWorkloadComplete(workloadId, result);
+          },
+          onAssemblyProgress: (workloadId, progress) => {
+            console.log(`📊 [STREAMING] Assembly progress: ${progress.completedBlocks}/${progress.totalBlocks} blocks`);
+
+            io.emit('assembly:progress', {
+              workloadId,
+              completedBlocks: progress.completedBlocks,
+              totalBlocks: progress.totalBlocks,
+              progress: progress.progress
+            });
+
+            matrixState.clients.forEach(client => {
+              if (client.clientType === 'native' && client.connected) {
+                client.emit('assembly:progress', {
+                  workloadId,
+                  completedBlocks: progress.completedBlocks,
+                  totalBlocks: progress.totalBlocks,
+                  progress: progress.progress
+                });
+              }
+            });
+          }
+        });
+
+        console.log(`✅ [COMPUTE START] Streaming callbacks configured for ${wid}`);
+      }
+
+      // NOW process the chunks (with streaming setup ready)
+      console.log(`⚡ [COMPUTE START] Calling processChunkedWorkload(streamingMode: ${streamingMode})`);
       const result = await chunkingManager.processChunkedWorkload(wl, streamingMode);
+
       if (!result.success) {
+        console.error(`❌ [COMPUTE START] Processing failed:`, result.error);
         wl.status = 'error';
         wl.error = result.error;
         saveCustomWorkloads();
         return res.status(400).json(result);
       }
 
-      // Update workload with chunk information
+      console.log(`🎯 [COMPUTE START] Processing result:`, {
+        success: result.success,
+        totalChunks: result.totalChunks,
+        streamingMode: result.streamingMode,
+        message: result.message
+      });
+
+      // Update workload with results
       wl.chunkDescriptors = result.chunkDescriptors;
       wl.plan = result.plan;
-      wl.streamingMode = streamingMode;  // NEW: Store streaming mode
+      wl.streamingMode = streamingMode;
 
-      if (streamingMode) {
+      if (streamingMode && result.streamingMode) {
         // Streaming mode: chunks are being created and dispatched dynamically
         wl.status = 'streaming_chunks';
-        console.log(`🌊 Streaming mode: chunks being created and dispatched for ${wid}`);
+        console.log(`🌊 [COMPUTE START] Streaming mode active - chunks will be dispatched as created`);
       } else {
         // Batch mode: create chunk store
         const store = {
@@ -1065,7 +1081,7 @@ app.post('/api/workloads/:id/compute-start', async (req, res) => {
 
         customWorkloadChunks.set(wid, store);
         wl.status = 'assigning_chunks';
-        console.log(`✅ Created ${store.allChunkDefs.length} chunk descriptors for workload ${wid}`);
+        console.log(`✅ [COMPUTE START] Created ${store.allChunkDefs.length} chunk descriptors (batch mode)`);
       }
     } else {
       // Non-chunked workload
@@ -1077,7 +1093,7 @@ app.post('/api/workloads/:id/compute-start', async (req, res) => {
     saveCustomWorkloadChunks();
     broadcastCustomWorkloadList();
 
-    // NEW: Emit streaming-aware event
+    // Emit event
     io.emit('workload:started', {
       id: wl.id,
       label: wl.label,
@@ -1087,19 +1103,21 @@ app.post('/api/workloads/:id/compute-start', async (req, res) => {
       totalChunks: wl.plan?.totalChunks || wl.chunkDescriptors?.length || 0
     });
 
+    console.log(`🎉 [COMPUTE START] Workload ${wid} started successfully (${streamingMode ? 'streaming' : 'batch'} mode)`);
+
     res.json({
       success: true,
       workloadId: wid,
       status: wl.status,
-      streamingMode,  // NEW: Return streaming mode
+      streamingMode,
       totalChunks: wl.plan?.totalChunks || wl.chunkDescriptors?.length || 0,
       message: streamingMode
-        ? `Streaming workload ${wl.label} started - chunks being created and dispatched dynamically`
-        : `Batch workload ${wl.label} started successfully`
+        ? `Streaming workload started - chunks dispatched as created`
+        : `Batch workload started successfully`
     });
 
   } catch (error) {
-    console.error('Compute start error:', error);
+    console.error('❌ [COMPUTE START] Error:', error);
     wl.status = 'error';
     wl.error = error.message;
     saveCustomWorkloads();
@@ -1137,17 +1155,23 @@ async function dispatchStreamingChunk(workloadId, chunkDescriptor) {
 }
 
 async function dispatchChunkToClient(client, chunkDescriptor, workloadId) {
+  console.log(`[CHUNK DISPATCH] === SENDING TO CLIENT ===`);
+  console.log(`[CHUNK DISPATCH] Client ID: ${client.id.substring(0, 8)}...`);
+  console.log(`[CHUNK DISPATCH] Client Type: ${client.clientType || 'browser'}`);
+  console.log(`[CHUNK DISPATCH] Chunk ID: ${chunkDescriptor.chunkId}`);
+  console.log(`[CHUNK DISPATCH] Framework: ${chunkDescriptor.framework}`);
+
   try {
     client.isBusyWithCustomChunk = true;
 
-    // Create unified task data for the client
+    // Create unified task data for the client (same as before but with better logging)
     const taskData = {
       parentId: chunkDescriptor.parentId,
       chunkId: chunkDescriptor.chunkId,
       chunkOrderIndex: chunkDescriptor.chunkIndex,
       framework: chunkDescriptor.framework,
       enhanced: true,
-      streaming: true,  // NEW: Mark as streaming chunk
+      streaming: true,
 
       // Shader code and execution parameters
       kernel: chunkDescriptor.kernel,
@@ -1163,15 +1187,10 @@ async function dispatchChunkToClient(client, chunkDescriptor, workloadId) {
       webglNumElements: chunkDescriptor.webglNumElements,
       webglInputSpec: chunkDescriptor.webglInputSpec,
 
-      // CUDA properties
       blockDim: chunkDescriptor.blockDim,
       gridDim: chunkDescriptor.gridDim,
-
-      // OpenCL properties
       globalWorkSize: chunkDescriptor.globalWorkSize,
       localWorkSize: chunkDescriptor.localWorkSize,
-
-      // Vulkan properties
       shaderType: chunkDescriptor.shaderType,
 
       // Data and metadata
@@ -1181,24 +1200,49 @@ async function dispatchChunkToClient(client, chunkDescriptor, workloadId) {
       outputSizes: chunkDescriptor.outputs ? chunkDescriptor.outputs.map(o => o.size) : [],
 
       // Assembly metadata for streaming
-      assemblyMetadata: chunkDescriptor.assemblyMetadata
+      assemblyMetadata: chunkDescriptor.assemblyMetadata,
+
+      // Streaming metadata
+      streamingMetadata: chunkDescriptor.streamingMetadata
     };
 
-    console.log(`🎯 Dispatching streaming chunk ${chunkDescriptor.chunkId} to ${client.clientType || 'browser'} client ${client.id}`);
+    console.log(`🎯 [DISPATCH] Sending ${chunkDescriptor.framework} chunk ${chunkDescriptor.chunkId} to ${client.clientType || 'browser'} client ${client.id}`);
 
-    // Send to appropriate client type
-    if (client.socket) {
-      client.socket.emit('workload:chunk_assign', taskData);
-    } else if (client.emit) {
-      client.emit('workload:chunk_assign', taskData);
-    } else {
-      throw new Error(`Client ${client.id} has no dispatch method`);
-    }
+    // Send to appropriate client type with timeout
+    const dispatchPromise = new Promise((resolve, reject) => {
+      const timeout = setTimeout(() => {
+        reject(new Error('Dispatch timeout'));
+      }, 30000); // 30 second timeout
 
-    return { success: true };
+      try {
+        if (client.socket) {
+          client.socket.emit('workload:chunk_assign', taskData);
+          clearTimeout(timeout);
+          resolve({ success: true });
+        } else if (client.emit) {
+          client.emit('workload:chunk_assign', taskData);
+          clearTimeout(timeout);
+          resolve({ success: true });
+        } else {
+          clearTimeout(timeout);
+          reject(new Error(`Client ${client.id} has no dispatch method`));
+        }
+      } catch (error) {
+        clearTimeout(timeout);
+        reject(error);
+      }
+    });
+
+    const result = await dispatchPromise;
+
+    // Log successful dispatch
+    updateStreamingWorkloadProgress(workloadId, chunkDescriptor.chunkId, 'dispatched');
+
+    return result;
 
   } catch (error) {
     client.isBusyWithCustomChunk = false;
+    console.error(`❌ [DISPATCH] Failed to dispatch to client ${client.id}:`, error);
     throw error;
   }
 }
@@ -1496,101 +1540,6 @@ app.post('/api/workloads/:id/inputs', async (req, res) => {
   } catch (error) {
     console.error('Upload setup error:', error);
     res.status(500).json({ error: 'Failed to setup file upload: ' + error.message });
-  }
-});
-
-// STEP 2: Enhanced compute-start endpoint - Process chunks AFTER files uploaded
-app.post('/api/workloads/:id/compute-start', async (req, res) => {
-  const wid = req.params.id;
-  const wl = customWorkloads.get(wid);
-
-  if (!wl) {
-    return res.status(404).json({ error: 'Workload not found' });
-  }
-
-  if (!['queued', 'awaiting_input'].includes(wl.status)) {
-    return res.status(400).json({ error: `Cannot start workload in status: ${wl.status}` });
-  }
-
-  try {
-    // For enhanced workloads, validate input files are present
-    if (wl.enhanced && wl.isChunkParent) {
-      if (!wl.inputRefs || wl.inputRefs.length === 0) {
-        return res.status(400).json({ error: 'No input files uploaded. Use POST /api/workloads/:id/inputs first.' });
-      }
-
-      // NOW process the chunks with the uploaded files
-      console.log(`🔄 Processing chunks for workload ${wid} with ${wl.inputRefs.length} input files...`);
-
-      const result = await chunkingManager.processChunkedWorkload(wl);
-      if (!result.success) {
-        wl.status = 'error';
-        wl.error = result.error;
-        saveCustomWorkloads();
-        return res.status(400).json(result);
-      }
-
-      // Update workload with chunk information
-      wl.chunkDescriptors = result.chunkDescriptors;
-      wl.plan = result.plan;
-
-      // Create chunk store
-      const store = {
-        parentId: wid,
-        allChunkDefs: result.chunkDescriptors.map((cd, idx) => ({
-          ...cd,
-          status: 'queued',
-          dispatchesMade: 0,
-          submissions: [],
-          activeAssignments: new Set(),
-          assignedClients: new Set(),
-          verified_results: null,
-          chunkOrderIndex: idx
-        })),
-        completedChunksData: new Map(),
-        expectedChunks: result.plan.totalChunks,
-        status: 'assigning_chunks',
-        aggregationMethod: result.plan.assemblyStrategy,
-        enhanced: true
-      };
-
-      customWorkloadChunks.set(wid, store);
-      wl.status = 'assigning_chunks';
-
-      console.log(`✅ Created ${store.allChunkDefs.length} chunk descriptors for workload ${wid}`);
-    } else {
-      // Non-chunked workload
-      wl.status = 'pending_dispatch';
-    }
-
-    wl.startedAt = Date.now();
-    saveCustomWorkloads();
-    saveCustomWorkloadChunks();
-    broadcastCustomWorkloadList();
-
-    io.emit('workload:started', {
-      id: wl.id,
-      label: wl.label,
-      status: wl.status,
-      startedAt: wl.startedAt,
-      totalChunks: wl.plan?.totalChunks || 0
-    });
-
-    res.json({
-      success: true,
-      workloadId: wid,
-      status: wl.status,
-      totalChunks: wl.plan?.totalChunks || 0,
-      message: `Workload ${wl.label} started successfully`
-    });
-
-  } catch (error) {
-    console.error('Compute start error:', error);
-    wl.status = 'error';
-    wl.error = error.message;
-    saveCustomWorkloads();
-
-    res.status(500).json({ error: 'Failed to start computation: ' + error.message });
   }
 });
 
@@ -2754,7 +2703,7 @@ io.on('connection', socket => {
 
     const client = matrixState.clients.get(socket.id);
     if (client) client.isBusyWithCustomChunk = false;
-
+    updateStreamingWorkloadProgress(parentId, chunkId, 'completed');
     const workloadState = customWorkloads.get(parentId);
     const chunkStore = customWorkloadChunks.get(parentId);
 
@@ -3293,10 +3242,49 @@ server.listen(PORT, () => {
   } catch (error) {
     console.error('Error processing streaming queues:', error);
   }
-}, 5000);
+}, 1000);
 });
 
+app.get('/api/streaming/status', (req, res) => {
+  const streamingStatus = {
+    activeQueues: streamingChunkQueues.size,
+    totalQueuedChunks: Array.from(streamingChunkQueues.values()).reduce((sum, queue) => sum + queue.length, 0),
+    activeStreamingWorkloads: Array.from(customWorkloads.values()).filter(w => w.streamingMode && w.status !== 'complete').length,
+    queueDetails: {}
+  };
 
+  // Add detailed queue information
+  for (const [workloadId, queue] of streamingChunkQueues.entries()) {
+    const workload = customWorkloads.get(workloadId);
+    streamingStatus.queueDetails[workloadId] = {
+      label: workload?.label || 'Unknown',
+      framework: workload?.framework || 'Unknown',
+      queueSize: queue.length,
+      oldestChunkAge: queue.length > 0 ? Date.now() - Math.min(...queue.map(item => item.queuedAt)) : 0,
+      averageAttempts: queue.length > 0 ? queue.reduce((sum, item) => sum + item.attempts, 0) / queue.length : 0,
+      progress: workload?.streamingProgress || null
+    };
+  }
+
+  res.json(streamingStatus);
+});
+
+app.post('/api/streaming/process-queues', async (req, res) => {
+  try {
+    const startTime = Date.now();
+    await processStreamingQueues();
+    const processingTime = Date.now() - startTime;
+
+    res.json({
+      success: true,
+      processingTime,
+      remainingQueues: streamingChunkQueues.size,
+      totalQueued: Array.from(streamingChunkQueues.values()).reduce((sum, queue) => sum + queue.length, 0)
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
 
 // --- Download final result if stored on disk ---
 app.get('/api/workloads/:id/download/final', (req, res) => {
@@ -3367,7 +3355,7 @@ app.get('/api/workloads/:id/status', (req, res) => {
 });
 
 async function queueStreamingChunk(workloadId, chunkDescriptor) {
-  console.log(`📋 Queuing streaming chunk ${chunkDescriptor.chunkId} - no clients available`);
+  console.log(`📋 [QUEUE] Queuing chunk ${chunkDescriptor.chunkId} - no available clients`);
 
   // Initialize queue for this workload if it doesn't exist
   if (!streamingChunkQueues.has(workloadId)) {
@@ -3376,97 +3364,150 @@ async function queueStreamingChunk(workloadId, chunkDescriptor) {
 
   const queue = streamingChunkQueues.get(workloadId);
 
-  // Check queue size limit
-  if (queue.length >= maxQueueSize) {
-    console.error(`❌ Streaming queue full for workload ${workloadId} (${queue.length} chunks)`);
-    return { success: false, error: 'Queue full' };
+  // Check queue size limit with dynamic scaling
+  const workload = customWorkloads.get(workloadId);
+  const dynamicMaxQueueSize = workload?.metadata?.maxQueueSize || Math.min(maxQueueSize, 100);
+
+  if (queue.length >= dynamicMaxQueueSize) {
+    // Remove oldest items to make room (FIFO)
+    const removed = queue.splice(0, Math.ceil(dynamicMaxQueueSize * 0.1)); // Remove 10%
+    console.warn(`⚠️  [QUEUE] Queue full for ${workloadId}, removed ${removed.length} oldest chunks`);
   }
 
-  // Add to queue with timestamp
+  // Add to queue with enhanced metadata
   queue.push({
     descriptor: chunkDescriptor,
     queuedAt: Date.now(),
-    attempts: 0
+    attempts: 0,
+    workloadId,
+    priority: chunkDescriptor.streamingMetadata?.tileProgress || 0
   });
 
-  console.log(`📊 Workload ${workloadId} queue: ${queue.length} chunks waiting`);
+  console.log(`📊 [QUEUE] Workload ${workloadId} queue: ${queue.length} chunks waiting`);
 
-  return { success: true, queued: true, queueSize: queue.length };
+  return {
+    success: true,
+    queued: true,
+    queueSize: queue.length,
+    position: queue.length
+  };
 }
 
 // ADD: Function to process queued streaming chunks
 async function processStreamingQueues() {
   if (streamingChunkQueues.size === 0) return;
 
-  const availableClients = Array.from(matrixState.clients.entries()).filter(([clientId, client]) =>
-    client.connected &&
-    client.gpuInfo &&
-    !client.isBusyWithCustomChunk &&
-    !client.isBusyWithMatrixTask &&
-    (client.socket || client.emit)
-  );
+  const startTime = Date.now();
+  let totalProcessed = 0;
 
-  if (availableClients.length === 0) return;
+  console.log(`🔄 [QUEUE] Processing ${streamingChunkQueues.size} streaming queues...`);
 
-  // Process each workload's queue
-  for (const [workloadId, queue] of streamingChunkQueues.entries()) {
+  // Get available clients by framework
+  const clientsByFramework = new Map();
+  matrixState.clients.forEach((client, clientId) => {
+    if (!client.connected || !client.gpuInfo ||
+        client.isBusyWithCustomChunk || client.isBusyWithMatrixTask ||
+        (!client.socket && !client.emit)) {
+      return;
+    }
+
+    if (client.supportedFrameworks) {
+      client.supportedFrameworks.forEach(framework => {
+        if (!clientsByFramework.has(framework)) {
+          clientsByFramework.set(framework, []);
+        }
+        clientsByFramework.get(framework).push({ clientId, client });
+      });
+    }
+  });
+
+  // Process each workload's queue with priority
+  const workloadQueues = Array.from(streamingChunkQueues.entries())
+    .sort(([aWorkloadId, aQueue], [bWorkloadId, bQueue]) => {
+      // Prioritize workloads with older chunks
+      const aOldest = Math.min(...aQueue.map(item => item.queuedAt));
+      const bOldest = Math.min(...bQueue.map(item => item.queuedAt));
+      return aOldest - bOldest;
+    });
+
+  for (const [workloadId, queue] of workloadQueues) {
     if (queue.length === 0) continue;
 
-    // Try to dispatch chunks from this queue
-    let dispatched = 0;
-    const maxDispatchPerCycle = Math.min(queue.length, availableClients.length);
+    let queueProcessed = 0;
+    const maxDispatchPerQueue = Math.min(queue.length, 5); // Limit per cycle
 
-    for (let i = 0; i < maxDispatchPerCycle && queue.length > 0; i++) {
-      const queuedChunk = queue.shift(); // Remove from front of queue
-      const { descriptor } = queuedChunk;
+    for (let i = 0; i < maxDispatchPerQueue && queue.length > 0; i++) {
+      const queuedItem = queue.shift();
+      const { descriptor } = queuedItem;
 
-      // Find a client that supports this framework
-      const availableClientIndex = availableClients.findIndex(([clientId, client]) =>
-        client.supportedFrameworks &&
-        client.supportedFrameworks.includes(descriptor.framework) &&
-        !client.isBusyWithCustomChunk &&
-        !client.isBusyWithMatrixTask
+      // Find available client for this framework
+      const frameworkClients = clientsByFramework.get(descriptor.framework) || [];
+      const availableClient = frameworkClients.find(({ client }) =>
+        !client.isBusyWithCustomChunk && !client.isBusyWithMatrixTask
       );
 
-      if (availableClientIndex !== -1) {
-        const [clientId, client] = availableClients[availableClientIndex];
+      if (!availableClient) {
+        // No client available, put back at front of queue
+        queue.unshift(queuedItem);
+        break;
+      }
 
-        try {
-          // Dispatch the queued chunk
-          await dispatchChunkToClient(client, descriptor, workloadId);
-          dispatched++;
+      try {
+        // Dispatch the queued chunk
+        await dispatchChunkToClient(availableClient.client, descriptor, workloadId);
 
-          // Remove this client from available list for this cycle
-          availableClients.splice(availableClientIndex, 1);
-
-          console.log(`🎯 Dispatched queued chunk ${descriptor.chunkId} to ${clientId} (${queue.length} remaining)`);
-        } catch (error) {
-          // Re-queue the chunk if dispatch failed
-          queue.unshift(queuedChunk);
-          queuedChunk.attempts++;
-          console.error(`⚠ Failed to dispatch queued chunk ${descriptor.chunkId}: ${error.message}`);
-          break;
+        // Mark client as busy and remove from available pool
+        availableClient.client.isBusyWithCustomChunk = true;
+        const frameworkList = clientsByFramework.get(descriptor.framework);
+        const clientIndex = frameworkList.indexOf(availableClient);
+        if (clientIndex > -1) {
+          frameworkList.splice(clientIndex, 1);
         }
-      } else {
-        // No suitable client found, put chunk back in queue
-        queue.unshift(queuedChunk);
+
+        queueProcessed++;
+        totalProcessed++;
+
+        console.log(`✅ [QUEUE] Dispatched queued chunk ${descriptor.chunkId} to ${availableClient.clientId}`);
+
+      } catch (error) {
+        // Re-queue the chunk with incremented attempt count
+        queuedItem.attempts++;
+        if (queuedItem.attempts < 3) {
+          queue.push(queuedItem);
+          console.warn(`⚠️  [QUEUE] Requeued chunk ${descriptor.chunkId} (attempt ${queuedItem.attempts}/3)`);
+        } else {
+          console.error(`❌ [QUEUE] Dropped chunk ${descriptor.chunkId} after 3 failed attempts`);
+          updateStreamingWorkloadProgress(workloadId, descriptor.chunkId, 'failed');
+        }
         break;
       }
     }
 
-    if (dispatched > 0) {
-      console.log(`📤 Processed streaming queue for ${workloadId}: dispatched ${dispatched} chunks, ${queue.length} remaining`);
+    if (queueProcessed > 0) {
+      console.log(`📤 [QUEUE] Processed ${queueProcessed} chunks for workload ${workloadId} (${queue.length} remaining)`);
     }
 
     // Clean up empty queues
     if (queue.length === 0) {
       streamingChunkQueues.delete(workloadId);
-      console.log(`🧹 Cleared empty queue for workload ${workloadId}`);
+      console.log(`🧹 [QUEUE] Cleared empty queue for workload ${workloadId}`);
     }
+  }
+
+  const processingTime = Date.now() - startTime;
+  if (totalProcessed > 0) {
+    console.log(`⚡ [QUEUE] Processed ${totalProcessed} total chunks in ${processingTime}ms`);
   }
 }
 
 async function dispatchStreamingChunkEnhanced(workloadId, chunkDescriptor) {
+  console.log(`[STREAMING DISPATCH] === STARTING DISPATCH ===`);
+  console.log(`[STREAMING DISPATCH] Workload: ${workloadId}`);
+  console.log(`[STREAMING DISPATCH] Chunk: ${chunkDescriptor.chunkId}`);
+  console.log(`[STREAMING DISPATCH] Framework: ${chunkDescriptor.framework}`);
+  console.log(`[STREAMING DISPATCH] Has inputs: ${!!chunkDescriptor.inputs} (${chunkDescriptor.inputs?.length || 0})`);
+  console.log(`[STREAMING DISPATCH] Has outputs: ${!!chunkDescriptor.outputs} (${chunkDescriptor.outputs?.length || 0})`);
+
   try {
     // Find available clients that support the framework
     const availableClients = Array.from(matrixState.clients.entries()).filter(([clientId, client]) =>
@@ -3498,6 +3539,57 @@ async function dispatchStreamingChunkEnhanced(workloadId, chunkDescriptor) {
   }
 }
 
+function updateStreamingWorkloadProgress(workloadId, chunkId, status) {
+  const workload = customWorkloads.get(workloadId);
+  if (!workload) return;
+
+  if (!workload.streamingProgress) {
+    workload.streamingProgress = {
+      dispatched: new Map(),
+      completed: new Map(),
+      failed: new Map(),
+      totalDispatched: 0,
+      totalCompleted: 0,
+      totalFailed: 0
+    };
+  }
+
+  const progress = workload.streamingProgress;
+
+  switch (status) {
+    case 'dispatched':
+      progress.dispatched.set(chunkId, Date.now());
+      progress.totalDispatched++;
+      console.log(`📈 [PROGRESS] Workload ${workloadId}: ${progress.totalDispatched} chunks dispatched`);
+      break;
+
+    case 'completed':
+      progress.completed.set(chunkId, Date.now());
+      progress.totalCompleted++;
+      progress.dispatched.delete(chunkId);
+      console.log(`📈 [PROGRESS] Workload ${workloadId}: ${progress.totalCompleted} chunks completed`);
+      break;
+
+    case 'failed':
+      progress.failed.set(chunkId, Date.now());
+      progress.totalFailed++;
+      progress.dispatched.delete(chunkId);
+      console.log(`📈 [PROGRESS] Workload ${workloadId}: ${progress.totalFailed} chunks failed`);
+      break;
+  }
+
+  // Emit progress update to clients
+  io.emit('streaming:progress', {
+    workloadId,
+    dispatched: progress.totalDispatched,
+    completed: progress.totalCompleted,
+    failed: progress.totalFailed,
+    active: progress.dispatched.size,
+    timestamp: Date.now()
+  });
+}
+
+
 function cleanupStreamingQueue(workloadId) {
   const queue = streamingChunkQueues.get(workloadId);
   if (queue) {
@@ -3505,6 +3597,92 @@ function cleanupStreamingQueue(workloadId) {
     streamingChunkQueues.delete(workloadId);
   }
 }
+
+function cleanupStreamingWorkload(workloadId) {
+  console.log(`🧹 [CLEANUP] Cleaning up streaming workload ${workloadId}`);
+
+  // Remove from streaming queues
+  const queue = streamingChunkQueues.get(workloadId);
+  if (queue) {
+    console.log(`🗑️  [CLEANUP] Removing ${queue.length} queued chunks for ${workloadId}`);
+    streamingChunkQueues.delete(workloadId);
+  }
+
+  // Clean up progress tracking
+  const workload = customWorkloads.get(workloadId);
+  if (workload && workload.streamingProgress) {
+    const progress = workload.streamingProgress;
+    console.log(`📊 [CLEANUP] Final stats for ${workloadId}: ${progress.totalCompleted} completed, ${progress.totalFailed} failed`);
+    delete workload.streamingProgress;
+  }
+
+  // Clean up from chunking manager
+  if (typeof chunkingManager.cleanupWorkload === 'function') {
+    try {
+      chunkingManager.cleanupWorkload(workloadId);
+    } catch (error) {
+      console.warn(`⚠️  [CLEANUP] ChunkingManager cleanup warning for ${workloadId}:`, error.message);
+    }
+  }
+}
+
+function handleStreamingError(workloadId, chunkId, error, clientId) {
+  console.error(`❌ [STREAMING ERROR] Workload ${workloadId}, chunk ${chunkId}, client ${clientId}: ${error.message}`);
+
+  // Update progress tracking
+  updateStreamingWorkloadProgress(workloadId, chunkId, 'failed');
+
+  // Emit error to monitoring clients
+  io.emit('streaming:error', {
+    workloadId,
+    chunkId,
+    clientId,
+    error: error.message,
+    timestamp: Date.now()
+  });
+
+  // Check if we should abort the workload due to too many failures
+  const workload = customWorkloads.get(workloadId);
+  if (workload && workload.streamingProgress) {
+    const progress = workload.streamingProgress;
+    const failureRate = progress.totalFailed / (progress.totalCompleted + progress.totalFailed + progress.totalDispatched);
+
+    if (failureRate > 0.5 && progress.totalFailed > 10) {
+      console.error(`🛑 [STREAMING ERROR] High failure rate (${(failureRate * 100).toFixed(1)}%) for workload ${workloadId}, considering abort`);
+
+      // Optionally auto-abort workloads with high failure rates
+      if (process.env.STREAMING_AUTO_ABORT === 'true') {
+        workload.status = 'error';
+        workload.error = `High failure rate: ${progress.totalFailed} failed chunks (${(failureRate * 100).toFixed(1)}%)`;
+        cleanupStreamingWorkload(workloadId);
+
+        io.emit('workload:aborted', {
+          id: workloadId,
+          reason: workload.error,
+          timestamp: Date.now()
+        });
+      }
+    }
+  }
+}
+
+setInterval(() => {
+  // Log streaming statistics every 30 seconds
+  if (streamingChunkQueues.size > 0) {
+    const totalQueued = Array.from(streamingChunkQueues.values()).reduce((sum, queue) => sum + queue.length, 0);
+    const activeStreaming = Array.from(customWorkloads.values()).filter(w => w.streamingMode && w.status !== 'complete').length;
+
+    console.log(`📈 [STREAMING STATS] ${activeStreaming} active streaming workloads, ${totalQueued} chunks queued`);
+
+    // Check for stalled queues
+    streamingChunkQueues.forEach((queue, workloadId) => {
+      const stalledChunks = queue.filter(item => Date.now() - item.queuedAt > 300000); // 5 minutes
+      if (stalledChunks.length > 0) {
+        console.warn(`⚠️  [STREAMING STATS] Workload ${workloadId} has ${stalledChunks.length} chunks stalled for >5 minutes`);
+      }
+    });
+  }
+}, 30000);
 
 async function handleStreamingWorkloadComplete(workloadId, result) {
   console.log(`🎉 Streaming workload ${workloadId} completed!`);

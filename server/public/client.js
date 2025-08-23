@@ -2063,7 +2063,7 @@ socket.on('workload:chunk_assign', async chunk => {
     hasKernel: !!(chunk.kernel || chunk.wgsl),
     enhanced: chunk.enhanced
   });
-
+  console.log(`[CHUNK RECEIVED] Streaming mode: ${chunk.streaming}`);
   // NEW: Debug WebGL-specific properties
   console.log(`[CLIENT DEBUG] WebGL properties:`, {
     hasWebglVertexShader: !!chunk.webglVertexShader,
