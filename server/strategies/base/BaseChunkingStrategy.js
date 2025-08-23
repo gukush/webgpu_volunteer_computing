@@ -1,5 +1,4 @@
-// strategies/base/BaseChunkingStrategy.js
-// Base class for all chunking strategies with multi-input/output support
+// COMPLETE: strategies/base/BaseChunkingStrategy.js - Enhanced base class with multi-input/output support
 
 export class BaseChunkingStrategy {
   constructor(name) {

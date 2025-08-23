@@ -10,6 +10,7 @@ OpenCLExecutor::~OpenCLExecutor() {
     cleanup();
 }
 
+
 bool OpenCLExecutor::initialize(const json& config) {
     if (initialized) return true;
 
@@ -42,41 +43,77 @@ bool OpenCLExecutor::initialize(const json& config) {
     clGetPlatformInfo(platform, CL_PLATFORM_NAME, sizeof(platformName), platformName, nullptr);
     std::cout << "Using OpenCL platform: " << platformName << std::endl;
 
-    // Get devices
-    cl_uint numDevices;
-    cl_device_type deviceType = CL_DEVICE_TYPE_GPU;
+    // ENHANCED: Explicit device type selection
+    cl_device_type deviceType = CL_DEVICE_TYPE_GPU; // Default
+    std::string requestedDeviceType = "auto";
 
     if (config.contains("deviceType")) {
-        std::string devTypeStr = config["deviceType"];
-        if (devTypeStr == "CPU") deviceType = CL_DEVICE_TYPE_CPU;
-        else if (devTypeStr == "GPU") deviceType = CL_DEVICE_TYPE_GPU;
-        else if (devTypeStr == "ALL") deviceType = CL_DEVICE_TYPE_ALL;
+        requestedDeviceType = config["deviceType"].get<std::string>();
+
+        if (requestedDeviceType == "cpu" || requestedDeviceType == "CPU") {
+            deviceType = CL_DEVICE_TYPE_CPU;
+            std::cout << "🖥️  Explicitly requesting CPU devices" << std::endl;
+        } else if (requestedDeviceType == "gpu" || requestedDeviceType == "GPU") {
+            deviceType = CL_DEVICE_TYPE_GPU;
+            std::cout << "🎮 Explicitly requesting GPU devices" << std::endl;
+        } else if (requestedDeviceType == "all" || requestedDeviceType == "ALL") {
+            deviceType = CL_DEVICE_TYPE_ALL;
+            std::cout << "🔧 Requesting all device types" << std::endl;
+        } else if (requestedDeviceType == "auto") {
+            deviceType = CL_DEVICE_TYPE_GPU; // Start with GPU
+            std::cout << "🤖 Auto-selecting devices (GPU preferred)" << std::endl;
+        }
     }
 
+    // Get devices with improved selection logic
+    cl_uint numDevices = 0;
+    std::vector<cl_device_id> devices;
+    std::string finalDeviceTypeStr;
+
+    // Try requested device type first
     err = clGetDeviceIDs(platform, deviceType, 0, nullptr, &numDevices);
 
-    if ((err != CL_SUCCESS || numDevices == 0) && deviceType == CL_DEVICE_TYPE_GPU) {
+    if (err == CL_SUCCESS && numDevices > 0) {
+        devices.resize(numDevices);
+        err = clGetDeviceIDs(platform, deviceType, numDevices, devices.data(), nullptr);
+
+        if (deviceType == CL_DEVICE_TYPE_CPU) finalDeviceTypeStr = "CPU";
+        else if (deviceType == CL_DEVICE_TYPE_GPU) finalDeviceTypeStr = "GPU";
+        else finalDeviceTypeStr = "Mixed";
+
+        std::cout << "✅ Found " << numDevices << " " << finalDeviceTypeStr << " device(s)" << std::endl;
+    }
+
+    // Fallback logic for auto mode
+    if ((err != CL_SUCCESS || numDevices == 0) && requestedDeviceType == "auto") {
         std::cout << "No GPU devices found, falling back to CPU devices..." << std::endl;
         deviceType = CL_DEVICE_TYPE_CPU;
         err = clGetDeviceIDs(platform, deviceType, 0, nullptr, &numDevices);
+
+        if (err == CL_SUCCESS && numDevices > 0) {
+            devices.resize(numDevices);
+            err = clGetDeviceIDs(platform, deviceType, numDevices, devices.data(), nullptr);
+            finalDeviceTypeStr = "CPU";
+            std::cout << "✅ Found " << numDevices << " CPU device(s)" << std::endl;
+        }
     }
 
-    if ((err != CL_SUCCESS || numDevices == 0) && deviceType != CL_DEVICE_TYPE_ALL) {
-        std::cout << "No " << (deviceType == CL_DEVICE_TYPE_CPU ? "CPU" : "specific")
-                  << " devices found, trying all device types..." << std::endl;
+    // Final fallback to any device type
+    if (err != CL_SUCCESS || numDevices == 0) {
+        std::cout << "No devices found for requested type, trying all device types..." << std::endl;
         deviceType = CL_DEVICE_TYPE_ALL;
         err = clGetDeviceIDs(platform, deviceType, 0, nullptr, &numDevices);
+
+        if (err == CL_SUCCESS && numDevices > 0) {
+            devices.resize(numDevices);
+            err = clGetDeviceIDs(platform, deviceType, numDevices, devices.data(), nullptr);
+            finalDeviceTypeStr = "Any";
+            std::cout << "✅ Found " << numDevices << " device(s) of any type" << std::endl;
+        }
     }
 
     if (err != CL_SUCCESS || numDevices == 0) {
-        std::cerr << "No suitable OpenCL devices found" << std::endl;
-        return false;
-    }
-
-    std::vector<cl_device_id> devices(numDevices);
-    err = clGetDeviceIDs(platform, deviceType, numDevices, devices.data(), nullptr);
-    if (err != CL_SUCCESS) {
-        std::cerr << "Failed to get OpenCL devices" << std::endl;
+        std::cerr << "❌ No suitable OpenCL devices found" << std::endl;
         return false;
     }
 
@@ -87,10 +124,38 @@ bool OpenCLExecutor::initialize(const json& config) {
     }
     device = devices[deviceId];
 
-    // Get device info
+    // Get detailed device info
     char deviceName[256];
+    char deviceVendor[256];
+    cl_device_type actualDeviceType;
+    cl_ulong globalMemSize;
+    cl_uint maxComputeUnits;
+    cl_uint maxWorkGroupSize;
+
     clGetDeviceInfo(device, CL_DEVICE_NAME, sizeof(deviceName), deviceName, nullptr);
-    std::cout << "Using OpenCL device: " << deviceName << std::endl;
+    clGetDeviceInfo(device, CL_DEVICE_VENDOR, sizeof(deviceVendor), deviceVendor, nullptr);
+    clGetDeviceInfo(device, CL_DEVICE_TYPE, sizeof(actualDeviceType), &actualDeviceType, nullptr);
+    clGetDeviceInfo(device, CL_DEVICE_GLOBAL_MEM_SIZE, sizeof(globalMemSize), &globalMemSize, nullptr);
+    clGetDeviceInfo(device, CL_DEVICE_MAX_COMPUTE_UNITS, sizeof(maxComputeUnits), &maxComputeUnits, nullptr);
+    clGetDeviceInfo(device, CL_DEVICE_MAX_WORK_GROUP_SIZE, sizeof(maxWorkGroupSize), &maxWorkGroupSize, nullptr);
+
+    std::string actualTypeStr;
+    if (actualDeviceType == CL_DEVICE_TYPE_CPU) actualTypeStr = "CPU";
+    else if (actualDeviceType == CL_DEVICE_TYPE_GPU) actualTypeStr = "GPU";
+    else if (actualDeviceType == CL_DEVICE_TYPE_ACCELERATOR) actualTypeStr = "Accelerator";
+    else actualTypeStr = "Other";
+
+    std::cout << "📋 Selected OpenCL device:" << std::endl;
+    std::cout << "   Name: " << deviceName << std::endl;
+    std::cout << "   Vendor: " << deviceVendor << std::endl;
+    std::cout << "   Type: " << actualTypeStr << std::endl;
+    std::cout << "   Compute Units: " << maxComputeUnits << std::endl;
+    std::cout << "   Max Work Group Size: " << maxWorkGroupSize << std::endl;
+    std::cout << "   Global Memory: " << (globalMemSize / (1024 * 1024)) << " MB" << std::endl;
+
+    // Store device type info for capabilities reporting
+    selectedDeviceType = actualDeviceType;
+    selectedDeviceTypeStr = actualTypeStr;
 
     // Create context
     context = clCreateContext(nullptr, 1, &device, nullptr, nullptr, &err);
@@ -107,6 +172,8 @@ bool OpenCLExecutor::initialize(const json& config) {
     }
 
     initialized = true;
+    std::cout << "✅ OpenCL executor initialized successfully with " << actualTypeStr << " device" << std::endl;
+
     return true;
 }
 
@@ -580,37 +647,55 @@ TaskResult OpenCLExecutor::executeTask(const TaskData& task) {
 
     return result;
 }
-
 json OpenCLExecutor::getCapabilities() const {
     json caps;
     caps["framework"] = "opencl";
     caps["initialized"] = initialized;
-    caps["supportsMultiInput"] = true;  // NEW: Advertise multi-input/output support
+    caps["supportsMultiInput"] = true;
     caps["supportsMultiOutput"] = true;
-    caps["maxInputs"] = 4;              // NEW: Practical limits
+    caps["maxInputs"] = 4;
     caps["maxOutputs"] = 3;
 
     if (initialized && device) {
         char deviceName[256];
         char deviceVendor[256];
-        cl_device_type deviceType;
         cl_ulong globalMemSize;
         cl_uint maxComputeUnits;
+        cl_uint maxWorkGroupSize;
 
         clGetDeviceInfo(device, CL_DEVICE_NAME, sizeof(deviceName), deviceName, nullptr);
         clGetDeviceInfo(device, CL_DEVICE_VENDOR, sizeof(deviceVendor), deviceVendor, nullptr);
-        clGetDeviceInfo(device, CL_DEVICE_TYPE, sizeof(deviceType), &deviceType, nullptr);
         clGetDeviceInfo(device, CL_DEVICE_GLOBAL_MEM_SIZE, sizeof(globalMemSize), &globalMemSize, nullptr);
         clGetDeviceInfo(device, CL_DEVICE_MAX_COMPUTE_UNITS, sizeof(maxComputeUnits), &maxComputeUnits, nullptr);
+        clGetDeviceInfo(device, CL_DEVICE_MAX_WORK_GROUP_SIZE, sizeof(maxWorkGroupSize), &maxWorkGroupSize, nullptr);
 
         caps["device"] = {
             {"name", deviceName},
             {"vendor", deviceVendor},
-            {"type", (deviceType == CL_DEVICE_TYPE_GPU) ? "GPU" :
-                    (deviceType == CL_DEVICE_TYPE_CPU) ? "CPU" : "Other"},
+            {"type", selectedDeviceTypeStr},
+            {"isCPU", selectedDeviceType == CL_DEVICE_TYPE_CPU},
+            {"isGPU", selectedDeviceType == CL_DEVICE_TYPE_GPU},
             {"globalMemory", globalMemSize},
-            {"computeUnits", maxComputeUnits}
+            {"computeUnits", maxComputeUnits},
+            {"maxWorkGroupSize", maxWorkGroupSize}
         };
+
+        // Add performance hints based on device type
+        if (selectedDeviceType == CL_DEVICE_TYPE_CPU) {
+            caps["performanceHints"] = {
+                {"preferredWorkGroupSize", std::min(maxWorkGroupSize, 64u)},
+                {"memoryPattern", "sequential_preferred"},
+                {"parallelismLevel", "thread_level"},
+                {"cacheFriendly", true}
+            };
+        } else {
+            caps["performanceHints"] = {
+                {"preferredWorkGroupSize", std::min(maxWorkGroupSize, 256u)},
+                {"memoryPattern", "coalesced_preferred"},
+                {"parallelismLevel", "massive_parallel"},
+                {"cacheFriendly", false}
+            };
+        }
     }
 
     return caps;

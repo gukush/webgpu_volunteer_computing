@@ -63,11 +63,22 @@ static void printUsage(const char* programName) {
     std::cout << "\nOptions:\n"
               << "  --url <wss://localhost:3000>  Server URL\n"
               << "  --device <0>                  Device ID\n"
+              << "  --device-type <type>          Device type (cpu/gpu/auto) [OpenCL only]\n"
               << "  --config <file.json>          Configuration file\n"
               << "  --insecure                    Accept self-signed certificates\n"
               << "  --legacy                      Use legacy FrameworkClient instead of WebSocket\n"
+              << "\nOpenCL Device Types:\n"
+              << "  cpu                           Force CPU device selection\n"
+              << "  gpu                           Force GPU device selection (default)\n"
+              << "  auto                          Auto-select (GPU preferred, fallback to CPU)\n"
+              << "  all                           Consider all device types\n"
+              << "\nExamples:\n"
+              << "  " << programName << " opencl --device-type cpu     # Force OpenCL CPU\n"
+              << "  " << programName << " opencl --device-type gpu     # Force OpenCL GPU\n"
+              << "  " << programName << " opencl --device-type auto    # Auto-select\n"
               << std::endl;
 }
+
 
 
 
@@ -509,6 +520,7 @@ private:
     }
 };
 
+
 int main(int argc, char* argv[]) {
     if (argc < 2) {
         printUsage(argv[0]);
@@ -518,10 +530,12 @@ int main(int argc, char* argv[]) {
     std::string framework = argv[1];
     std::string serverUrl = "wss://localhost:3000";
     int deviceId = 0;
+    std::string deviceType = "auto"; // NEW: Device type option
     std::string configFile;
     bool insecure = false;
     bool useLegacy = false;
 
+    // Enhanced argument parsing
     for (int i = 2; i < argc; i++) {
         std::string arg = argv[i];
         if (arg == "--url" && i + 1 < argc) {
@@ -529,6 +543,10 @@ int main(int argc, char* argv[]) {
         }
         else if (arg == "--device" && i + 1 < argc) {
             deviceId = std::stoi(argv[++i]);
+        }
+        else if (arg == "--device-type" && i + 1 < argc) {
+            deviceType = argv[++i];
+            std::cout << "🔧 Device type specified: " << deviceType << std::endl;
         }
         else if (arg == "--config" && i + 1 < argc) {
             configFile = argv[++i];
@@ -539,8 +557,30 @@ int main(int argc, char* argv[]) {
         else if (arg == "--legacy") {
             useLegacy = true;
         }
+        else {
+            std::cerr << "Unknown option: " << arg << std::endl;
+            printUsage(argv[0]);
+            return 1;
+        }
     }
+    if (framework == "opencl") {
+        std::vector<std::string> validTypes = {"cpu", "gpu", "auto", "all"};
+        if (std::find(validTypes.begin(), validTypes.end(), deviceType) == validTypes.end()) {
+            std::cerr << "Invalid device type for OpenCL: " << deviceType << std::endl;
+            std::cerr << "Valid options: cpu, gpu, auto, all" << std::endl;
+            return 1;
+        }
 
+        if (deviceType == "cpu") {
+            std::cout << "CPU baseline mode: OpenCL will use CPU devices only" << std::endl;
+        } else if (deviceType == "gpu") {
+            std::cout << "GPU mode: OpenCL will use GPU devices only" << std::endl;
+        } else if (deviceType == "auto") {
+            std::cout << "Auto mode: OpenCL will prefer GPU, fallback to CPU" << std::endl;
+        }
+    } else if (deviceType != "auto") {
+        std::cout << "Warning: --device-type only applies to OpenCL framework" << std::endl;
+    }
     // Set insecure SSL if requested
     if (insecure) {
         std::cout << "Warning: Accepting self-signed certificates" << std::endl;
@@ -590,7 +630,7 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
-    // Load config
+    // Load and enhance config
     json config;
     if (!configFile.empty()) {
         std::ifstream configStream(configFile);
@@ -608,8 +648,12 @@ int main(int argc, char* argv[]) {
         }
     }
     config["deviceId"] = deviceId;
+    config["deviceType"] = deviceType;
 
     std::cout << "Initializing " << framework << " executor..." << std::endl;
+    if (framework == "opencl") {
+        std::cout << " with device type: " << deviceType <<std::endl;
+    }
     if (!executor->initialize(config)) {
         std::cerr << "Failed to initialize " << framework << " executor" << std::endl;
 
@@ -628,7 +672,25 @@ int main(int argc, char* argv[]) {
     try {
         json caps = executor->getCapabilities();
         std::cout << "✅ " << framework << " executor initialized successfully" << std::endl;
-        std::cout << "Capabilities: " << caps.dump(2) << std::endl;
+
+        if (caps.contains("device")) {
+            auto device = caps["device"];
+            std::cout << "Device Information:" << std::endl;
+            std::cout << "   Name: " << device.value("name", "Unknown") << std::endl;
+            std::cout << "   Type: " << device.value("type", "Unknown") << std::endl;
+            std::cout << "   Vendor: " << device.value("vendor", "Unknown") << std::endl;
+
+            if (device.contains("isCPU") && device["isCPU"].get<bool>()) {
+                std::cout << "Running in CPU baseline mode" << std::endl;
+            } else if (device.contains("isGPU") && device["isGPU"].get<bool>()) {
+                std::cout << "Running in GPU acceleration mode" << std::endl;
+            }
+
+            if (device.contains("computeUnits")) {
+                std::cout << "   Compute Units: " << device["computeUnits"] << std::endl;
+            }
+        }
+
     } catch (const std::exception& e) {
         std::cout << "✅ " << framework << " executor initialized (capabilities unavailable: "
                   << e.what() << ")" << std::endl;

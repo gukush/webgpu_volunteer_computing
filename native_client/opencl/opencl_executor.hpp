@@ -1,4 +1,4 @@
-// Add these additions to opencl_executor.hpp
+// Updated opencl_executor.hpp with device type tracking
 
 #pragma once
 #include "../common/framework_client.hpp"
@@ -20,6 +20,10 @@ private:
     cl_command_queue queue = nullptr;
     bool initialized = false;
 
+    // NEW: Device type tracking
+    cl_device_type selectedDeviceType = CL_DEVICE_TYPE_GPU;
+    std::string selectedDeviceTypeStr = "GPU";
+
     struct CompiledKernel {
         cl_program program = nullptr;
         cl_kernel kernel = nullptr;
@@ -27,7 +31,7 @@ private:
 
     std::map<std::string, CompiledKernel> kernelCache;
 
-    // NEW: Uniform value structure for enhanced metadata support
+    // Uniform value structure for enhanced metadata support
     enum class UniformType {
         INT32,
         UINT32,
@@ -71,8 +75,6 @@ private:
     bool createOutputBuffers(const TaskData& task, BufferSet& buffers);
     bool setKernelArguments(cl_kernel kernel, const BufferSet& buffers, const TaskData& task);
     bool readOutputBuffers(const BufferSet& buffers, const TaskData& task, TaskResult& result);
-
-    // NEW: Enhanced metadata processing
     bool processMetadataUniforms(const TaskData& task, std::vector<UniformValue>& uniforms);
 
 public:
@@ -84,5 +86,10 @@ public:
     TaskResult executeTask(const TaskData& task) override;
     std::string getFrameworkName() const override { return "opencl"; }
     json getCapabilities() const override;
+
+    // NEW: Device type utilities
+    bool isCPUDevice() const { return selectedDeviceType == CL_DEVICE_TYPE_CPU; }
+    bool isGPUDevice() const { return selectedDeviceType == CL_DEVICE_TYPE_GPU; }
+    std::string getDeviceTypeString() const { return selectedDeviceTypeStr; }
 };
 #endif

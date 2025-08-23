@@ -25,7 +25,7 @@ export class ChunkingStrategyRegistry {
     this.chunkingStrategies = new Map();
     this.assemblyStrategies = new Map();
     this.shaderTemplates = new Map();
-
+    this.streamingCapabilities = new Map();
     // Initialize built-in strategies
     this.initializeBuiltInStrategies();
   }
@@ -40,6 +40,8 @@ export class ChunkingStrategyRegistry {
     }
 
     this.chunkingStrategies.set(strategy.name, strategy);
+    const capabilities = this.analyzeChunkingCapabilities(strategy);
+    this.streamingCapabilities.set(strategy.name, capabilities);
     console.log(`Registered chunking strategy: ${strategy.name}`);
   }
 
@@ -53,9 +55,70 @@ export class ChunkingStrategyRegistry {
     }
 
     this.assemblyStrategies.set(strategy.name, strategy);
+    const capabilities = this.analyzeAssemblyCapabilities(strategy);
+    this.streamingCapabilities.set(strategy.name, capabilities);
+
     console.log(`Registered assembly strategy: ${strategy.name}`);
   }
 
+  analyzeChunkingCapabilities(strategy) {
+    return {
+      hasStreaming: typeof strategy.createChunkDescriptorsStreaming === 'function',
+      hasBatch: typeof strategy.createChunkDescriptors === 'function',
+      hasMemoryPlanning: typeof strategy.planMemoryStrategy === 'function',
+      hasInputValidation: typeof strategy.validateInputs === 'function',
+      hasSchemaDefinition: typeof strategy.defineInputSchema === 'function',
+      supportsMultiInput: this.checkMultiInputSupport(strategy),
+      supportedFrameworks: this.getSupportedFrameworks(strategy)
+    };
+  }
+  analyzeAssemblyCapabilities(strategy) {
+    return {
+      hasStreaming: typeof strategy.processChunkResult === 'function',
+      hasBatch: typeof strategy.assembleResults === 'function',
+      hasMemoryMgmt: typeof strategy.initOutputStore === 'function',
+      hasProgress: typeof strategy.onBlockComplete === 'function',
+      hasCleanup: typeof strategy.cleanup === 'function',
+      supportsMultiOutput: this.checkMultiOutputSupport(strategy)
+    };
+  }
+
+  checkMultiInputSupport(strategy) {
+    if (typeof strategy.defineInputSchema !== 'function') {
+      return false;
+    }
+    try {
+      const schema = strategy.defineInputSchema();
+      return schema.inputs && schema.inputs.length > 1;
+    } catch (e) {
+      return false;
+    }
+  }
+
+  checkMultiOutputSupport(strategy) {
+    if (typeof strategy.getDefaultSchema !== 'function') {
+      return false;
+    }
+    try {
+      const schema = strategy.getDefaultSchema();
+      return schema.outputs && schema.outputs.length > 1;
+    } catch (e) {
+      return false;
+    }
+  }
+
+  getSupportedFrameworks(strategy) {
+    const frameworks = ['webgpu']; // Default
+
+    // Check for framework-specific methods
+    if (typeof strategy.getWebGLVertexShader === 'function') frameworks.push('webgl');
+    if (typeof strategy.getCUDAKernel === 'function') frameworks.push('cuda');
+    if (typeof strategy.getOpenCLKernel === 'function') frameworks.push('opencl');
+    if (typeof strategy.getVulkanShader === 'function') frameworks.push('vulkan');
+    if (typeof strategy.getJavaScriptKernel === 'function') frameworks.push('javascript');
+
+    return frameworks;
+  }
   /**
    * Register a shader template
    * @param {string} name - Template name
@@ -98,13 +161,120 @@ export class ChunkingStrategyRegistry {
    * @returns {Object} - Object with arrays of strategy names
    */
   listStrategies() {
+    const chunkingList = Array.from(this.chunkingStrategies.keys()).map(name => {
+      const capabilities = this.streamingCapabilities.get(name) || {};
+      return {
+        name,
+        ...capabilities
+      };
+    });
+
+    const assemblyList = Array.from(this.assemblyStrategies.keys()).map(name => {
+      const capabilities = this.streamingCapabilities.get(name) || {};
+      return {
+        name,
+        ...capabilities
+      };
+    });
+
     return {
-      chunking: Array.from(this.chunkingStrategies.keys()),
-      assembly: Array.from(this.assemblyStrategies.keys()),
-      shaders: Array.from(this.shaderTemplates.keys())
+      chunking: chunkingList,
+      assembly: assemblyList,
+      shaders: Array.from(this.shaderTemplates.keys()),
+      streamingSupport: {
+        totalStrategies: this.chunkingStrategies.size + this.assemblyStrategies.size,
+        streamingEnabled: chunkingList.filter(s => s.hasStreaming).length + assemblyList.filter(s => s.hasStreaming).length
+      }
     };
   }
+ getStreamingCapableStrategies() {
+    const streamingChunking = Array.from(this.chunkingStrategies.keys())
+      .filter(name => {
+        const caps = this.streamingCapabilities.get(name);
+        return caps && caps.hasStreaming;
+      });
 
+    const streamingAssembly = Array.from(this.assemblyStrategies.keys())
+      .filter(name => {
+        const caps = this.streamingCapabilities.get(name);
+        return caps && caps.hasStreaming;
+      });
+
+    return {
+      chunking: streamingChunking,
+      assembly: streamingAssembly
+    };
+  }
+   getFrameworkSupportedStrategies(framework) {
+    const supported = [];
+
+    for (const [name, capabilities] of this.streamingCapabilities.entries()) {
+      if (capabilities.supportedFrameworks && capabilities.supportedFrameworks.includes(framework)) {
+        supported.push({
+          name,
+          type: this.chunkingStrategies.has(name) ? 'chunking' : 'assembly',
+          capabilities
+        });
+      }
+    }
+
+    return supported;
+  }
+   validateStreamingCompatibility(chunkingStrategy, assemblyStrategy, framework) {
+    const chunkingCaps = this.streamingCapabilities.get(chunkingStrategy);
+    const assemblyCaps = this.streamingCapabilities.get(assemblyStrategy);
+
+    const issues = [];
+
+    // Check if chunking strategy exists and supports streaming
+    if (!chunkingCaps) {
+      issues.push(`Chunking strategy '${chunkingStrategy}' not found`);
+    } else if (!chunkingCaps.hasStreaming) {
+      issues.push(`Chunking strategy '${chunkingStrategy}' does not support streaming`);
+    }
+
+    // Check if assembly strategy exists and supports streaming
+    if (!assemblyCaps) {
+      issues.push(`Assembly strategy '${assemblyStrategy}' not found`);
+    } else if (!assemblyCaps.hasStreaming) {
+      issues.push(`Assembly strategy '${assemblyStrategy}' does not support streaming`);
+    }
+
+    // Check framework support
+    if (chunkingCaps && !chunkingCaps.supportedFrameworks.includes(framework)) {
+      issues.push(`Chunking strategy '${chunkingStrategy}' does not support framework '${framework}'`);
+    }
+
+    return {
+      compatible: issues.length === 0,
+      issues,
+      recommendations: this.generateCompatibilityRecommendations(chunkingStrategy, assemblyStrategy, framework, issues)
+    };
+  }
+generateCompatibilityRecommendations(chunkingStrategy, assemblyStrategy, framework, issues) {
+    const recommendations = [];
+
+    if (issues.some(i => i.includes('does not support streaming'))) {
+      const streamingStrategies = this.getStreamingCapableStrategies();
+      if (streamingStrategies.chunking.length > 0) {
+        recommendations.push(`Consider using streaming-capable chunking strategies: ${streamingStrategies.chunking.join(', ')}`);
+      }
+      if (streamingStrategies.assembly.length > 0) {
+        recommendations.push(`Consider using streaming-capable assembly strategies: ${streamingStrategies.assembly.join(', ')}`);
+      }
+    }
+
+    if (issues.some(i => i.includes('does not support framework'))) {
+      const frameworkStrategies = this.getFrameworkSupportedStrategies(framework);
+      if (frameworkStrategies.length > 0) {
+        recommendations.push(`Strategies supporting ${framework}: ${frameworkStrategies.map(s => s.name).join(', ')}`);
+      } else {
+        recommendations.push(`No strategies support ${framework}. Try 'webgpu' as fallback.`);
+      }
+    }
+
+    return recommendations;
+  }
   /**
    * Load and register a custom strategy from JavaScript code
    * @param {string} strategyCode - JavaScript code containing strategy class
@@ -114,7 +284,7 @@ export class ChunkingStrategyRegistry {
    */
   loadCustomStrategy(strategyCode, type, expectedName = null) {
     try {
-      // Create a sandbox environment with required base classes
+      // Your existing VM context creation (keep as-is)
       const sandbox = {
         BaseChunkingStrategy,
         BaseAssemblyStrategy,
@@ -127,22 +297,18 @@ export class ChunkingStrategyRegistry {
         module: { exports: {} }
       };
 
-      // Create VM context
       const context = vm.createContext(sandbox);
-
-      // Execute the strategy code
       vm.runInContext(strategyCode, context, {
         filename: `custom_${type}_strategy.js`,
-        timeout: 5000 // 5 second timeout for strategy loading
+        timeout: 5000
       });
 
-      // Extract the strategy class (try different export patterns)
+      // Your existing strategy class extraction (keep as-is)
       let StrategyClass = context.module.exports.default ||
                          context.module.exports ||
                          context.exports.default ||
                          context.exports;
 
-      // If it's still an object, look for a class inside it
       if (typeof StrategyClass === 'object' && StrategyClass.constructor === Object) {
         const keys = Object.keys(StrategyClass);
         if (keys.length === 1) {
@@ -157,10 +323,9 @@ export class ChunkingStrategyRegistry {
         };
       }
 
-      // Instantiate the strategy
       const strategyInstance = new StrategyClass();
 
-      // Validate the strategy type
+      // Your existing validation (keep as-is)
       if (type === 'chunking' && !(strategyInstance instanceof BaseChunkingStrategy)) {
         return {
           success: false,
@@ -175,7 +340,6 @@ export class ChunkingStrategyRegistry {
         };
       }
 
-      // Validate strategy name if provided
       if (expectedName && strategyInstance.name !== expectedName) {
         return {
           success: false,
@@ -183,16 +347,21 @@ export class ChunkingStrategyRegistry {
         };
       }
 
-      // Register the strategy
+      // Register using your existing methods (they now include capability detection)
       if (type === 'chunking') {
         this.registerChunkingStrategy(strategyInstance);
       } else {
         this.registerAssemblyStrategy(strategyInstance);
       }
 
+      // NEW: Return enhanced info including streaming support
+      const capabilities = this.streamingCapabilities.get(strategyInstance.name);
       return {
         success: true,
-        strategyName: strategyInstance.name
+        strategyName: strategyInstance.name,
+        capabilities,
+        isStreamingCapable: type === 'chunking' ? capabilities.hasStreaming : capabilities.hasStreaming,
+        supportedFrameworks: capabilities.supportedFrameworks || ['webgpu']
       };
 
     } catch (error) {
@@ -202,7 +371,55 @@ export class ChunkingStrategyRegistry {
       };
     }
   }
+  analyzeStreamingReadiness() {
+    const analysis = {
+      ready: [],
+      needsUpgrade: [],
+      recommendations: []
+    };
 
+    for (const [name, strategy] of this.chunkingStrategies.entries()) {
+      const caps = this.streamingCapabilities.get(name);
+      if (caps.hasStreaming && caps.hasBatch) {
+        analysis.ready.push({ name, type: 'chunking', capabilities: caps });
+      } else {
+        analysis.needsUpgrade.push({
+          name,
+          type: 'chunking',
+          missing: [
+            !caps.hasStreaming ? 'createChunkDescriptorsStreaming method' : null,
+            !caps.hasMemoryPlanning ? 'planMemoryStrategy method' : null,
+            !caps.hasSchemaDefinition ? 'defineInputSchema method' : null
+          ].filter(Boolean)
+        });
+      }
+    }
+
+    for (const [name, strategy] of this.assemblyStrategies.entries()) {
+      const caps = this.streamingCapabilities.get(name);
+      if (caps.hasStreaming && caps.hasBatch) {
+        analysis.ready.push({ name, type: 'assembly', capabilities: caps });
+      } else {
+        analysis.needsUpgrade.push({
+          name,
+          type: 'assembly',
+          missing: [
+            !caps.hasStreaming ? 'processChunkResult method' : null,
+            !caps.hasMemoryMgmt ? 'initOutputStore method' : null,
+            !caps.hasProgress ? 'onBlockComplete callback support' : null
+          ].filter(Boolean)
+        });
+      }
+    }
+
+    // Generate recommendations
+    if (analysis.needsUpgrade.length > 0) {
+      analysis.recommendations.push('Consider upgrading strategies to support streaming for better performance');
+      analysis.recommendations.push('Use block_matrix strategy as a reference for streaming implementation');
+    }
+
+    return analysis;
+  }
   /**
    * UPDATED: Initialize built-in strategies including matrix tiled
    */

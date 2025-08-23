@@ -1,5 +1,4 @@
-// strategies/base/BaseAssemblyStrategy.js
-// Base class for all assembly strategies with multi-output support
+// COMPLETE: strategies/base/BaseAssemblyStrategy.js - Enhanced base class with multi-output support
 
 export class BaseAssemblyStrategy {
   constructor(name) {
@@ -27,7 +26,7 @@ export class BaseAssemblyStrategy {
       const sortedChunks = this.sortChunks(completedChunks);
 
       // NEW: Multi-output assembly
-      if (schema.outputs.length > 1) {
+      if (schema.outputs && schema.outputs.length > 1) {
         return this.assembleMultipleOutputs(sortedChunks, plan, schema);
       } else {
         return this.assembleSingleOutput(sortedChunks, plan, schema);
@@ -155,7 +154,7 @@ export class BaseAssemblyStrategy {
 
     // NEW: Validate multi-output chunks
     const schema = plan.schema || this.getDefaultSchema();
-    if (schema.outputs.length > 1) {
+    if (schema.outputs && schema.outputs.length > 1) {
       for (const chunk of completedChunks) {
         const chunkResults = chunk.results || (chunk.result ? [chunk.result] : []);
         if (chunkResults.length !== schema.outputs.length) {

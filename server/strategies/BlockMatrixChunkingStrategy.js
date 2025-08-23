@@ -192,7 +192,18 @@ export default class BlockMatrixChunkingStrategy extends BaseChunkingStrategy {
         console.log(`[STRATEGY DEBUG] Final descriptor keys:`, Object.keys(descriptor));
         console.log(`[STRATEGY DEBUG] Has webglVertexShader:`, !!descriptor.webglVertexShader);
         return descriptor;
-
+      case 'javascript':
+      return {
+        ...baseDescriptor,
+        kernel: this.getJavaScriptKernel(),
+        entry: 'blockMatrixMultiply',
+        workgroupCount: [1, 1, 1], // Not used for JS, but kept for consistency
+        jsExecutionHints: {
+          algorithm: 'block_matrix_multiply',
+          parallelizable: false,
+          memoryAccess: 'sequential'
+        }
+      };
       case 'vulkan':  // NEW: Add Vulkan support
         console.log(`[STRATEGY DEBUG] Creating Vulkan descriptor`);
         return {
@@ -301,6 +312,34 @@ export default class BlockMatrixChunkingStrategy extends BaseChunkingStrategy {
     `;
   }
 
+  getJavaScriptKernel() {
+  return `
+    // JavaScript CPU kernel for block matrix multiplication
+    // This function will be executed in the browser's JavaScript engine
+    function blockMatrixMultiply(blockA, blockB, blockSize) {
+      const result = new Float32Array(blockSize * blockSize);
+
+      // Standard matrix multiplication algorithm
+      for (let i = 0; i < blockSize; i++) {
+        for (let j = 0; j < blockSize; j++) {
+          let sum = 0;
+          for (let k = 0; k < blockSize; k++) {
+            const aVal = blockA[i * blockSize + k];
+            const bVal = blockB[k * blockSize + j];
+            sum += aVal * bVal;
+          }
+          result[i * blockSize + j] = sum;
+        }
+      }
+
+      return result;
+    }
+
+    // Metadata for the kernel
+    // block_size: Size of the matrix block (N x N)
+    // matrix_size: Size of the full matrix (for reference)
+  `;
+  }
   // NEW: CUDA kernel
   getCUDAKernel() {
     return `

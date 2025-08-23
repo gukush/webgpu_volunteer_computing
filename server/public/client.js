@@ -94,8 +94,17 @@ const elements = {
 const PARAMS = new URLSearchParams(location.search);
 const IS_HEADLESS = PARAMS.get('mode') === 'headless';
 const WORKER_ID = PARAMS.get('workerId') || 'N/A';
-const socket = io({ query: IS_HEADLESS ? { mode: 'headless', workerId: WORKER_ID } : {} });
-
+const socket = io({
+  path: "/socket.io",
+  //withCredentials: true,
+  // transports: ["websocket"],   // optional; omit to allow polling->websocket
+  query: IS_HEADLESS ? { mode: 'headless', workerId: WORKER_ID } : {}
+});
+socket.on("connect_error", (err) => {
+  console.error("[client] connect_error", err);
+});
+socket.io.on("reconnect_attempt", n => console.log("reconnect_attempt", n));
+socket.io.on("upgrade", t => console.log("upgraded to", t && t.name));
 // Enhanced: Multi-framework capability detection
 async function detectFrameworkCapabilities() {
   const capabilities = {
@@ -179,6 +188,18 @@ async function detectFrameworkCapabilities() {
   } catch (e) {
     console.warn('WebGL2 detection error:', e.message);
   }
+
+  // JavaScript CPU framework (always available)
+  capabilities.supportedFrameworks.push('javascript');
+  frameworkState.javascript = {
+    supported: true,
+    context: 'cpu',
+    version: 'ES2020+',
+    vendor: navigator.userAgent,
+    cores: navigator.hardwareConcurrency || 4
+  };
+
+  console.log(`[JavaScript] CPU framework available with ${frameworkState.javascript.cores} logical cores`);
 
   return capabilities;
 }
@@ -662,8 +683,126 @@ async function executeFrameworkKernel(meta) {
       return await executeWGSL(meta);
     case 'webgl':
       return await executeWebGLCompute(meta);
+    case 'javascript':
+      return await executeJavaScriptCompute(meta);
     default:
       throw new Error(`Unsupported framework: ${framework}`);
+  }
+}
+
+async function executeJavaScriptCompute(chunk) {
+  console.log(`[JavaScript] Starting CPU execution for ${chunk.chunkId || chunk.id}`);
+
+  const outputs = chunk.outputs || [];
+  if (outputs.length === 0) {
+    throw new Error('No output specifications provided');
+  }
+
+  const t0 = performance.now();
+
+  try {
+    // Parse inputs
+    const inputs = [];
+    if (chunk.inputs && chunk.inputs.length > 0) {
+      for (let i = 0; i < chunk.inputs.length; i++) {
+        const input = chunk.inputs[i];
+        if (!input || !input.data) continue;
+
+        const inputBytes = Uint8Array.from(atob(input.data), c => c.charCodeAt(0));
+        const inputFloats = new Float32Array(inputBytes.buffer);
+        inputs.push(inputFloats);
+      }
+    }
+
+    // Extract metadata
+    const metadata = chunk.metadata || {};
+    const blockSize = metadata.block_size || metadata.blockSize || 64;
+    const matrixSize = metadata.matrix_size || metadata.matrixSize || 512;
+
+    console.log(`[JavaScript] Processing block: ${blockSize}x${blockSize}, matrix: ${matrixSize}x${matrixSize}`);
+
+    let results = [];
+
+    // Execute dynamic kernel if provided by server
+    if (chunk.kernel && chunk.entry) {
+      console.log(`[JavaScript] Executing dynamic kernel: ${chunk.entry}`);
+
+      try {
+        // Create execution context with inputs and metadata available
+        const kernelFunction = new Function('inputs', 'metadata', 'Float32Array', `
+          ${chunk.kernel}
+
+          // Call the entry point function
+          if (typeof ${chunk.entry} === 'function') {
+            return ${chunk.entry}(inputs[0], inputs[1], metadata.block_size || metadata.blockSize);
+          } else {
+            throw new Error('Entry point function ${chunk.entry} not found in kernel');
+          }
+        `);
+
+        const result = kernelFunction(inputs, metadata, Float32Array);
+
+        if (result instanceof Float32Array) {
+          results.push(result);
+        } else {
+          throw new Error('Kernel must return Float32Array');
+        }
+
+        console.log(`[JavaScript] Dynamic kernel executed successfully`);
+
+      } catch (kernelError) {
+        console.error(`[JavaScript] Dynamic kernel execution failed:`, kernelError);
+        console.log(`[JavaScript] Falling back to built-in implementation`);
+
+        // Fallback to built-in implementation
+        if (inputs.length >= 2) {
+          const result = executeBlockMatrixMultiply(inputs[0], inputs[1], blockSize);
+          results.push(result);
+        } else {
+          throw new Error('Dynamic kernel failed and insufficient inputs for fallback');
+        }
+      }
+    } else {
+      // No dynamic kernel - use built-in implementations
+      console.log(`[JavaScript] Using built-in computation (no dynamic kernel provided)`);
+
+      if (inputs.length >= 2) {
+        // Matrix block multiplication
+        const result = executeBlockMatrixMultiply(inputs[0], inputs[1], blockSize);
+        results.push(result);
+      } else if (inputs.length === 1) {
+        // Single input processing
+        const result = processSingleInput(inputs[0], metadata);
+        results.push(result);
+      } else {
+        // Generate test output
+        const size = outputs[0].size / 4; // Assume float32
+        const result = new Float32Array(size);
+        for (let i = 0; i < size; i++) {
+          result[i] = Math.random();
+        }
+        results.push(result);
+      }
+    }
+
+    // Convert results to base64
+    const base64Results = results.map(result => {
+      const bytes = new Uint8Array(result.buffer);
+      return btoa(String.fromCharCode(...bytes));
+    });
+
+    const dt = performance.now() - t0;
+    console.log(`[JavaScript] Computation completed in ${dt.toFixed(0)}ms`);
+
+    return {
+      results: base64Results,
+      result: base64Results[0], // Backward compatibility
+      processingTime: dt
+    };
+
+  } catch (error) {
+    console.error(`[JavaScript] Execution error:`, error);
+    throw error;
   }
 }
 
@@ -1538,12 +1677,28 @@ function updateFrameworkDisplay(capabilities) {
   frameworkInfo.className = 'status info';
   frameworkInfo.style.marginTop = '15px';
 
+  const frameworkBadges = capabilities.supportedFrameworks.map(fw => {
+    const badge = `<span class="framework-badge framework-${fw}">${fw.toUpperCase()}</span>`;
+    return badge;
+  }).join(' ');
+
   frameworkInfo.innerHTML = `
     <strong>Supported Frameworks:</strong><br>
-    ${capabilities.supportedFrameworks.map(fw =>
-      `<span class="framework-badge">${fw.toUpperCase()}</span>`
-    ).join(' ')}
+    ${frameworkBadges}
   `;
+
+  // Add JavaScript-specific styling
+  const style = document.createElement('style');
+  style.textContent += `
+    .framework-badge.framework-javascript {
+      background: #f7df1e;
+      color: #000;
+    }
+  `;
+  if (!document.head.querySelector('style[data-framework-styles]')) {
+    style.setAttribute('data-framework-styles', 'true');
+    document.head.appendChild(style);
+  }
 
   const gpuInfo = elements.gpuInfo;
   if (gpuInfo.nextSibling) {
@@ -2008,7 +2163,10 @@ socket.on('workload:chunk_assign', async chunk => {
       console.log(`[WebGL] Routing chunk ${chunk.chunkId} to WebGL execution`);
       result = await executeWebGLCompute(chunk);
       break;
-
+    case 'javascript':
+      console.log(`[JS] Routing chunk ${chunk.chunkId} to JavaScript execution`);
+      result = await executeJavaScriptCompute(chunk);
+      break;
     case 'cuda':
       console.log(`[CUDA] Routing chunk ${chunk.chunkId} to CUDA execution`);
       // TODO: Implement CUDA execution

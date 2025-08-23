@@ -1,6 +1,5 @@
 #!/usr/bin/env node
-// ENHANCED: app/scripts/test-chunking.mjs
-// End-to-end two-step test harness for block-matrix workloads with framework selection.
+// ENHANCED: app/scripts/test-chunking.mjs - Complete version with streaming support and smart memory management
 
 import fs from 'fs/promises';
 import path from 'path';
@@ -14,13 +13,17 @@ const args = minimist(process.argv.slice(2));
 
 const size = parseInt(args.size, 10);
 const blockSize = parseInt(args['block-size'], 10);
-const framework = args.framework || 'webgpu'; // NEW: Framework selection
+const framework = args.framework || 'webgpu';
 const inputPath = args.input ? path.resolve(args.input) : null;
 const apiBase = args['api-base'] || process.env.API_BASE || 'https://localhost:3000';
 const insecureFlag = args.insecure || process.env.TEST_INSECURE;
 const pollInterval = Number(args.interval || process.env.TEST_POLL_INTERVAL || 2000);
 
-// NEW: Framework validation
+// ENHANCED: New options for streaming and memory management
+const streamingMode = args.streaming || process.env.TEST_STREAMING || false;
+const memoryThreshold = parseInt(args['memory-threshold'], 10) || 512 * 1024 * 1024; // 512MB default
+const batchSize = parseInt(args['batch-size'], 10) || 10; // Chunk creation batch size
+
 const SUPPORTED_FRAMEWORKS = ['webgpu', 'webgl', 'cuda', 'opencl', 'vulkan'];
 
 // If the user requested insecure, set TLS reject env early so node fetch accepts self-signed certs.
@@ -29,16 +32,31 @@ if (insecureFlag) {
 }
 
 if (!Number.isInteger(size) || !Number.isInteger(blockSize)) {
-  console.error('Usage: --size N --block-size M [--framework F] [--input path] [--api-base https://host:port] [--insecure]');
+  console.error('Usage: --size N --block-size M [options]');
   console.error('');
-  console.error('Options:');
-  console.error('  --framework    GPU framework to use (webgpu, webgl, cuda, opencl, vulkan) [default: webgpu]');
+  console.error('Required:');
   console.error('  --size         Matrix size (must be divisible by block-size)');
   console.error('  --block-size   Block size for matrix subdivision');
-  console.error('  --input        Path to pre-generated matrix file (optional)');
-  console.error('  --api-base     API server URL [default: https://localhost:3000]');
-  console.error('  --insecure     Accept self-signed certificates');
-  console.error('  --interval     Status polling interval in ms [default: 2000]');
+  console.error('');
+  console.error('Options:');
+  console.error('  --framework      GPU framework (webgpu, webgl, cuda, opencl, vulkan) [default: webgpu]');
+  console.error('  --input          Path to pre-generated matrix file');
+  console.error('  --streaming      Enable streaming chunk creation and assembly');
+  console.error('  --memory-threshold  Memory threshold in bytes [default: 512MB]');
+  console.error('  --batch-size     Chunk creation batch size [default: 10]');
+  console.error('  --api-base       API server URL [default: https://localhost:3000]');
+  console.error('  --insecure       Accept self-signed certificates');
+  console.error('  --interval       Status polling interval in ms [default: 2000]');
+  console.error('');
+  console.error('Examples:');
+  console.error('  # Small matrix, batch mode');
+  console.error('  node test-chunking.mjs --size 512 --block-size 32');
+  console.error('');
+  console.error('  # Large matrix, streaming mode with 1GB threshold');
+  console.error('  node test-chunking.mjs --size 2048 --block-size 128 --streaming --memory-threshold 1073741824');
+  console.error('');
+  console.error('  # WebGL with streaming');
+  console.error('  node test-chunking.mjs --size 1024 --block-size 64 --framework webgl --streaming');
   process.exit(1);
 }
 
@@ -55,6 +73,7 @@ if (!SUPPORTED_FRAMEWORKS.includes(framework)) {
 }
 
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+
 function parseHostPort(urlString) {
   try {
     const u = new URL(urlString);
@@ -195,6 +214,35 @@ async function checkFrameworkSupport(framework, apiBase) {
   }
 }
 
+// ENHANCED: Memory strategy estimation
+function estimateMemoryStrategy(matrixSize, memoryThreshold) {
+  const matrixBytes = matrixSize * matrixSize * 4; // Float32
+  const totalInputBytes = matrixBytes * 2; // A and B matrices
+  const outputBytes = matrixBytes; // Result matrix C
+  const totalBytes = totalInputBytes + outputBytes;
+
+  const strategy = {
+    matrixBytes,
+    totalInputBytes,
+    outputBytes,
+    totalBytes,
+    canFitAll: totalBytes <= memoryThreshold,
+    canFitOutput: outputBytes <= memoryThreshold,
+    canFitOneInput: matrixBytes <= memoryThreshold,
+    recommendedStrategy: 'unknown'
+  };
+
+  if (strategy.canFitAll) {
+    strategy.recommendedStrategy = 'all_memory';
+  } else if (strategy.canFitOutput) {
+    strategy.recommendedStrategy = 'output_memory_input_disk';
+  } else {
+    strategy.recommendedStrategy = 'all_disk';
+  }
+
+  return strategy;
+}
+
 // NEW: Get framework-specific chunking strategy
 function getChunkingStrategyForFramework(framework) {
   const strategyMap = {
@@ -221,14 +269,47 @@ function getAssemblyStrategyForFramework(framework) {
   return strategyMap[framework] || 'block_matrix_assembly';
 }
 
+// ENHANCED: Streaming status polling with assembly progress
 async function pollStatus(workloadId, intervalMs = 2000) {
+  let lastProgress = -1;
+  let lastAssemblyBlocks = -1;
+  let lastDispatchedChunks = -1;
+
   while (true) {
     try {
       const status = await getJSON(`${apiBase}/api/workloads/${workloadId}/status`);
 
       console.log(`⏳ Status: ${status.status}`);
+
       if (status.chunks) {
-        console.log(`   Progress: ${status.chunks.completed}/${status.chunks.total} chunks (${status.chunks.progress.toFixed(1)}%)`);
+        const progress = status.chunks.progress.toFixed(1);
+        if (progress !== lastProgress) {
+          console.log(`   Chunk Progress: ${status.chunks.completed}/${status.chunks.total} chunks (${progress}%)`);
+          lastProgress = progress;
+        }
+
+        // Show active chunks if available
+        if (status.chunks.active > 0) {
+          console.log(`   Active: ${status.chunks.active} chunks being processed`);
+        }
+      }
+
+      // ENHANCED: Show streaming-specific progress
+      if (status.streaming) {
+        const dispatchedChunks = status.streaming.dispatchedChunks || 0;
+        if (dispatchedChunks !== lastDispatchedChunks) {
+          console.log(`   Dispatched: ${dispatchedChunks} chunks sent to clients`);
+          lastDispatchedChunks = dispatchedChunks;
+        }
+      }
+
+      // ENHANCED: Show assembly progress if available
+      if (status.assembly) {
+        const assemblyProgress = status.assembly.completedBlocks || 0;
+        if (assemblyProgress !== lastAssemblyBlocks) {
+          console.log(`   Assembly: ${assemblyProgress}/${status.assembly.totalBlocks} blocks completed`);
+          lastAssemblyBlocks = assemblyProgress;
+        }
       }
 
       if (status.status === 'complete') {
@@ -251,17 +332,31 @@ async function pollStatus(workloadId, intervalMs = 2000) {
 }
 
 (async () => {
-  console.log(`API base: ${apiBase}`);
-  console.log(`Framework: ${framework.toUpperCase()}`); // NEW: Show selected framework
+  console.log(`🚀 Enhanced Block Matrix Test`);
+  console.log(`   Framework: ${framework.toUpperCase()}`);
+  console.log(`   Matrix Size: ${size}×${size}`);
+  console.log(`   Block Size: ${blockSize}×${blockSize}`);
+  console.log(`   API Base: ${apiBase}`);
+  console.log(`   Streaming Mode: ${streamingMode ? 'ENABLED' : 'DISABLED'}`);
+
+  // ENHANCED: Memory strategy analysis
+  const memoryStrategy = estimateMemoryStrategy(size, memoryThreshold);
+  console.log(`\n💾 Memory Analysis:`);
+  console.log(`   Matrix Size: ${Math.round(memoryStrategy.matrixBytes/1024/1024)}MB each`);
+  console.log(`   Total Input: ${Math.round(memoryStrategy.totalInputBytes/1024/1024)}MB`);
+  console.log(`   Output: ${Math.round(memoryStrategy.outputBytes/1024/1024)}MB`);
+  console.log(`   Total: ${Math.round(memoryStrategy.totalBytes/1024/1024)}MB`);
+  console.log(`   Threshold: ${Math.round(memoryThreshold/1024/1024)}MB`);
+  console.log(`   Strategy: ${memoryStrategy.recommendedStrategy}`);
 
   if (insecureFlag) {
-    console.log('⚠️ Insecure mode enabled: NODE_TLS_REJECT_UNAUTHORIZED=0 (accepting self-signed certs)');
+    console.log('\n⚠️ Insecure mode enabled: NODE_TLS_REJECT_UNAUTHORIZED=0 (accepting self-signed certs)');
   }
 
   try {
     await ensureServerReachable(apiBase, 4);
   } catch (err) {
-    console.error('❌ Server preflight failed:', err.message || err);
+    console.error('\n❌ Server preflight failed:', err.message || err);
     console.error('Tip: if your server uses a self-signed cert, run with:');
     console.error('  NODE_TLS_REJECT_UNAUTHORIZED=0 node app/scripts/test-chunking.mjs --insecure ...');
     process.exit(2);
@@ -269,7 +364,7 @@ async function pollStatus(workloadId, intervalMs = 2000) {
 
   try {
     // NEW: Check framework support
-    console.log(`🔍 Checking ${framework.toUpperCase()} framework support...`);
+    console.log(`\n🔍 Checking ${framework.toUpperCase()} framework support...`);
     const frameworkCheck = await checkFrameworkSupport(framework, apiBase);
 
     if (!frameworkCheck.supported) {
@@ -293,9 +388,9 @@ async function pollStatus(workloadId, intervalMs = 2000) {
     }
 
     // STEP 1: Create workload (metadata only) - NEW TWO-STEP FLOW with framework selection
-    console.log('📋 Creating workload definition...');
+    console.log('\n📋 Creating workload definition...');
     const payload = {
-      label: `${framework.toUpperCase()} Block Matrix ${size}×${size} test (${blockSize}×${blockSize} blocks)`,
+      label: `${framework.toUpperCase()} ${streamingMode ? 'Streaming' : 'Batch'} Block Matrix ${size}×${size} test (${blockSize}×${blockSize} blocks)`,
       framework: framework, // NEW: Use selected framework
       chunkingStrategy: getChunkingStrategyForFramework(framework), // NEW: Framework-specific strategy
       assemblyStrategy: getAssemblyStrategyForFramework(framework), // NEW: Framework-specific assembly
@@ -303,7 +398,10 @@ async function pollStatus(workloadId, intervalMs = 2000) {
         matrixSize: size,
         blockSize,
         framework: framework, // Additional metadata
-        testType: 'block_matrix_multiplication'
+        testType: 'block_matrix_multiplication',
+        memoryThreshold: memoryThreshold,
+        streamingMode: streamingMode,
+        batchSize: batchSize
       },
       outputSizes: [ size * size * 4 ]
     };
@@ -315,6 +413,7 @@ async function pollStatus(workloadId, intervalMs = 2000) {
     console.log(`✅ Workload created: ${workloadId}`);
     console.log(`   Status: ${workloadInfo.status}`);
     console.log(`   Framework: ${framework.toUpperCase()}`);
+    console.log(`   Streaming: ${streamingMode ? 'YES' : 'NO'}`);
     console.log(`   Requires file upload: ${workloadInfo.requiresFileUpload}`);
 
     if (workloadInfo.requiresFileUpload) {
@@ -325,7 +424,7 @@ async function pollStatus(workloadId, intervalMs = 2000) {
     if (workloadInfo.status === 'awaiting_input' || workloadInfo.requiresFileUpload) {
       let buf;
       if (inputPath) {
-        console.log(`📤 Uploading provided file: ${inputPath}`);
+        console.log(`\n📤 Uploading provided file: ${inputPath}`);
         buf = await fs.readFile(inputPath);
         console.log(`   File size: ${buf.length} bytes`);
 
@@ -343,7 +442,7 @@ async function pollStatus(workloadId, intervalMs = 2000) {
         }
         console.log(`   ✅ File validation passed: ${size}×${size} matrices`);
       } else {
-        console.log(`⚙️ Generating random matrices for ${framework.toUpperCase()} computation...`);
+        console.log(`\n⚙️ Generating random matrices for ${framework.toUpperCase()} computation...`);
         const A = Array.from({ length: size }, () => Array.from({ length: size }, () => Math.random()));
         const B = Array.from({ length: size }, () => Array.from({ length: size }, () => Math.random()));
         buf = packCombinedMatrices(size, A, B);
@@ -365,19 +464,23 @@ async function pollStatus(workloadId, intervalMs = 2000) {
     }
 
     // STEP 3: Start computation
-    console.log(`🚀 Starting ${framework.toUpperCase()} computation...`);
-    const startResp = await postJSON(`${apiBase}/api/workloads/${workloadId}/compute-start`, {});
+    console.log(`\n🚀 Starting ${streamingMode ? 'streaming' : 'batch'} ${framework.toUpperCase()} computation...`);
+    const startPayload = streamingMode ? { streamingMode: true, batchSize } : {};
+    const startResp = await postJSON(`${apiBase}/api/workloads/${workloadId}/compute-start`, startPayload);
     console.log(`✅ Computation started successfully`);
     console.log(`   Status: ${startResp.status}`);
     console.log(`   Framework: ${framework.toUpperCase()}`);
     console.log(`   Total chunks: ${startResp.totalChunks}`);
+    console.log(`   Mode: ${streamingMode ? 'STREAMING' : 'BATCH'}`);
     console.log(`   Message: ${startResp.message}`);
 
     // STEP 4: Poll status until completion
-    console.log('⏳ Waiting for computation to complete...');
+    console.log(`\n⏳ Waiting for ${streamingMode ? 'streaming' : 'batch'} computation to complete...`);
+    const startTime = Date.now();
     const finalInfo = await pollStatus(workloadId, pollInterval);
+    const totalTime = (Date.now() - startTime) / 1000;
 
-    console.log('\n🎉 Workload completed successfully!');
+    console.log(`\n🎉 Workload completed successfully in ${totalTime.toFixed(2)}s!`);
     console.log('📊 Final status:', JSON.stringify(finalInfo, null, 2));
 
     // STEP 5: Try to download result
@@ -422,10 +525,14 @@ async function pollStatus(workloadId, intervalMs = 2000) {
     console.log('\n🎉 Test completed successfully!');
     console.log(`\n📈 Performance Summary:`);
     console.log(`   Framework: ${framework.toUpperCase()}`);
-    console.log(`   Matrix size: ${size}×${size}`);
+    console.log(`   Mode: ${streamingMode ? 'STREAMING' : 'BATCH'}`);
+    console.log(`   Matrix size: ${size}×${size} (${Math.round(memoryStrategy.matrixBytes/1024/1024)}MB each)`);
     console.log(`   Block size: ${blockSize}×${blockSize}`);
+    console.log(`   Memory strategy: ${memoryStrategy.recommendedStrategy}`);
     console.log(`   Expected chunks: ${Math.pow(Math.floor(size / blockSize), 3)}`);
     console.log(`   Actual chunks: ${startResp.totalChunks}`);
+    console.log(`   Total time: ${totalTime.toFixed(2)}s`);
+    console.log(`   Throughput: ${(startResp.totalChunks / totalTime).toFixed(2)} chunks/sec`);
 
   } catch (err) {
     console.error('\n❌ Test failed:', err.message || err);
@@ -437,6 +544,7 @@ async function pollStatus(workloadId, intervalMs = 2000) {
       console.error(`   - Verify the ${framework} framework is properly supported`);
       console.error('   - Ensure the block_matrix strategy is properly registered');
       console.error('   - Verify the two-step flow is implemented correctly');
+      console.error('   - Check enhanced chunking system is enabled');
     }
 
     if (err.message.includes('Framework') && err.message.includes('not supported')) {
@@ -445,6 +553,14 @@ async function pollStatus(workloadId, intervalMs = 2000) {
       console.error(`   - For CUDA: ensure CUDA runtime and clients are available`);
       console.error(`   - For OpenCL: ensure OpenCL runtime and clients are available`);
       console.error(`   - Try different framework with --framework <name>`);
+    }
+
+    if (streamingMode && err.message.includes('streaming')) {
+      console.error('\n🌊 Streaming mode troubleshooting:');
+      console.error('   - Ensure server supports streaming chunking API');
+      console.error('   - Check if strategy supports createChunkDescriptorsStreaming');
+      console.error('   - Verify streaming assembly is properly initialized');
+      console.error('   - Try without --streaming flag for batch mode');
     }
 
     if (err.cause && err.cause.socket) {
