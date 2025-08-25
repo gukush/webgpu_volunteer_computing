@@ -17,7 +17,11 @@ import { EnhancedChunkingManager } from './strategies/EnhancedChunkingManager.js
 const streamingChunkQueues = new Map(); // workloadId -> queue of pending chunks
 const maxQueueSize = 1000; // Prevent memory bloat
 const app = express();
-
+const activeChunkDispatches = new Map(); // chunkId-clientId -> timestamp
+const processedChunkCompletions = new Map(); // parentId-chunkId-clientId -> timestamp
+const dispatchLock = new Map(); // chunkId -> timestamp to prevent concurrent dispatch
+const clientDispatchLock = new Set(); // clientId set to prevent concurrent client assignments
+const recentCallbacks = new Map(); // Add at top level
 
 const STORAGE_ROOT = process.env.VOLUNTEER_STORAGE || path.join(os.tmpdir(), 'volunteer');
 async function ensureDir(p) { await fs.promises.mkdir(p, { recursive: true }); }
@@ -141,7 +145,8 @@ io.engine.on("connection_error", (err) => {
     code: err.code, message: err.message, context: err.context
   });
 });
-io.on("connection", (s) => console.log("[IO] connected", s.id));
+
+
 
 // RAW WEBSOCKET SERVER FOR NATIVE CLIENTS
 const wss = new WebSocketServer({
@@ -980,6 +985,86 @@ app.post('/api/workloads/:id/compute-start', async (req, res) => {
 
   // Extract streaming mode from request or workload
   const streamingMode = req.body.streamingMode || wl.streamingMode || false;
+
+
+
+// ADDITIONAL: Make sure the EnhancedChunkingManager registration works properly
+// Add this debugging to your streaming callback setup in /api/workloads/:id/compute-start:
+
+if (streamingMode) {
+  console.log(`🌊 [COMPUTE START] Setting up streaming callbacks for workload ${wid}`);
+
+  // Set up dispatch callback for streaming chunk creation with deduplication
+ chunkingManager.setDispatchCallback(wid, async (chunkDescriptor) => {
+    const callbackKey = `${wid}-${chunkDescriptor.chunkId}`;
+    const now = Date.now();
+
+    // Check for recent callback
+    const lastCallback = recentCallbacks.get(callbackKey);
+    if (lastCallback && (now - lastCallback) < 5000) {
+      console.log(`[CALLBACK] Ignoring duplicate callback for ${chunkDescriptor.chunkId}`);
+      return { success: true, duplicate: true };
+    }
+
+    recentCallbacks.set(callbackKey, now);
+    console.log(`📤 [STREAMING] Dispatch callback triggered for ${chunkDescriptor.chunkId}`);
+    return await dispatchStreamingChunkEnhanced(wid, chunkDescriptor);
+  });
+  /*
+  chunkingManager.setDispatchCallback(wid, async (chunkDescriptor) => {
+    console.log(`📤 [STREAMING] Dispatch callback triggered for ${chunkDescriptor.chunkId}`);
+    console.log(`📤 [STREAMING] Workload still exists: ${!!customWorkloads.get(wid)}`);
+    return await dispatchStreamingChunkEnhanced(wid, chunkDescriptor);
+  });
+  */
+  /*
+  chunkingManager.setDispatchCallback(wid, async (chunkDescriptor) => {
+  const callbackKey = `${wid}-${chunkDescriptor.chunkId}`;
+  const now = Date.now();
+
+  // Check for recent callback
+  const lastCallback = recentCallbacks.get(callbackKey);
+  if (lastCallback && (now - lastCallback) < 5000) {
+    console.log(`[CALLBACK] Ignoring duplicate callback for ${chunkDescriptor.chunkId}`);
+    return { success: true, duplicate: true };
+  }
+
+  recentCallbacks.set(callbackKey, now);
+  return await dispatchStreamingChunkEnhanced(wid, chunkDescriptor);
+});
+  */
+  // Set up server callbacks for streaming events
+  chunkingManager.setServerCallbacks({
+    onWorkloadComplete: async (workloadId, result) => {
+      console.log(`🎉 [STREAMING CALLBACK] Workload complete: ${workloadId}`);
+      await handleStreamingWorkloadComplete(workloadId, result);
+    },
+    onAssemblyProgress: (workloadId, progress) => {
+      console.log(`📊 [STREAMING CALLBACK] Assembly progress: ${workloadId} - ${progress.completedBlocks}/${progress.totalBlocks}`);
+
+      io.emit('assembly:progress', {
+        workloadId,
+        completedBlocks: progress.completedBlocks,
+        totalBlocks: progress.totalBlocks,
+        progress: progress.progress
+      });
+
+      matrixState.clients.forEach(client => {
+        if (client.clientType === 'native' && client.connected) {
+          client.emit('assembly:progress', {
+            workloadId,
+            completedBlocks: progress.completedBlocks,
+            totalBlocks: progress.totalBlocks,
+            progress: progress.progress
+          });
+        }
+      });
+    }
+  });
+
+  console.log(`✅ [COMPUTE START] Streaming callbacks configured for ${wid}`);
+}
+
   const batchSize = req.body.batchSize || wl.metadata?.batchSize || 10;
 
   console.log(`🚀 [COMPUTE START] Starting workload ${wid} (streaming: ${streamingMode})`);
@@ -1155,12 +1240,19 @@ async function dispatchStreamingChunk(workloadId, chunkDescriptor) {
 }
 
 async function dispatchChunkToClient(client, chunkDescriptor, workloadId) {
+  const dispatchKey = `${chunkDescriptor.chunkId}-${client.id}`;
+  const now = Date.now();
+  const lastDispatched = activeChunkDispatches.get(dispatchKey);
+  if (lastDispatched && (now - lastDispatched) < 10000) { // 10 second window
+    console.log(`[DISPATCH] Preventing duplicate dispatch: ${chunkDescriptor.chunkId} to ${client.id}`);
+    return { success: true, duplicate: true };
+  }
+  activeChunkDispatches.set(dispatchKey, now);
   console.log(`[CHUNK DISPATCH] === SENDING TO CLIENT ===`);
   console.log(`[CHUNK DISPATCH] Client ID: ${client.id.substring(0, 8)}...`);
   console.log(`[CHUNK DISPATCH] Client Type: ${client.clientType || 'browser'}`);
   console.log(`[CHUNK DISPATCH] Chunk ID: ${chunkDescriptor.chunkId}`);
   console.log(`[CHUNK DISPATCH] Framework: ${chunkDescriptor.framework}`);
-
   try {
     client.isBusyWithCustomChunk = true;
 
@@ -2520,13 +2612,144 @@ function checkTaskTimeouts() {
   });
 }
 
+function checkTaskTimeoutsFixed() {
+  const now = Date.now();
 
+  // Clean up expired dispatch locks
+  for (const [chunkId, lockTime] of dispatchLock.entries()) {
+    if (now - lockTime > 60000) { // 1 minute timeout
+      dispatchLock.delete(chunkId);
+    }
+  }
+
+  // Clean up expired client locks
+  for (const clientId of clientDispatchLock) {
+    const client = matrixState.clients.get(clientId);
+    if (!client || !client.connected) {
+      clientDispatchLock.delete(clientId);
+    }
+  }
+
+  // Clean up expired active dispatches
+  for (const [key, timestamp] of activeChunkDispatches.entries()) {
+    if (now - timestamp > 300000) { // 5 minutes
+      activeChunkDispatches.delete(key);
+    }
+  }
+
+  // Original timeout logic...
+  for (const [assignId, inst] of matrixState.activeTasks.entries()) {
+    if (now - inst.startTime > MATRIX_TASK_TIMEOUT) {
+      console.log(`Matrix assignment ${assignId} timed out.`);
+      const cl = matrixState.clients.get(inst.assignedTo);
+      if (cl) {
+        cl.isBusyWithMatrixTask = false;
+        clientDispatchLock.delete(inst.assignedTo);
+      }
+      matrixState.activeTasks.delete(assignId);
+    }
+  }
+
+  // Enhanced chunk timeout handling with proper cleanup
+  customWorkloadChunks.forEach(store => {
+    store.allChunkDefs.forEach(cd => {
+      if (cd.activeAssignments.size > 0 && cd.assignedAt &&
+          (now - cd.assignedAt > CUSTOM_CHUNK_TIMEOUT) && cd.assignedTo) {
+
+        const timedOutClient = cd.assignedTo;
+        console.log(`Chunk ${cd.chunkId} for ${cd.parentId} timed out on ${timedOutClient}`);
+
+        // ATOMIC: Complete cleanup
+        const cl = matrixState.clients.get(timedOutClient);
+        if (cl) cl.isBusyWithCustomChunk = false;
+
+        cd.activeAssignments.delete(timedOutClient);
+        cd.assignedTo = null;
+        cd.assignedAt = null;
+
+        clientDispatchLock.delete(timedOutClient);
+        dispatchLock.delete(cd.chunkId);
+
+        const parent = customWorkloads.get(cd.parentId);
+        addProcessingTime(parent, {
+          chunkId: cd.chunkId,
+          error: 'timeout',
+          assignedTo: timedOutClient,
+          timedOutAt: now
+        });
+      }
+    });
+  });
+}
+/*
 setInterval(() => {
   checkTaskTimeouts();
 }, 30000);
+*/
+
+setInterval(checkTaskTimeoutsFixed, 30000);
+setInterval(centralizedDispatchCoordinator, 1000);
+
+function handleClientDisconnectFixed(clientId) {
+  const client = matrixState.clients.get(clientId);
+  if (client) {
+    client.connected = false;
+    client.isBusyWithMatrixTask = false;
+    client.isBusyWithCustomChunk = false;
+    client.isBusyWithNonChunkedWGSL = false;
+  }
+
+  // ATOMIC: Clean up all locks for this client
+  clientDispatchLock.delete(clientId);
+
+  // Clean up any chunks this client was dispatched
+  for (const [chunkId, lockTime] of dispatchLock.entries()) {
+    // Remove locks for chunks that might have been assigned to this client
+    const chunkKey = `${chunkId}-${clientId}`;
+    if (activeChunkDispatches.has(chunkKey)) {
+      dispatchLock.delete(chunkId);
+      activeChunkDispatches.delete(chunkKey);
+    }
+  }
+
+  // Rest of the existing disconnect logic...
+  for (const [assignId, inst] of matrixState.activeTasks.entries()) {
+    if (inst.assignedTo === clientId) {
+      console.log(`Matrix assignment ${assignId} for ${clientId} timed out on disconnect.`);
+      matrixState.activeTasks.delete(assignId);
+    }
+  }
+
+  customWorkloadChunks.forEach(store => {
+    store.allChunkDefs.forEach(cd => {
+      if (cd.activeAssignments.has(clientId)) {
+        cd.activeAssignments.delete(clientId);
+        if (cd.assignedTo === clientId) {
+          cd.assignedTo = null;
+          cd.assignedAt = null;
+          // Clean up locks for this chunk
+          dispatchLock.delete(cd.chunkId);
+        }
+        if (!cd.verified_results && cd.activeAssignments.size === 0 && cd.status === 'active') {
+          cd.status = 'queued';
+        }
+      }
+    });
+  });
+
+  customWorkloads.forEach(wl => {
+    if (!wl.isChunkParent && wl.activeAssignments.has(clientId)) {
+      wl.activeAssignments.delete(clientId);
+    }
+  });
+
+  matrixState.clients.delete(clientId);
+  matrixState.stats.activeClients = matrixState.clients.size;
+}
+
 
 io.on('connection', socket => {
-  console.log(`New client: ${socket.id}`);
+  console.log(`[IO] connected: ${socket.id}`);
   matrixState.clients.set(socket.id, {
     id: socket.id,
     socket,
@@ -2698,15 +2921,81 @@ io.on('connection', socket => {
   });
 
   // Enhanced chunk completion
-  socket.on('workload:chunk_done_enhanced', ({ parentId, chunkId, results, result, processingTime, strategy, metadata, reportedChecksum }) => {
+  socket.on('workload:chunk_done_enhanced', async ({ parentId, chunkId, results, result, processingTime, strategy, metadata, reportedChecksum }) => {
+
+    // DEDUPLICATION: Check if we've already processed this chunk recently
+    const chunkKey = `${parentId}-${chunkId}-${socket.id}`;
+    const now = Date.now();
+    const lastProcessed = processedChunkCompletions.get(chunkKey);
+      if (lastProcessed && (now - lastProcessed) < 5000) { // 5 second window
+      console.log(`[CHUNK RESULT] Ignoring duplicate chunk completion: ${chunkId} from client ${socket.id}`);
+      return;
+    }
+    processedChunkCompletions.set(chunkKey, now);
     console.log(`[CHUNK RESULT] Enhanced chunk ${chunkId} completed by ${socket.id}`);
+    console.log(`[CHUNK RESULT] Parent ID: ${parentId}`);
+    console.log(`[CHUNK RESULT] Chunk ID: ${chunkId}`);
+    console.log(`[CHUNK RESULT] Results count: ${results?.length || (result ? 1 : 0)}`);
+    console.log(`[CHUNK RESULT] Processing time: ${processingTime}ms`);
 
     const client = matrixState.clients.get(socket.id);
     if (client) client.isBusyWithCustomChunk = false;
+    clientDispatchLock.delete(socket.id);
+    dispatchLock.delete(chunkId);
+    console.log(`[CHUNK RESULT] Enhanced chunk ${chunkId} completed by ${socket.id}`);
     updateStreamingWorkloadProgress(parentId, chunkId, 'completed');
+     console.log(`[CHUNK RESULT] Looking up workload: ${parentId}`);
     const workloadState = customWorkloads.get(parentId);
-    const chunkStore = customWorkloadChunks.get(parentId);
+    console.log(`[CHUNK RESULT] Workload found: ${!!workloadState}`);
+    if (workloadState) {
+      console.log(`[CHUNK RESULT] Workload status: ${workloadState.status}`);
+      console.log(`[CHUNK RESULT] Workload streaming mode: ${workloadState.streamingMode}`);
+    }
 
+    if (workloadState && workloadState.streamingMode) {
+    console.log(`[CHUNK RESULT] Processing streaming chunk ${chunkId} via chunking manager`);
+
+    let finalResults = results || [result];
+    if (!Array.isArray(finalResults)) finalResults = [finalResults];
+
+    try {
+      // For streaming: Call chunking manager directly (no chunk store needed)
+      const assemblyResult = await chunkingManager.handleChunkCompletion(parentId, chunkId, finalResults, processingTime);
+      console.log(`[CHUNK RESULT] Streaming assembly result:`, {
+        success: assemblyResult.success,
+        status: assemblyResult.status,
+        error: assemblyResult.error
+      });
+
+      if (assemblyResult.success && assemblyResult.status === 'complete') {
+        console.log(`🎉 Streaming workload ${parentId} COMPLETED!`);
+        // Handle completion for streaming workloads
+        await handleStreamingWorkloadComplete(parentId, assemblyResult);
+      } else if (!assemblyResult.success) {
+        console.error(`❌ Streaming assembly failed for ${parentId}: ${assemblyResult.error}`);
+        workloadState.status = 'error';
+        workloadState.error = assemblyResult.error;
+        saveCustomWorkloads();
+        broadcastCustomWorkloadList();
+      }
+    } catch (assemblyError) {
+      console.error(`❌ Streaming assembly error for chunk ${chunkId}:`, assemblyError);
+      workloadState.status = 'error';
+      workloadState.error = assemblyError.message;
+      saveCustomWorkloads();
+      broadcastCustomWorkloadList();
+    }
+
+    return; // Exit early for streaming mode
+  }
+
+    const chunkStore = customWorkloadChunks.get(parentId);
+    console.log(`[CHUNK RESULT] Chunk store found: ${!!chunkStore}`);
+    if (chunkStore) {
+    console.log(`[CHUNK RESULT] Store enhanced: ${chunkStore.enhanced}`);
+    console.log(`[CHUNK RESULT] Store expected chunks: ${chunkStore.expectedChunks}`);
+    console.log(`[CHUNK RESULT] Store completed chunks: ${chunkStore.completedChunksData?.size || 0}`);
+  }
     if (!workloadState || !chunkStore) {
       console.error(`[CHUNK RESULT] Workload ${parentId} not found for chunk ${chunkId}`);
       return;
@@ -2843,6 +3132,15 @@ io.on('connection', socket => {
 
   // Regular chunk completion
   socket.on('workload:chunk_done', ({ parentId, chunkId, chunkOrderIndex, results, result, processingTime, reportedChecksum }) => {
+     const chunkKey = `${parentId}-${chunkId}-${socket.id}`; // Include client ID
+    const now = Date.now();
+    const lastProcessed = processedChunkCompletions.get(chunkKey);
+
+    if (lastProcessed && (now - lastProcessed) < 5000) { // 5 second window
+      console.log(`[CHUNK RESULT] Ignoring duplicate chunk completion: ${chunkId} from client ${socket.id}`);
+      return;
+    }
+    processedChunkCompletions.set(chunkKey, now);
     const client = matrixState.clients.get(socket.id);
     if (client) client.isBusyWithCustomChunk = false;
     const parent = customWorkloads.get(parentId);
@@ -3230,7 +3528,7 @@ server.listen(PORT, () => {
   } catch (e) {
     console.log('Enhanced chunking system initialized');
   }
-
+/*
   setInterval(async () => {
   assignTasksToAvailableClients();
   assignCustomChunkToAvailableClientsEnhanced();
@@ -3243,7 +3541,161 @@ server.listen(PORT, () => {
     console.error('Error processing streaming queues:', error);
   }
 }, 1000);
+*/
 });
+
+let isDispatchRunning = false;
+async function centralizedDispatchCoordinator() {
+  // Prevent concurrent execution of the entire dispatch cycle
+  if (isDispatchRunning) {
+    return;
+  }
+
+  isDispatchRunning = true;
+
+  try {
+    // Execute dispatch functions in sequence with proper state management
+    await executeDispatchCycle();
+  } catch (error) {
+    console.error('Error in centralized dispatch coordinator:', error);
+  } finally {
+    isDispatchRunning = false;
+  }
+}
+
+async function executeDispatchCycle() {
+  // 1. Matrix tasks (if running)
+  if (matrixState.isRunning) {
+    assignTasksToAvailableClientsFixed();
+  }
+
+  // 2. Process streaming chunks (highest priority)
+  await processStreamingQueuesFixed();
+
+  // 3. Regular chunk assignments
+  assignCustomChunkToAvailableClientsFixed();
+
+  // 4. Non-chunked workloads
+  tryDispatchNonChunkedWorkloadsFixed();
+}
+
+
+function assignTasksToAvailableClientsFixed() {
+  if (!matrixState.isRunning) return;
+
+  for (const [cid, client] of matrixState.clients.entries()) {
+    // Check all conditions atomically including the client dispatch lock
+    if (client.connected &&
+        client.gpuInfo &&
+        !client.isBusyWithMatrixTask &&
+        !client.isBusyWithCustomChunk &&
+        !client.isBusyWithNonChunkedWGSL &&
+        !clientDispatchLock.has(cid)) {
+
+      const task = assignMatrixTask(cid);
+      if (task) {
+        // ATOMIC: Lock client immediately
+        clientDispatchLock.add(cid);
+
+        try {
+          if (client.socket) {
+            client.socket.emit('task:assign', task);
+          } else if (client.emit) {
+            client.emit('task:assign', task);
+          }
+          console.log(`✅ Assigned matrix task ${task.id} to ${cid}`);
+        } catch (error) {
+          // Cleanup on failure
+          clientDispatchLock.delete(cid);
+          client.isBusyWithMatrixTask = false;
+          console.error(`Failed to assign matrix task to ${cid}:`, error);
+        }
+      }
+    }
+  }
+}
+
+function tryDispatchNonChunkedWorkloadsFixed() {
+  for (const [clientId, client] of matrixState.clients.entries()) {
+    // Check all conditions atomically including dispatch locks
+    if (!client.connected ||
+        !client.gpuInfo ||
+        client.isBusyWithCustomChunk ||
+        client.isBusyWithMatrixTask ||
+        client.isBusyWithNonChunkedWGSL ||
+        clientDispatchLock.has(clientId) ||
+        (!client.socket && !client.emit)) {
+      continue;
+    }
+
+    for (const wl of customWorkloads.values()) {
+      if (!wl.isChunkParent &&
+          ['pending_dispatch', 'pending'].includes(wl.status) &&
+          !wl.finalResultBase64 &&
+          wl.dispatchesMade < ADMIN_K_PARAMETER &&
+          !wl.activeAssignments.has(clientId)) {
+
+        // Check framework support
+        if (!client.supportedFrameworks ||
+            !client.supportedFrameworks.includes(wl.framework)) {
+          continue;
+        }
+
+        // ATOMIC: Lock client immediately
+        clientDispatchLock.add(clientId);
+
+        try {
+          wl.dispatchesMade++;
+          wl.activeAssignments.add(clientId);
+          client.isBusyWithNonChunkedWGSL = true;
+
+          const clientTypeStr = client.clientType || 'browser';
+          console.log(`Dispatching ${wl.framework} workload ${wl.label} to ${clientTypeStr} client ${clientId}`);
+
+          let parsedInputs = {};
+          if (wl.input) {
+            try {
+              if (typeof wl.input === 'string' && wl.input.startsWith('{')) {
+                parsedInputs = JSON.parse(wl.input);
+              } else {
+                parsedInputs = { input: wl.input };
+              }
+            } catch (e) {
+              parsedInputs = { input: wl.input };
+            }
+          }
+
+          const taskData = {
+            ...wl,
+            compilationOptions: wl.compilationOptions,
+            inputs: Object.values(parsedInputs),
+            outputSizes: wl.outputSizes || [wl.outputSize]
+          };
+
+          // Send based on client type
+          if (client.socket) {
+            client.socket.emit('workload:new', taskData);
+          } else if (client.emit) {
+            client.emit('workload:new', taskData);
+          }
+
+          console.log(`✅ Assigned non-chunked workload ${wl.label} to ${clientTypeStr} client ${clientId}`);
+          break;
+
+        } catch (error) {
+          // CRITICAL: Cleanup on failure
+          wl.dispatchesMade--;
+          wl.activeAssignments.delete(clientId);
+          client.isBusyWithNonChunkedWGSL = false;
+          clientDispatchLock.delete(clientId);
+
+          console.error(`Failed to dispatch workload ${wl.label} to ${clientId}:`, error);
+          continue;
+        }
+      }
+    }
+  }
+}
 
 app.get('/api/streaming/status', (req, res) => {
   const streamingStatus = {
@@ -3272,7 +3724,7 @@ app.get('/api/streaming/status', (req, res) => {
 app.post('/api/streaming/process-queues', async (req, res) => {
   try {
     const startTime = Date.now();
-    await processStreamingQueues();
+    await processStreamingQueuesFixed();
     const processingTime = Date.now() - startTime;
 
     res.json({
@@ -3500,6 +3952,387 @@ async function processStreamingQueues() {
   }
 }
 
+async function processStreamingQueuesFixed() {
+  if (streamingChunkQueues.size === 0) return;
+
+  const startTime = Date.now();
+  let totalProcessed = 0;
+
+  console.log(`🔄 [QUEUE] Processing ${streamingChunkQueues.size} streaming queues...`);
+
+  // Get available clients by framework (with atomic client locking)
+  const clientsByFramework = getAvailableClientsByFramework();
+
+  // Process each workload's queue with priority and atomic operations
+  const workloadQueues = Array.from(streamingChunkQueues.entries())
+    .sort(([aWorkloadId, aQueue], [bWorkloadId, bQueue]) => {
+      const aOldest = Math.min(...aQueue.map(item => item.queuedAt));
+      const bOldest = Math.min(...bQueue.map(item => item.queuedAt));
+      return aOldest - bOldest;
+    });
+
+  for (const [workloadId, queue] of workloadQueues) {
+    if (queue.length === 0) continue;
+
+    let queueProcessed = 0;
+    const maxDispatchPerQueue = Math.min(queue.length, 5);
+
+    for (let i = 0; i < maxDispatchPerQueue && queue.length > 0; i++) {
+      // ✅ PEEK at the first item, DON'T remove yet
+      const queuedItem = queue[0];
+      if (!queuedItem) break;
+
+      const { descriptor } = queuedItem;
+
+      // ✅ Check if chunk is already being dispatched BEFORE removing from queue
+      if (dispatchLock.has(descriptor.chunkId)) {
+        const lockTime = dispatchLock.get(descriptor.chunkId);
+        if (Date.now() - lockTime < 30000) { // 30 second lock
+          console.log(`[DISPATCH LOCK] Chunk ${descriptor.chunkId} already being dispatched, skipping queue`);
+          break; // Stop processing this queue for now
+        } else {
+          // Lock expired, remove it
+          dispatchLock.delete(descriptor.chunkId);
+        }
+      }
+
+      // ✅ NOW remove from queue after confirming we can process it
+      queue.shift();
+
+      // ✅ ATOMIC OPERATION: Lock this chunk immediately
+      dispatchLock.set(descriptor.chunkId, Date.now());
+
+      try {
+        // Find available client for this framework
+        const frameworkClients = clientsByFramework.get(descriptor.framework) || [];
+        const availableClient = frameworkClients.find(({ clientId, client }) =>
+          !client.isBusyWithCustomChunk &&
+          !client.isBusyWithMatrixTask &&
+          !clientDispatchLock.has(clientId)
+        );
+
+        if (!availableClient) {
+          // ✅ No client available, put back at FRONT of queue and unlock
+          queue.unshift(queuedItem);
+          dispatchLock.delete(descriptor.chunkId);
+          console.log(`⏸️ [QUEUE] No available clients for ${descriptor.chunkId}, requeuing`);
+          break; // Stop processing this queue
+        }
+
+        // ✅ ATOMIC OPERATION: Lock client immediately
+        const { clientId, client } = availableClient;
+        clientDispatchLock.add(clientId);
+        client.isBusyWithCustomChunk = true;
+
+        // Dispatch the chunk
+        await dispatchChunkToClientFixed(client, descriptor, workloadId);
+
+        // Remove client from available pool for this cycle
+        const frameworkList = clientsByFramework.get(descriptor.framework);
+        const clientIndex = frameworkList.findIndex(item => item.clientId === clientId);
+        if (clientIndex > -1) {
+          frameworkList.splice(clientIndex, 1);
+        }
+
+        queueProcessed++;
+        totalProcessed++;
+
+        console.log(`✅ [QUEUE] Dispatched queued chunk ${descriptor.chunkId} to ${clientId}`);
+
+      } catch (error) {
+        // ✅ Re-queue the chunk with incremented attempt count and unlock
+        queuedItem.attempts++;
+        if (queuedItem.attempts < 3) {
+          queue.push(queuedItem); // Put at end for retry later
+          console.warn(`⚠️ [QUEUE] Requeued chunk ${descriptor.chunkId} (attempt ${queuedItem.attempts}/3)`);
+        } else {
+          console.error(`❌ [QUEUE] Dropped chunk ${descriptor.chunkId} after 3 failed attempts`);
+          updateStreamingWorkloadProgress(workloadId, descriptor.chunkId, 'failed');
+        }
+
+        // Always unlock on error
+        dispatchLock.delete(descriptor.chunkId);
+        if (availableClient) {
+          clientDispatchLock.delete(availableClient.clientId);
+          availableClient.client.isBusyWithCustomChunk = false;
+        }
+        break; // Stop processing this queue on error
+      }
+    }
+
+    if (queueProcessed > 0) {
+      console.log(`📤 [QUEUE] Processed ${queueProcessed} chunks for workload ${workloadId} (${queue.length} remaining)`);
+    }
+
+    // Clean up empty queues
+    if (queue.length === 0) {
+      streamingChunkQueues.delete(workloadId);
+      console.log(`🧹 [QUEUE] Cleared empty queue for workload ${workloadId}`);
+    }
+  }
+
+  const processingTime = Date.now() - startTime;
+  if (totalProcessed > 0) {
+    console.log(`⚡ [QUEUE] Processed ${totalProcessed} total chunks in ${processingTime}ms`);
+  }
+}
+
+function getAvailableClientsByFramework() {
+  const clientsByFramework = new Map();
+
+  matrixState.clients.forEach((client, clientId) => {
+    // Check all conditions atomically
+    if (!client.connected ||
+        !client.gpuInfo ||
+        client.isBusyWithCustomChunk ||
+        client.isBusyWithMatrixTask ||
+        clientDispatchLock.has(clientId) ||
+        (!client.socket && !client.emit)) {
+      return;
+    }
+
+    if (client.supportedFrameworks) {
+      client.supportedFrameworks.forEach(framework => {
+        if (!clientsByFramework.has(framework)) {
+          clientsByFramework.set(framework, []);
+        }
+        clientsByFramework.get(framework).push({ clientId, client });
+      });
+    }
+  });
+
+  return clientsByFramework;
+}
+
+
+async function dispatchChunkToClientFixed(client, chunkDescriptor, workloadId) {
+  const dispatchKey = `${chunkDescriptor.chunkId}-${client.id}`;
+  const now = Date.now();
+
+  // Enhanced deduplication check
+  const lastDispatched = activeChunkDispatches.get(dispatchKey);
+  if (lastDispatched && (now - lastDispatched) < 10000) {
+    console.log(`[DISPATCH] Preventing duplicate dispatch: ${chunkDescriptor.chunkId} to ${client.id}`);
+    throw new Error('Duplicate dispatch prevented');
+  }
+
+  // ATOMIC: Record dispatch immediately
+  activeChunkDispatches.set(dispatchKey, now);
+
+  console.log(`[CHUNK DISPATCH] === SENDING TO CLIENT ===`);
+  console.log(`[CHUNK DISPATCH] Client ID: ${client.id.substring(0, 8)}...`);
+  console.log(`[CHUNK DISPATCH] Client Type: ${client.clientType || 'browser'}`);
+  console.log(`[CHUNK DISPATCH] Chunk ID: ${chunkDescriptor.chunkId}`);
+  console.log(`[CHUNK DISPATCH] Framework: ${chunkDescriptor.framework}`);
+
+  try {
+    // Create unified task data
+    const taskData = {
+      parentId: chunkDescriptor.parentId,
+      chunkId: chunkDescriptor.chunkId,
+      chunkOrderIndex: chunkDescriptor.chunkIndex,
+      framework: chunkDescriptor.framework,
+      enhanced: true,
+      streaming: true,
+
+      // Shader code and execution parameters
+      kernel: chunkDescriptor.kernel,
+      wgsl: chunkDescriptor.kernel,
+      entry: chunkDescriptor.entry || 'main',
+      workgroupCount: chunkDescriptor.workgroupCount || [1, 1, 1],
+
+      // Framework-specific properties
+      webglShaderType: chunkDescriptor.webglShaderType,
+      webglVertexShader: chunkDescriptor.webglVertexShader,
+      webglFragmentShader: chunkDescriptor.webglFragmentShader,
+      webglVaryings: chunkDescriptor.webglVaryings,
+      webglNumElements: chunkDescriptor.webglNumElements,
+      webglInputSpec: chunkDescriptor.webglInputSpec,
+
+      blockDim: chunkDescriptor.blockDim,
+      gridDim: chunkDescriptor.gridDim,
+      globalWorkSize: chunkDescriptor.globalWorkSize,
+      localWorkSize: chunkDescriptor.localWorkSize,
+      shaderType: chunkDescriptor.shaderType,
+
+      // Data and metadata
+      inputs: chunkDescriptor.inputs || [],
+      outputs: chunkDescriptor.outputs || [],
+      metadata: chunkDescriptor.metadata || {},
+      outputSizes: chunkDescriptor.outputs ? chunkDescriptor.outputs.map(o => o.size) : [],
+
+      // Assembly metadata for streaming
+      assemblyMetadata: chunkDescriptor.assemblyMetadata,
+      streamingMetadata: chunkDescriptor.streamingMetadata
+    };
+
+    console.log(`🎯 [DISPATCH] Sending ${chunkDescriptor.framework} chunk ${chunkDescriptor.chunkId} to ${client.clientType || 'browser'} client ${client.id}`);
+
+    // Send to appropriate client type with timeout
+    const dispatchPromise = new Promise((resolve, reject) => {
+      const timeout = setTimeout(() => {
+        reject(new Error('Dispatch timeout'));
+      }, 30000);
+
+      try {
+        if (client.socket) {
+          client.socket.emit('workload:chunk_assign', taskData);
+          clearTimeout(timeout);
+          resolve({ success: true });
+        } else if (client.emit) {
+          client.emit('workload:chunk_assign', taskData);
+          clearTimeout(timeout);
+          resolve({ success: true });
+        } else {
+          clearTimeout(timeout);
+          reject(new Error(`Client ${client.id} has no dispatch method`));
+        }
+      } catch (error) {
+        clearTimeout(timeout);
+        reject(error);
+      }
+    });
+
+    const result = await dispatchPromise;
+
+    // Update streaming progress
+    updateStreamingWorkloadProgress(workloadId, chunkDescriptor.chunkId, 'dispatched');
+
+    return result;
+
+  } catch (error) {
+    // CRITICAL: Cleanup on failure
+    client.isBusyWithCustomChunk = false;
+    clientDispatchLock.delete(client.id);
+    dispatchLock.delete(chunkDescriptor.chunkId);
+    activeChunkDispatches.delete(dispatchKey);
+
+    console.error(`❌ [DISPATCH] Failed to dispatch to client ${client.id}:`, error);
+    throw error;
+  }
+}
+
+
+function assignCustomChunkToAvailableClientsFixed() {
+  const availableClients = Array.from(matrixState.clients.entries()).filter(([clientId, client]) =>
+    client.connected &&
+    client.gpuInfo &&
+    !client.isBusyWithCustomChunk &&
+    !client.isBusyWithMatrixTask &&
+    !clientDispatchLock.has(clientId) &&
+    (client.socket || client.emit)
+  );
+
+  for (const [clientId, client] of availableClients) {
+    let assigned = false;
+
+    for (const parent of customWorkloads.values()) {
+      // Skip streaming workloads (handled by processStreamingQueuesFixed)
+      if (parent.streamingMode && parent.status === 'streaming_chunks') {
+        continue;
+      }
+
+      if (!parent.isChunkParent || !['assigning_chunks', 'processing_chunks'].includes(parent.status)) continue;
+
+      if (!client.supportedFrameworks || !client.supportedFrameworks.includes(parent.framework)) {
+        continue;
+      }
+
+      const store = customWorkloadChunks.get(parent.id);
+      if (!store) continue;
+
+      for (const cd of store.allChunkDefs) {
+        if (
+          cd.status !== 'completed' &&
+          !cd.verified_results &&
+          cd.dispatchesMade < ADMIN_K_PARAMETER &&
+          !cd.assignedClients.has(clientId) &&
+          !dispatchLock.has(cd.chunkId) // ATOMIC: Check chunk lock
+        ) {
+          // ATOMIC: Lock chunk and client immediately
+          dispatchLock.set(cd.chunkId, Date.now());
+          clientDispatchLock.add(clientId);
+
+          cd.dispatchesMade++;
+          cd.activeAssignments.add(clientId);
+          cd.assignedClients.add(clientId);
+          cd.status = 'active';
+          cd.assignedTo = clientId;
+          cd.assignedAt = Date.now();
+          client.isBusyWithCustomChunk = true;
+
+          try {
+            // Create task data (same as before)
+            const taskData = {
+              parentId: cd.parentId,
+              chunkId: cd.chunkId,
+              chunkOrderIndex: cd.chunkOrderIndex,
+              framework: parent.framework,
+              enhanced: parent.enhanced,
+              streaming: false,
+
+              kernel: cd.kernel || parent.metadata?.customShader,
+              wgsl: cd.wgsl || cd.kernel || parent.metadata?.customShader,
+              entry: cd.entry || 'main',
+              workgroupCount: cd.workgroupCount || [1, 1, 1],
+
+              webglShaderType: cd.webglShaderType,
+              webglVertexShader: cd.webglVertexShader,
+              webglFragmentShader: cd.webglFragmentShader,
+              webglVaryings: cd.webglVaryings,
+              webglNumElements: cd.webglNumElements,
+              webglInputSpec: cd.webglInputSpec,
+
+              blockDim: cd.blockDim,
+              gridDim: cd.gridDim,
+              globalWorkSize: cd.globalWorkSize,
+              localWorkSize: cd.localWorkSize,
+              shaderType: cd.shaderType,
+
+              inputs: cd.inputs || [],
+              outputs: cd.outputs || [],
+              metadata: cd.metadata || {},
+              outputSizes: cd.outputs ? cd.outputs.map(o => o.size) : [cd.outputSize],
+              outputSize: cd.outputs ? cd.outputs[0]?.size : cd.outputSize,
+
+              chunkingStrategy: parent.chunkingStrategy,
+              assemblyStrategy: parent.assemblyStrategy
+            };
+
+            // Dispatch based on client type
+            if (client.socket) {
+              client.socket.emit('workload:chunk_assign', taskData);
+            } else if (client.emit) {
+              client.emit('workload:chunk_assign', taskData);
+            }
+
+            console.log(`✅ Assigned batch chunk ${cd.chunkId} to ${client.clientType || 'browser'} client ${clientId}`);
+            assigned = true;
+            break;
+
+          } catch (error) {
+            // CRITICAL: Cleanup on failure
+            cd.dispatchesMade--;
+            cd.activeAssignments.delete(clientId);
+            cd.assignedClients.delete(clientId);
+            cd.status = 'queued';
+            cd.assignedTo = null;
+            cd.assignedAt = null;
+            client.isBusyWithCustomChunk = false;
+            dispatchLock.delete(cd.chunkId);
+            clientDispatchLock.delete(clientId);
+
+            console.error(`Failed to assign chunk ${cd.chunkId} to ${clientId}:`, error);
+            continue;
+          }
+        }
+      }
+
+      if (assigned) break;
+    }
+  }
+}
+
 async function dispatchStreamingChunkEnhanced(workloadId, chunkDescriptor) {
   console.log(`[STREAMING DISPATCH] === STARTING DISPATCH ===`);
   console.log(`[STREAMING DISPATCH] Workload: ${workloadId}`);
@@ -3540,8 +4373,13 @@ async function dispatchStreamingChunkEnhanced(workloadId, chunkDescriptor) {
 }
 
 function updateStreamingWorkloadProgress(workloadId, chunkId, status) {
+  console.log(`📊 [PROGRESS] Updating streaming progress: ${workloadId} - ${chunkId} - ${status}`);
+
   const workload = customWorkloads.get(workloadId);
-  if (!workload) return;
+  if (!workload) {
+    console.warn(`📊 [PROGRESS] WARNING: Workload ${workloadId} not found for progress update`);
+    return;
+  }
 
   if (!workload.streamingProgress) {
     workload.streamingProgress = {
@@ -3552,6 +4390,7 @@ function updateStreamingWorkloadProgress(workloadId, chunkId, status) {
       totalCompleted: 0,
       totalFailed: 0
     };
+    console.log(`📊 [PROGRESS] Initialized streaming progress for ${workloadId}`);
   }
 
   const progress = workload.streamingProgress;
@@ -3588,7 +4427,6 @@ function updateStreamingWorkloadProgress(workloadId, chunkId, status) {
     timestamp: Date.now()
   });
 }
-
 
 function cleanupStreamingQueue(workloadId) {
   const queue = streamingChunkQueues.get(workloadId);
@@ -3665,6 +4503,23 @@ function handleStreamingError(workloadId, chunkId, error, clientId) {
     }
   }
 }
+// cleanup deduplication map
+setInterval(() => {
+  const now = Date.now();
+  const cutoff = now - 60000; // Remove entries older than 1 minute
+
+  for (const [key, timestamp] of processedChunkCompletions.entries()) {
+    if (timestamp < cutoff) {
+      processedChunkCompletions.delete(key);
+    }
+  }
+  for (const [key, timestamp] of recentCallbacks.entries()) {
+    if (timestamp < cutoff) {
+      recentCallbacks.delete(key);
+    }
+  }
+}, 30000);
+
 
 setInterval(() => {
   // Log streaming statistics every 30 seconds

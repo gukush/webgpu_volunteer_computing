@@ -2219,39 +2219,48 @@ socket.on('workload:chunk_assign', async chunk => {
   socket.emit(eventName, eventData);
 
   logTaskActivity(`[${framework.toUpperCase()}] Chunk ${chunk.chunkId} complete: ${outputCount} outputs`, 'success');
+  console.log(`[CLIENT DEBUG] Chunk ${chunk.chunkId} completion:`, {
+  enhanced: chunk.enhanced,
+  streaming: chunk.streaming,
+  eventName: eventName,
+  framework: framework
+});
+ } catch (err) {
+    console.error(`[${framework.toUpperCase()}] Execution error for ${chunk.chunkId}:`, err);
+    logTaskActivity(`[${framework.toUpperCase()}] Chunk ${chunk.chunkId} error: ${err.message}`, 'error');
 
-} catch (err) {
-  console.error(`[${framework.toUpperCase()}] Execution error for ${chunk.chunkId}:`, err);
-  logTaskActivity(`[${framework.toUpperCase()}] Chunk ${chunk.chunkId} error: ${err.message}`, 'error');
+    // Send ONLY the appropriate error event
+    const errorEventName = chunk.enhanced ? 'workload:chunk_error_enhanced' : 'workload:chunk_error';
+    socket.emit(errorEventName, {
+      parentId: chunk.parentId,
+      chunkId: chunk.chunkId,
+      message: `${framework}: ${err.message}`
+    });
 
-  const eventName = chunk.enhanced ? 'workload:chunk_error_enhanced' : 'workload:chunk_error';
-  socket.emit(eventName, {
-    parentId: chunk.parentId,
-    chunkId: chunk.chunkId,
-    message: `${framework}: ${err.message}`
-  });
+    console.log(`[CLIENT] Sent ${errorEventName} for chunk ${chunk.chunkId}`);
+
   } finally {
-  state.isComputingChunk = false;
-  state.currentTask = null;
+    state.isComputingChunk = false;
+    state.currentTask = null;
 
-  // Reset framework display
-  if (!IS_HEADLESS) {
-    const currentFramework = document.getElementById('current-framework');
-    const currentStrategy = document.getElementById('current-strategy');
+    // Reset framework display
+    if (!IS_HEADLESS) {
+      const currentFramework = document.getElementById('current-framework');
+      const currentStrategy = document.getElementById('current-strategy');
 
-    if (currentFramework) {
-      currentFramework.textContent = '-';
-      currentFramework.className = 'stat-value';
+      if (currentFramework) {
+        currentFramework.textContent = '-';
+        currentFramework.className = 'stat-value';
+      }
+
+      if (currentStrategy) {
+        currentStrategy.textContent = '-';
+      }
     }
 
-    if (currentStrategy) {
-      currentStrategy.textContent = '-';
-    }
+    updateComputationStatusDisplay();
+    requestMatrixTask();
   }
-
-  updateComputationStatusDisplay();
-  requestMatrixTask();
-}
 });
 
 socket.on('workloads:list_update', all => {

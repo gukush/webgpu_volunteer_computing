@@ -116,8 +116,21 @@ export class EnhancedChunkingManager {
       // Initialize streaming assembly if supported
       let assembler = null;
       if (streamingMode && this.supportsStreamingAssembly(workload.assemblyStrategy)) {
-        assembler = await this.initializeStreamingAssembly(workload, fullPlan);
-        this.streamingAssemblers.set(workload.id, assembler);
+        console.log(`🔧 Initializing streaming assembly for ${workload.id} with strategy: ${workload.assemblyStrategy}`);
+        try {
+          assembler = await this.initializeStreamingAssembly(workload, fullPlan);
+          this.streamingAssemblers.set(workload.id, assembler);
+          console.log(`✅ Streaming assembler initialized for ${workload.id}`);
+        } catch (assemblyError) {
+          console.error(`❌ Failed to initialize streaming assembler:`, assemblyError);
+          return {
+            success: false,
+            error: `Failed to initialize streaming assembly: ${assemblyError.message}`
+          };
+        }
+      }
+      else if (streamingMode) {
+        console.warn(`⚠️ Streaming mode requested but assembly strategy '${workload.assemblyStrategy}' doesn't support streaming`);
       }
 
       // Register the workload for tracking
@@ -277,12 +290,13 @@ export class EnhancedChunkingManager {
   /**
    * ENHANCED: Handle chunk completion with streaming assembly support
    */
-  handleChunkCompletion(parentId, chunkId, result, processingTime) {
+  async handleChunkCompletion(parentId, chunkId, result, processingTime) {
     let results = result;
     if (!Array.isArray(results)) {
       results = [results];
     }
 
+    console.log(`[CHUNKING MANAGER] Processing chunk completion: ${chunkId} for workload ${parentId}`);
     // Handle iterative workload chunk completion
     const handler = this.phaseCompletionHandlers.get(parentId);
     if (handler) {
