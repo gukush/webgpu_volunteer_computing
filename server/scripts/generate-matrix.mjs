@@ -216,8 +216,8 @@ async function main() {
     };
     await fs.writeFile(inputsJsonPath, JSON.stringify(inputsConfig, null, 2));
     
-    console.log(`✅ Combined matrices saved to: ${combinedPath}`);
-    console.log(`✅ Inputs config saved to: ${inputsJsonPath}`);
+    console.log(` Combined matrices saved to: ${combinedPath}`);
+    console.log(` Inputs config saved to: ${inputsJsonPath}`);
     console.log(`\nUsage:`);
     console.log(`node scripts/submit-task.mjs matrix-tiled --size ${size} --tile-size 64 --inputs ${inputsJsonPath}`);
     
@@ -241,9 +241,9 @@ async function main() {
     };
     await fs.writeFile(inputsJsonPath, JSON.stringify(inputsConfig, null, 2));
     
-    console.log(`✅ Matrix A saved to: ${matrixAPath}`);
-    console.log(`✅ Matrix B saved to: ${matrixBPath}`);
-    console.log(`✅ Inputs config saved to: ${inputsJsonPath}`);
+    console.log(` Matrix A saved to: ${matrixAPath}`);
+    console.log(` Matrix B saved to: ${matrixBPath}`);
+    console.log(` Inputs config saved to: ${inputsJsonPath}`);
     
   } else {
     console.error(`Error: Unknown format "${format}". Use: combined, separate`);

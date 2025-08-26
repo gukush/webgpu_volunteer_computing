@@ -35,7 +35,7 @@ export default class DistributedConvolutionAssemblyStrategy extends BaseAssembly
 
     const totalOutputSize = outputHeight * outputWidth * outputChannels;
 
-    console.log(`🖼️ Initializing convolution output tensor: ${outputHeight}×${outputWidth}×${outputChannels} = ${totalOutputSize} elements`);
+    console.log(`️ Initializing convolution output tensor: ${outputHeight}×${outputWidth}×${outputChannels} = ${totalOutputSize} elements`);
 
     // Initialize output tensor buffer
     this.outputTensor = new Float32Array(totalOutputSize);
@@ -47,7 +47,7 @@ export default class DistributedConvolutionAssemblyStrategy extends BaseAssembly
     this.totalExpectedTiles = tilesY * tilesX;
     this.completedTileCount = 0;
 
-    console.log(`📋 Convolution assembly initialized: expecting ${this.totalExpectedTiles} tiles (${tilesY}×${tilesX})`);
+    console.log(` Convolution assembly initialized: expecting ${this.totalExpectedTiles} tiles (${tilesY}×${tilesX})`);
   }
 
   /**
@@ -88,7 +88,7 @@ export default class DistributedConvolutionAssemblyStrategy extends BaseAssembly
       outputChannels
     } = assemblyMetadata;
 
-    console.log(`🔧 Processing convolution tile (${tileY},${tileX}): ${tileOutputHeight}×${tileOutputWidth}×${outputChannels}`);
+    console.log(` Processing convolution tile (${tileY},${tileX}): ${tileOutputHeight}×${tileOutputWidth}×${outputChannels}`);
 
     // Decode the tile result
     const resultBuffer = Buffer.from(chunkResult.result || chunkResult.results[0], 'base64');
@@ -112,7 +112,7 @@ export default class DistributedConvolutionAssemblyStrategy extends BaseAssembly
 
     this.completedTileCount++;
 
-    console.log(`✅ Convolution tile (${tileY},${tileX}) completed (${this.completedTileCount}/${this.totalExpectedTiles} total)`);
+    console.log(` Convolution tile (${tileY},${tileX}) completed (${this.completedTileCount}/${this.totalExpectedTiles} total)`);
 
     // Fire streaming callback
     const callback = this.streamingCallbacks.get('tile_complete');
@@ -128,7 +128,7 @@ export default class DistributedConvolutionAssemblyStrategy extends BaseAssembly
 
     // Check if entire convolution is complete
     if (this.completedTileCount === this.totalExpectedTiles) {
-      console.log(`🎉 Convolution assembly completed! All ${this.totalExpectedTiles} tiles processed.`);
+      console.log(` Convolution assembly completed! All ${this.totalExpectedTiles} tiles processed.`);
 
       const finalResult = await this.finalize();
 
@@ -190,7 +190,7 @@ export default class DistributedConvolutionAssemblyStrategy extends BaseAssembly
       throw new Error('Output tensor not initialized');
     }
 
-    console.log(`🏁 Finalizing convolution result: ${this.outputHeight}×${this.outputWidth}×${this.outputChannels}`);
+    console.log(` Finalizing convolution result: ${this.outputHeight}×${this.outputWidth}×${this.outputChannels}`);
 
     // Convert Float32Array to buffer and then base64
     const resultBuffer = Buffer.from(this.outputTensor.buffer);
@@ -223,7 +223,7 @@ export default class DistributedConvolutionAssemblyStrategy extends BaseAssembly
         await this.initOutputStore(plan);
       }
 
-      console.log(`🔧 Batch assembling ${completedChunks.length} convolution tiles...`);
+      console.log(` Batch assembling ${completedChunks.length} convolution tiles...`);
 
       // Sort chunks by tile position
       const sortedChunks = this.sortTileChunks(completedChunks);

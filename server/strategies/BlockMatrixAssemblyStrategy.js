@@ -40,7 +40,7 @@ export default class BlockMatrixAssemblyStrategy extends BaseAssemblyStrategy {
     const strategy = memoryStrategy?.outputStrategy || this.determineOutputStrategy(matrixBytes);
     const preferMemory = strategy === 'memory';
 
-    console.log(`📊 Assembly strategy: ${strategy} for ${Math.round(matrixBytes/1024/1024)}MB result matrix`);
+    console.log(` Assembly strategy: ${strategy} for ${Math.round(matrixBytes/1024/1024)}MB result matrix`);
 
     this.outputStore = selectStore({
       filePath: outputPath,
@@ -59,7 +59,7 @@ export default class BlockMatrixAssemblyStrategy extends BaseAssemblyStrategy {
     this.totalExpectedBlocks = blocksPerDim * blocksPerDim; // Unique output blocks
     this.completedBlocks = 0;
 
-    console.log(`🔧 Output store initialized: ${this.outputStore.kind} (${this.totalExpectedBlocks} unique blocks expected)`);
+    console.log(` Output store initialized: ${this.outputStore.kind} (${this.totalExpectedBlocks} unique blocks expected)`);
   }
 
   determineOutputStrategy(matrixBytes) {
@@ -109,14 +109,14 @@ export default class BlockMatrixAssemblyStrategy extends BaseAssemblyStrategy {
     const newK = currentK + 1;
     this.blockCompleteness.set(blockId, newK);
 
-    console.log(`📝 Block (${outputBlockRow},${outputBlockCol}) += k${kIndex} result (${newK}/${this.blocksPerDim} k-values)`);
+    console.log(` Block (${outputBlockRow},${outputBlockCol}) += k${kIndex} result (${newK}/${this.blocksPerDim} k-values)`);
 
     // Check if this output block is complete
     const blockComplete = this.isBlockComplete(outputBlockRow, outputBlockCol);
     if (blockComplete && this.blockCompleteness.get(blockId) === this.blocksPerDim) {
       // This is the first time this block completed
       this.completedBlocks++;
-      console.log(`✅ Block (${outputBlockRow},${outputBlockCol}) completed (${this.completedBlocks}/${this.totalExpectedBlocks} total)`);
+      console.log(` Block (${outputBlockRow},${outputBlockCol}) completed (${this.completedBlocks}/${this.totalExpectedBlocks} total)`);
 
       // Fire streaming callback
       const callback = this.streamingCallbacks.get('block_complete');
@@ -134,7 +134,7 @@ export default class BlockMatrixAssemblyStrategy extends BaseAssemblyStrategy {
 
     // Check if entire matrix is complete
     if (this.completedBlocks === this.totalExpectedBlocks) {
-      console.log(`🎉 Matrix assembly completed! All ${this.totalExpectedBlocks} blocks done.`);
+      console.log(` Matrix assembly completed! All ${this.totalExpectedBlocks} blocks done.`);
 
       const finalResult = await this.finalize();
 
@@ -178,7 +178,7 @@ export default class BlockMatrixAssemblyStrategy extends BaseAssemblyStrategy {
       throw new Error('Output store not initialized');
     }
 
-    console.log(`🏁 Finalizing ${this.outputStore.kind} result matrix...`);
+    console.log(` Finalizing ${this.outputStore.kind} result matrix...`);
 
     if (this.outputStore.kind === 'memory') {
       // Return the Float32Array directly
@@ -220,7 +220,7 @@ export default class BlockMatrixAssemblyStrategy extends BaseAssemblyStrategy {
         await this.initOutputStore(plan);
       }
 
-      console.log(`🔧 Batch assembling ${completedChunks.length} chunks...`);
+      console.log(` Batch assembling ${completedChunks.length} chunks...`);
 
       // Group chunks by output block and process
       const outputBlocks = this.groupChunksByOutputBlock(completedChunks);

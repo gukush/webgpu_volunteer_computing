@@ -65,7 +65,7 @@ bool WebSocketClient::connect(const std::string& host, const std::string& port, 
         shouldStop = false;
         ioThread = std::thread(&WebSocketClient::runEventLoop, this);
 
-        std::cout << "✅ Connected to native WebSocket endpoint: " << native_target << std::endl;
+        std::cout << " Connected to native WebSocket endpoint: " << native_target << std::endl;
 
         if (onConnected) {
             onConnected();
@@ -142,12 +142,12 @@ void WebSocketClient::joinComputation(const json& capabilities) {
     };
 
     sendEvent("client:join", joinData);
-    std::cout << "🔗 Sent client:join with capabilities" << std::endl;
+    std::cout << " Sent client:join with capabilities" << std::endl;
 }
 
 void WebSocketClient::requestTask() {
     sendEvent("task:request", json::object());
-    std::cout << "📋 Requested matrix task" << std::endl;
+    std::cout << " Requested matrix task" << std::endl;
 }
 
 void WebSocketClient::submitTaskResult(const std::string& assignmentId, const std::string& taskId,
@@ -161,7 +161,7 @@ void WebSocketClient::submitTaskResult(const std::string& assignmentId, const st
     };
 
     sendEvent("task:complete", resultData);
-    std::cout << "✅ Submitted task result for " << taskId << std::endl;
+    std::cout << " Submitted task result for " << taskId << std::endl;
 }
 
 void WebSocketClient::submitWorkloadResult(const std::string& workloadId, const std::string& result,
@@ -174,7 +174,7 @@ void WebSocketClient::submitWorkloadResult(const std::string& workloadId, const 
     };
 
     sendEvent("workload:done", resultData);
-    std::cout << "✅ Submitted workload result for " << workloadId << std::endl;
+    std::cout << " Submitted workload result for " << workloadId << std::endl;
 }
 
 void WebSocketClient::submitChunkResult(const std::string& parentId, const std::string& chunkId,
@@ -193,7 +193,7 @@ void WebSocketClient::submitChunkResult(const std::string& parentId, const std::
     };
 
     sendEvent("workload:chunk_done_enhanced", resultData);
-    std::cout << "✅ Submitted enhanced chunk result for " << chunkId << std::endl;
+    std::cout << " Submitted enhanced chunk result for " << chunkId << std::endl;
 }
 
 void WebSocketClient::reportError(const std::string& workloadId, const std::string& message) {
@@ -203,7 +203,7 @@ void WebSocketClient::reportError(const std::string& workloadId, const std::stri
     };
 
     sendEvent("workload:error", errorData);
-    std::cout << "❌ Reported error for " << workloadId << ": " << message << std::endl;
+    std::cout << " Reported error for " << workloadId << ": " << message << std::endl;
 }
 
 void WebSocketClient::reportChunkError(const std::string& parentId, const std::string& chunkId,
@@ -215,7 +215,7 @@ void WebSocketClient::reportChunkError(const std::string& parentId, const std::s
     };
 
     sendEvent("workload:chunk_error", errorData);
-    std::cout << "❌ Reported chunk error for " << chunkId << ": " << message << std::endl;
+    std::cout << " Reported chunk error for " << chunkId << ": " << message << std::endl;
 }
 
 void WebSocketClient::runEventLoop() {
@@ -268,11 +268,11 @@ void WebSocketClient::runEventLoop() {
                         onWorkloadComplete(eventData);
                     }
                 } else if (eventType == "admin:k_update") {
-                    std::cout << "📊 K parameter updated to: " << eventData << std::endl;
+                    std::cout << " K parameter updated to: " << eventData << std::endl;
                 } else if (eventType == "clients:update") {
                     // Optional: handle client list updates
                 } else {
-                    std::cout << "❓ Unknown event type: " << eventType << std::endl;
+                    std::cout << " Unknown event type: " << eventType << std::endl;
                 }
 
             } catch (json::parse_error const& e) {
@@ -296,5 +296,5 @@ void WebSocketClient::runEventLoop() {
         }
     }
 
-    std::cout << "🔌 WebSocket event loop ended" << std::endl;
+    std::cout << " WebSocket event loop ended" << std::endl;
 }

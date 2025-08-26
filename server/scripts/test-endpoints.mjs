@@ -10,7 +10,7 @@ const BASE_URL = process.argv[2] || 'https://localhost:3000';
 
 async function testEndpoint(method, path, body = null) {
   const url = `${BASE_URL}${path}`;
-  console.log(`\n🔍 Testing ${method} ${path}`);
+  console.log(`\n Testing ${method} ${path}`);
   
   const options = {
     method,
@@ -31,15 +31,15 @@ async function testEndpoint(method, path, body = null) {
     if (response.ok) {
       try {
         const json = JSON.parse(text);
-        console.log(`   ✅ Response: ${JSON.stringify(json, null, 2)}`);
+        console.log(`    Response: ${JSON.stringify(json, null, 2)}`);
       } catch {
-        console.log(`   ✅ Response: ${text.slice(0, 200)}...`);
+        console.log(`    Response: ${text.slice(0, 200)}...`);
       }
     } else {
-      console.log(`   ❌ Error: ${text.slice(0, 200)}...`);
+      console.log(`    Error: ${text.slice(0, 200)}...`);
     }
   } catch (error) {
-    console.log(`   💥 Request failed: ${error.message}`);
+    console.log(`    Request failed: ${error.message}`);
   }
 }
 
@@ -56,7 +56,7 @@ async function main() {
   await testEndpoint('GET', '/api/workloads');
   await testEndpoint('POST', '/api/system/k', { k: 1 });
   
-  console.log('\n📝 Summary:');
+  console.log('\n Summary:');
   console.log('If /api/status works but /api/workloads/startQueued gives 404,');
   console.log('there might be an issue with route registration in server.js');
 }

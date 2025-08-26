@@ -1975,7 +1975,7 @@ socket.on('connect', async () => {
     socket.emit('client:join', {
       gpuInfo: frameworkState.webgpu.adapterInfo || frameworkState.webgl.extensions || { vendor: 'CPU Fallback' },
       hasWebGPU: frameworkState.webgpu.supported,
-      supportedFrameworks: capabilities.supportedFrameworks, // ✅ Now included!
+      supportedFrameworks: capabilities.supportedFrameworks, //  Now included!
       clientType: capabilities.clientType
     });
 
@@ -2398,7 +2398,7 @@ socket.on('workload:new', async meta => {
 
 socket.on('workload:complete', data => {
   if (data.enhanced) {
-    logTaskActivity(`✅ Enhanced workload ${data.label} complete! (${data.stats?.chunkingStrategy}/${data.stats?.assemblyStrategy})`, 'success');
+    logTaskActivity(` Enhanced workload ${data.label} complete! (${data.stats?.chunkingStrategy}/${data.stats?.assemblyStrategy})`, 'success');
 
     if (data.stats) {
       logTaskActivity(`   Strategy: ${data.stats.chunkingStrategy} → ${data.stats.assemblyStrategy}`, 'info');

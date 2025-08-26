@@ -52,16 +52,16 @@ bool OpenCLExecutor::initialize(const json& config) {
 
         if (requestedDeviceType == "cpu" || requestedDeviceType == "CPU") {
             deviceType = CL_DEVICE_TYPE_CPU;
-            std::cout << "🖥️  Explicitly requesting CPU devices" << std::endl;
+            std::cout << "️  Explicitly requesting CPU devices" << std::endl;
         } else if (requestedDeviceType == "gpu" || requestedDeviceType == "GPU") {
             deviceType = CL_DEVICE_TYPE_GPU;
-            std::cout << "🎮 Explicitly requesting GPU devices" << std::endl;
+            std::cout << " Explicitly requesting GPU devices" << std::endl;
         } else if (requestedDeviceType == "all" || requestedDeviceType == "ALL") {
             deviceType = CL_DEVICE_TYPE_ALL;
-            std::cout << "🔧 Requesting all device types" << std::endl;
+            std::cout << " Requesting all device types" << std::endl;
         } else if (requestedDeviceType == "auto") {
             deviceType = CL_DEVICE_TYPE_GPU; // Start with GPU
-            std::cout << "🤖 Auto-selecting devices (GPU preferred)" << std::endl;
+            std::cout << " Auto-selecting devices (GPU preferred)" << std::endl;
         }
     }
 
@@ -81,7 +81,7 @@ bool OpenCLExecutor::initialize(const json& config) {
         else if (deviceType == CL_DEVICE_TYPE_GPU) finalDeviceTypeStr = "GPU";
         else finalDeviceTypeStr = "Mixed";
 
-        std::cout << "✅ Found " << numDevices << " " << finalDeviceTypeStr << " device(s)" << std::endl;
+        std::cout << " Found " << numDevices << " " << finalDeviceTypeStr << " device(s)" << std::endl;
     }
 
     // Fallback logic for auto mode
@@ -94,7 +94,7 @@ bool OpenCLExecutor::initialize(const json& config) {
             devices.resize(numDevices);
             err = clGetDeviceIDs(platform, deviceType, numDevices, devices.data(), nullptr);
             finalDeviceTypeStr = "CPU";
-            std::cout << "✅ Found " << numDevices << " CPU device(s)" << std::endl;
+            std::cout << " Found " << numDevices << " CPU device(s)" << std::endl;
         }
     }
 
@@ -108,12 +108,12 @@ bool OpenCLExecutor::initialize(const json& config) {
             devices.resize(numDevices);
             err = clGetDeviceIDs(platform, deviceType, numDevices, devices.data(), nullptr);
             finalDeviceTypeStr = "Any";
-            std::cout << "✅ Found " << numDevices << " device(s) of any type" << std::endl;
+            std::cout << " Found " << numDevices << " device(s) of any type" << std::endl;
         }
     }
 
     if (err != CL_SUCCESS || numDevices == 0) {
-        std::cerr << "❌ No suitable OpenCL devices found" << std::endl;
+        std::cerr << " No suitable OpenCL devices found" << std::endl;
         return false;
     }
 
@@ -145,7 +145,7 @@ bool OpenCLExecutor::initialize(const json& config) {
     else if (actualDeviceType == CL_DEVICE_TYPE_ACCELERATOR) actualTypeStr = "Accelerator";
     else actualTypeStr = "Other";
 
-    std::cout << "📋 Selected OpenCL device:" << std::endl;
+    std::cout << " Selected OpenCL device:" << std::endl;
     std::cout << "   Name: " << deviceName << std::endl;
     std::cout << "   Vendor: " << deviceVendor << std::endl;
     std::cout << "   Type: " << actualTypeStr << std::endl;
@@ -172,7 +172,7 @@ bool OpenCLExecutor::initialize(const json& config) {
     }
 
     initialized = true;
-    std::cout << "✅ OpenCL executor initialized successfully with " << actualTypeStr << " device" << std::endl;
+    std::cout << " OpenCL executor initialized successfully with " << actualTypeStr << " device" << std::endl;
 
     return true;
 }

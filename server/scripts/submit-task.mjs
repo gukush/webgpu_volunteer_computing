@@ -463,7 +463,7 @@ async function main() {
           input: buffer.toString('base64')
         };
 
-        console.log(`✅ Loaded matrix data: ${buffer.length} bytes (${size}×${size} matrices)`);
+        console.log(` Loaded matrix data: ${buffer.length} bytes (${size}×${size} matrices)`);
 
       } catch (err) {
         console.error(`Failed to load matrix file ${args.input}: ${err.message}`);
@@ -495,7 +495,7 @@ async function main() {
         input: combinedMatricesBuffer
       };
 
-      console.log(`✅ Generated random ${size}×${size} test matrices`);
+      console.log(` Generated random ${size}×${size} test matrices`);
     }
 
     const payload = {
@@ -549,7 +549,7 @@ async function main() {
       const workloadInfo = await postJSON(`${base}/api/workloads/advanced`, payload);
       const workloadId = workloadInfo.id;
       if (!workloadId) throw new Error('No workload ID returned');
-      console.log('✅ Workload created:', workloadId);
+      console.log(' Workload created:', workloadId);
 
       if (args.input) {
         const inputPath = path.resolve(args.input);
@@ -560,7 +560,7 @@ async function main() {
         const upload = await postMultipart(`${base}/api/workloads/${workloadId}/inputs`, [
           { name: 'combined_matrix', buffer: buf, filename: path.basename(inputPath) }
         ]);
-        console.log('✅ Upload complete:', upload);
+        console.log(' Upload complete:', upload);
       } else {
         console.log('Generating random matrices...');
         const A = Array.from({ length: size }, () => Array.from({ length: size }, () => Math.random()));
@@ -569,7 +569,7 @@ async function main() {
         const upload = await postMultipart(`${base}/api/workloads/${workloadId}/inputs`, [
           { name: 'combined_matrix', buffer: buf, filename: `random_${size}x${size}.bin` }
         ]);
-        console.log('✅ Random data uploaded:', upload);
+        console.log(' Random data uploaded:', upload);
       }
     } catch (err) {
       console.error('Failed to submit block-matrix workload:', err.message);

@@ -149,10 +149,10 @@ async createChunkDescriptorsStreaming(plan, dispatchCallback) {
   const { matrixSize, blockSize, blocksPerDim, blockByteSize } = plan.metadata;
   const framework = plan.framework || 'webgpu';
 
-  console.log(`🌊 [CHUNKING STRATEGY] Starting streaming chunk creation`);
-  console.log(`🌊 [CHUNKING STRATEGY] Framework: ${framework}`);
-  console.log(`🌊 [CHUNKING STRATEGY] Matrix: ${matrixSize}x${matrixSize}, Block: ${blockSize}x${blockSize}`);
-  console.log(`🌊 [CHUNKING STRATEGY] Expected chunks: ${blocksPerDim * blocksPerDim * blocksPerDim}`);
+  console.log(` [CHUNKING STRATEGY] Starting streaming chunk creation`);
+  console.log(` [CHUNKING STRATEGY] Framework: ${framework}`);
+  console.log(` [CHUNKING STRATEGY] Matrix: ${matrixSize}x${matrixSize}, Block: ${blockSize}x${blockSize}`);
+  console.log(` [CHUNKING STRATEGY] Expected chunks: ${blocksPerDim * blocksPerDim * blocksPerDim}`);
 
   // Get input data (same logic as batch mode)
   const inputFileRef = (plan.inputRefs || []).find(r => r.name === 'combined_matrix')
@@ -183,7 +183,7 @@ async createChunkDescriptorsStreaming(plan, dispatchCallback) {
     // Open file if using file input
     if (inputFileRef?.path) {
       fileHandle = await fs.open(inputFileRef.path, 'r');
-      console.log(`📂 Opened input file: ${inputFileRef.path}`);
+      console.log(` Opened input file: ${inputFileRef.path}`);
     }
 
     // Create and dispatch chunks one by one
@@ -219,7 +219,7 @@ async createChunkDescriptorsStreaming(plan, dispatchCallback) {
               totalChunks: blocksPerDim * blocksPerDim * blocksPerDim
             };
 
-            console.log(`🚀 Dispatching chunk ${descriptor.chunkId} (${chunkIndex + 1}/${blocksPerDim * blocksPerDim * blocksPerDim})`);
+            console.log(` Dispatching chunk ${descriptor.chunkId} (${chunkIndex + 1}/${blocksPerDim * blocksPerDim * blocksPerDim})`);
 
             // IMMEDIATELY dispatch this chunk
             await dispatchCallback(descriptor);
@@ -234,7 +234,7 @@ async createChunkDescriptorsStreaming(plan, dispatchCallback) {
 
           } catch (chunkError) {
             const errorMsg = `Failed to create/dispatch chunk (${i},${j},k${k}): ${chunkError.message}`;
-            console.error(`❌ ${errorMsg}`);
+            console.error(` ${errorMsg}`);
             errors.push(errorMsg);
 
             // Continue with next chunk instead of failing completely
@@ -248,10 +248,10 @@ async createChunkDescriptorsStreaming(plan, dispatchCallback) {
     const totalExpected = blocksPerDim * blocksPerDim * blocksPerDim;
 
     if (errors.length > 0) {
-      console.warn(`⚠️  Streaming completed with ${errors.length} errors out of ${totalExpected} chunks`);
+      console.warn(`️  Streaming completed with ${errors.length} errors out of ${totalExpected} chunks`);
     }
 
-    console.log(`✅ Streaming chunk creation completed: ${dispatchedCount}/${totalExpected} chunks dispatched`);
+    console.log(` Streaming chunk creation completed: ${dispatchedCount}/${totalExpected} chunks dispatched`);
 
     return {
       success: true,
@@ -270,7 +270,7 @@ async createChunkDescriptorsStreaming(plan, dispatchCallback) {
     };
 
   } catch (error) {
-    console.error(`💥 Streaming chunk creation failed:`, error);
+    console.error(` Streaming chunk creation failed:`, error);
 
     return {
       success: false,
@@ -287,9 +287,9 @@ async createChunkDescriptorsStreaming(plan, dispatchCallback) {
     if (fileHandle) {
       try {
         await fileHandle.close();
-        console.log(`📂 Closed input file`);
+        console.log(` Closed input file`);
       } catch (closeError) {
-        console.warn(`⚠️  Failed to close file handle:`, closeError.message);
+        console.warn(`️  Failed to close file handle:`, closeError.message);
       }
     }
   }
