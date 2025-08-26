@@ -4,13 +4,15 @@
 import { BaseChunkingStrategy } from './base/BaseChunkingStrategy.js';
 import { BaseAssemblyStrategy } from './base/BaseAssemblyStrategy.js';
 
-// NEW: Import matrix tiled strategies
-import MatrixTiledChunkingStrategy from './MatrixTiledChunkingStrategy.js';
-import MatrixTiledAssemblyStrategy from './MatrixTiledAssemblyStrategy.js';
 
 import BlockMatrixChunkingStrategy from './BlockMatrixChunkingStrategy.js';
 import BlockMatrixAssemblyStrategy from './BlockMatrixAssemblyStrategy.js';
 
+import DistributedSortChunkingStrategy from './DistributedSortChunkingStrategy.js';
+import DistributedSortAssemblyStrategy from './DistributedSortAssemblyStrategy.js';
+
+import DistributedConvolutionChunkingStrategy from './DistributedConvolutionChunkingStrategy.js';
+import DistributedConvolutionAssemblyStrategy from './DistributedConvolutionAssemblyStrategy.js';
 
 
 import vm from 'vm';
@@ -428,9 +430,11 @@ generateCompatibilityRecommendations(chunkingStrategy, assemblyStrategy, framewo
     this.registerChunkingStrategy(new LinearChunkingStrategy());
     this.registerAssemblyStrategy(new LinearAssemblyStrategy());
 
-    // NEW: Matrix tiled strategies
-    this.registerChunkingStrategy(new MatrixTiledChunkingStrategy());
-    this.registerAssemblyStrategy(new MatrixTiledAssemblyStrategy());
+    this.registerChunkingStrategy(new DistributedSortChunkingStrategy());
+    this.registerAssemblyStrategy(new DistributedSortAssemblyStrategy());
+
+    this.registerChunkingStrategy(new DistributedConvolutionChunkingStrategy());
+    this.registerAssemblyStrategy(new DistributedConvolutionAssemblyStrategy());
 
     this.registerChunkingStrategy(new BlockMatrixChunkingStrategy());
     this.registerAssemblyStrategy(new BlockMatrixAssemblyStrategy());
