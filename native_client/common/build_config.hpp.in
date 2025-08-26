@@ -1,0 +1,54 @@
+// build_config.hpp.in - Template file for build-time configuration
+// This file is processed by CMake's configure_file() to generate build_config.hpp
+#pragma once
+
+// Build-time configuration values
+#cmakedefine HAVE_CUDA
+#cmakedefine HAVE_OPENCL
+#cmakedefine HAVE_VULKAN
+#cmakedefine HAVE_SHADERC
+
+// CUDA configuration
+#ifdef HAVE_CUDA
+#define CUDA_INCLUDE_PATH "@CUDA_INCLUDE_PATH@"
+#else
+#define CUDA_INCLUDE_PATH ""
+#endif
+
+// Version information
+#define PROJECT_NAME "@PROJECT_NAME@"
+#define CMAKE_CXX_STANDARD @CMAKE_CXX_STANDARD@
+
+// Utility macros
+#define STRINGIFY(x) #x
+#define TOSTRING(x) STRINGIFY(x)
+
+namespace BuildConfig {
+    constexpr const char* getCudaIncludePath() {
+        return CUDA_INCLUDE_PATH;
+    }
+    
+    constexpr bool hasCuda() {
+#ifdef HAVE_CUDA
+        return true;
+#else
+        return false;
+#endif
+    }
+    
+    constexpr bool hasOpenCL() {
+#ifdef HAVE_OPENCL
+        return true;
+#else
+        return false;
+#endif
+    }
+    
+    constexpr bool hasVulkan() {
+#ifdef HAVE_VULKAN
+        return true;
+#else
+        return false;
+#endif
+    }
+}

@@ -1,10 +1,12 @@
 // cuda_executor.cpp
 #include "cuda_executor.hpp"
+#include "build_config.hpp"  // Include the generated build configuration
 #include <iostream>
 #include <chrono>
 #include <algorithm>
 #include <sstream>
 #include <set>
+#include <filesystem>
 
 // ================= Error helpers =================
 void CudaExecutor::logCuError(const char* where, CUresult r) {
@@ -149,6 +151,19 @@ bool CudaExecutor::initialize(const json& /*config*/) {
     std::cout << "CUDA initialized on device " << deviceId
               << " (" << deviceName << "), CC " << computeMajor << "." << computeMinor
               << std::endl;
+
+    // Log the CUDA include path that will be used for NVRTC
+    const char* cudaIncludePath = BuildConfig::getCudaIncludePath();
+    if (cudaIncludePath && strlen(cudaIncludePath) > 0) {
+        std::cout << "CUDA include path for NVRTC: " << cudaIncludePath << std::endl;
+        // Verify the path exists
+        if (!std::filesystem::exists(cudaIncludePath)) {
+            std::cerr << "Warning: CUDA include path does not exist: " << cudaIncludePath << std::endl;
+        }
+    } else {
+        std::cerr << "Warning: No CUDA include path configured for NVRTC - CUDA headers may not be found" << std::endl;
+    }
+
     return true;
 }
 
@@ -177,6 +192,8 @@ bool CudaExecutor::compileKernel(const std::string& source,
     if (!nvrtcCheck(nres, "nvrtcCreateProgram")) return false;
 
     std::vector<std::string> optStrings;
+
+    // Basic architecture and standard
     {
         std::ostringstream arch;
         arch << "--gpu-architecture=compute_" << computeMajor << computeMinor;
@@ -184,6 +201,15 @@ bool CudaExecutor::compileKernel(const std::string& source,
     }
     optStrings.push_back("--std=c++14");
 
+    // Add CUDA include path for NVRTC if available
+    const char* cudaIncludePath = BuildConfig::getCudaIncludePath();
+    if (cudaIncludePath && strlen(cudaIncludePath) > 0) {
+        std::string includeFlag = std::string("-I") + cudaIncludePath;
+        optStrings.push_back(includeFlag);
+        std::cout << "Added NVRTC include path: " << includeFlag << std::endl;
+    }
+
+    // Additional compilation options from task
     if (compileOpts.contains("optimization") && compileOpts["optimization"].is_string()) {
         optStrings.push_back(compileOpts["optimization"].get<std::string>());
     }
@@ -193,16 +219,41 @@ bool CudaExecutor::compileKernel(const std::string& source,
         }
     }
 
+    // Additional include paths from compilation options
+    if (compileOpts.contains("includePaths") && compileOpts["includePaths"].is_array()) {
+        for (const auto& path : compileOpts["includePaths"]) {
+            if (path.is_string()) {
+                std::string includeFlag = std::string("-I") + path.get<std::string>();
+                optStrings.push_back(includeFlag);
+                std::cout << "Added additional include path: " << includeFlag << std::endl;
+            }
+        }
+    }
+
     std::vector<const char*> optsC;
     optsC.reserve(optStrings.size());
     for (auto& s : optStrings) optsC.push_back(s.c_str());
+
+    // Log all compilation options
+    std::cout << "NVRTC compilation options:" << std::endl;
+    for (size_t i = 0; i < optStrings.size(); ++i) {
+        std::cout << "  [" << i << "] " << optStrings[i] << std::endl;
+    }
 
     nres = nvrtcCompileProgram(prog, static_cast<int>(optsC.size()), optsC.data());
 
     size_t logSize = 0;
     nvrtcGetProgramLogSize(prog, &logSize);
     std::string log;
-    if (logSize > 1) { log.resize(logSize); nvrtcGetProgramLog(prog, log.data()); }
+    if (logSize > 1) {
+        log.resize(logSize);
+        nvrtcGetProgramLog(prog, log.data());
+        // Always show compilation log if it's not empty (may contain warnings)
+        if (!log.empty() && log != "\n") {
+            std::cout << "NVRTC compilation log:\n" << log << std::endl;
+        }
+    }
+
     if (!nvrtcCheck(nres, "nvrtcCompileProgram", log)) {
         nvrtcDestroyProgram(&prog);
         return false;
@@ -224,6 +275,8 @@ bool CudaExecutor::compileKernel(const std::string& source,
         result.module = nullptr;
         return false;
     }
+
+    std::cout << "NVRTC compilation successful, PTX size: " << ptxSize << " bytes" << std::endl;
     return true;
 }
 
@@ -627,6 +680,7 @@ json CudaExecutor::getCapabilities() const {
     caps["uniformTypes"] = {"int32","uint32","float32","int64","uint64","float64"};
     caps["taskAgnostic"] = true;
     caps["expectsKernelIn"] = "kernel";
+    caps["nvrtcIncludePath"] = BuildConfig::getCudaIncludePath();
 
     if (initialized) {
         caps["device"] = {

@@ -24,6 +24,7 @@ find_package(Threads REQUIRED)
 
 # Optional: CUDA support
 option(ENABLE_CUDA "Enable CUDA support" ON)
+set(CUDA_INCLUDE_PATH "") # Initialize CUDA include path variable
 if(ENABLE_CUDA)
     enable_language(CUDA)
     find_package(CUDAToolkit QUIET)
@@ -203,21 +204,44 @@ endif()
 # Include directories
 include_directories(${CMAKE_CURRENT_SOURCE_DIR})
 
-# Add CUDA include directories if available
+# Add CUDA include directories if available and capture for NVRTC
 if(HAVE_CUDA)
     foreach(_p
-        $ENV{CUDA_HOME}
+        $ENV{CUDA_HOME}/include
         /usr/local/cuda-13/targets/x86_64-linux/include
         /usr/local/cuda-13/include
         /usr/local/cuda/include
+        /usr/include/cuda
     )
         if(_p AND EXISTS "${_p}")
             message(STATUS "Adding CUDA include dir: ${_p}")
             include_directories(BEFORE "${_p}")
+            set(CUDA_INCLUDE_PATH "${_p}")
             break()
         endif()
     endforeach()
+
+    # If we didn't find CUDA headers in standard locations, try to get from CUDAToolkit
+    if(NOT CUDA_INCLUDE_PATH AND CUDAToolkit_FOUND)
+        get_target_property(CUDA_TOOLKIT_INCLUDE_DIRS CUDA::toolkit INTERFACE_INCLUDE_DIRECTORIES)
+        if(CUDA_TOOLKIT_INCLUDE_DIRS)
+            list(GET CUDA_TOOLKIT_INCLUDE_DIRS 0 CUDA_INCLUDE_PATH)
+            message(STATUS "Using CUDAToolkit include path: ${CUDA_INCLUDE_PATH}")
+        endif()
+    endif()
+
+    message(STATUS "CUDA include path for NVRTC: ${CUDA_INCLUDE_PATH}")
 endif()
+
+# Generate config header with build-time information
+configure_file(
+    "${CMAKE_CURRENT_SOURCE_DIR}/common/build_config.hpp.in"
+    "${CMAKE_CURRENT_BINARY_DIR}/generated/build_config.hpp"
+    @ONLY
+)
+
+# Add the generated directory to include path
+include_directories("${CMAKE_CURRENT_BINARY_DIR}/generated")
 
 # Common source files
 set(COMMON_SOURCES
@@ -369,6 +393,9 @@ endif()
 if(HAVE_OPENCL)
     message(STATUS "OpenCL Include: ${OPENCL_INCLUDE_DIR}")
     message(STATUS "OpenCL Library: ${OPENCL_LIBRARY_PATH}")
+endif()
+if(HAVE_CUDA)
+    message(STATUS "CUDA Include Path: ${CUDA_INCLUDE_PATH}")
 endif()
 message(STATUS "====================")
 
