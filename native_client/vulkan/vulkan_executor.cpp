@@ -4,6 +4,7 @@
 #include <stdexcept>
 #include <algorithm>
 #include <chrono>
+#include <sstream>
 
 #ifndef HAVE_SHADERC
   #error "This build requires shaderc: define HAVE_SHADERC and link with shaderc"
@@ -70,7 +71,10 @@ std::vector<uint32_t> compile_glsl_to_spirv(const std::string& source, const std
 VulkanExecutor::VulkanExecutor(int preferredDeviceIndex)
     : preferredDeviceIndex_(preferredDeviceIndex) {}
 
-VulkanExecutor::~VulkanExecutor() { cleanup(); }
+VulkanExecutor::~VulkanExecutor() {
+    cleanupShaderCache();
+    cleanup();
+}
 
 bool VulkanExecutor::initialize(const json&) {
     if (!createInstance()) return false;
@@ -79,7 +83,89 @@ bool VulkanExecutor::initialize(const json&) {
     return true;
 }
 
-void VulkanExecutor::cleanup() { destroyVulkan(); }
+void VulkanExecutor::cleanup() {
+    cleanupShaderCache();
+    destroyVulkan();
+}
+
+void VulkanExecutor::cleanupShaderCache() {
+    if (!device_) return;
+
+    for (auto& [key, shader] : shaderCache_) {
+        if (shader.shaderModule != VK_NULL_HANDLE) {
+            vkDestroyShaderModule(device_, shader.shaderModule, nullptr);
+        }
+    }
+    shaderCache_.clear();
+    std::cout << "Cleaned up Vulkan shader cache" << std::endl;
+}
+
+std::string VulkanExecutor::makeCacheKey(const std::string& source, const std::string& entry, const json& compileOpts) const {
+    std::hash<std::string> hasher;
+    size_t hash = hasher(source);
+    hash ^= (hasher(entry) + 0x9e3779b97f4a7c15ULL + (hash << 6) + (hash >> 2));
+
+    // Include compilation options in hash
+    std::string optsStr = compileOpts.dump();
+    hash ^= (hasher(optsStr) + 0x9e3779b97f4a7c15ULL + (hash << 6) + (hash >> 2));
+
+    std::ostringstream ss;
+    ss << std::hex << hash;
+    return ss.str();
+}
+
+bool VulkanExecutor::getOrCompileShader(const std::string& source, const std::string& entry,
+                                      const json& compileOpts, CompiledShader*& outShader) {
+    std::string cacheKey = makeCacheKey(source, entry, compileOpts);
+
+    // Check if shader is already cached
+    auto it = shaderCache_.find(cacheKey);
+    if (it != shaderCache_.end()) {
+        outShader = &it->second;
+        std::cout << "Using cached GLSL shader (key: " << cacheKey << ")" << std::endl;
+        return true;
+    }
+
+    try {
+        std::cout << "Compiling GLSL shader to SPIR-V (key: " << cacheKey << ")..." << std::endl;
+
+        // Compile GLSL to SPIR-V
+        auto macros = parse_macros(compileOpts);
+        std::vector<uint32_t> spirv = compile_glsl_to_spirv(source, entry, macros);
+
+        // Create Vulkan shader module
+        VkShaderModuleCreateInfo smci{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+        smci.codeSize = spirv.size() * sizeof(uint32_t);
+        smci.pCode = spirv.data();
+
+        VkShaderModule shaderModule = VK_NULL_HANDLE;
+        if (vkCreateShaderModule(device_, &smci, nullptr, &shaderModule) != VK_SUCCESS) {
+            throw std::runtime_error("vkCreateShaderModule failed");
+        }
+
+        // Store in cache
+        CompiledShader compiledShader;
+        compiledShader.spirv = std::move(spirv);
+        compiledShader.shaderModule = shaderModule;
+        compiledShader.entryPoint = entry;
+
+        auto [insertIt, success] = shaderCache_.emplace(cacheKey, std::move(compiledShader));
+        if (success) {
+            outShader = &insertIt->second;
+            std::cout << "GLSL shader compiled and cached successfully (SPIR-V size: "
+                      << outShader->spirv.size() * 4 << " bytes)" << std::endl;
+            return true;
+        } else {
+            // Failed to cache, clean up
+            vkDestroyShaderModule(device_, shaderModule, nullptr);
+            throw std::runtime_error("Failed to cache compiled shader");
+        }
+
+    } catch (const std::exception& e) {
+        std::cerr << "Shader compilation failed: " << e.what() << std::endl;
+        return false;
+    }
+}
 
 json VulkanExecutor::getCapabilities() const {
     json caps;
@@ -89,6 +175,9 @@ json VulkanExecutor::getCapabilities() const {
     caps["supportsMultiOutput"] = true;
     caps["shaderSource"] = "glsl";
     caps["requiresBindings"] = "uniforms at binding 0, inputs first, then outputs (set=0, binding=i)";
+    caps["shaderCache"] = true;
+    caps["shaderCacheSize"] = static_cast<int>(shaderCache_.size());
+
     if (phys_) {
         VkPhysicalDeviceProperties props{};
         vkGetPhysicalDeviceProperties(phys_, &props);
@@ -225,7 +314,7 @@ void VulkanExecutor::destroyBuffer(Buffer& b) const {
     if (b.mem) { vkFreeMemory(device_, b.mem, nullptr); b.mem = VK_NULL_HANDLE; }
 }
 
-// FIXED: Enhanced executeTask with metadata handling
+// FIXED: Enhanced executeTask with metadata handling and shader caching
 TaskResult VulkanExecutor::executeTask(const TaskData& task) {
     TaskResult result{};
     auto t0 = std::chrono::high_resolution_clock::now();
@@ -239,7 +328,6 @@ TaskResult VulkanExecutor::executeTask(const TaskData& task) {
     VkDescriptorSetLayout dsetLayout = VK_NULL_HANDLE;
     VkPipelineLayout pipelineLayout = VK_NULL_HANDLE;
     VkDescriptorPool descPool = VK_NULL_HANDLE;
-    VkShaderModule shaderModule = VK_NULL_HANDLE;
     VkPipeline pipeline = VK_NULL_HANDLE;
 
     try {
@@ -391,24 +479,20 @@ TaskResult VulkanExecutor::executeTask(const TaskData& task) {
         if (vkCreatePipelineLayout(device_, &plci, nullptr, &pipelineLayout) != VK_SUCCESS)
             throw std::runtime_error("vkCreatePipelineLayout failed");
 
-        // Compile GLSL to SPIR-V if kernel provided; otherwise fall back to CPU copy.
+        // NEW: Use cached shader compilation if kernel provided; otherwise fall back to CPU copy.
         bool useGpu = !task.kernel.empty();
-        if (useGpu) {
-            std::cout << "Compiling GLSL shader..." << std::endl;
-            auto macros = parse_macros(task.compilationOptions);
-            std::vector<uint32_t> spirv = compile_glsl_to_spirv(task.kernel,
-                task.entry.empty() ? "main" : task.entry, macros);
+        CompiledShader* cachedShader = nullptr;
 
-            VkShaderModuleCreateInfo smci{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
-            smci.codeSize = spirv.size() * sizeof(uint32_t);
-            smci.pCode = spirv.data();
-            if (vkCreateShaderModule(device_, &smci, nullptr, &shaderModule) != VK_SUCCESS)
-                throw std::runtime_error("vkCreateShaderModule failed");
+        if (useGpu) {
+            const std::string& entry = task.entry.empty() ? "main" : task.entry;
+            if (!getOrCompileShader(task.kernel, entry, task.compilationOptions, cachedShader)) {
+                throw std::runtime_error("Shader compilation failed");
+            }
 
             VkPipelineShaderStageCreateInfo stage{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
             stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
-            stage.module = shaderModule;
-            stage.pName = (task.entry.empty() ? "main" : task.entry.c_str());
+            stage.module = cachedShader->shaderModule;
+            stage.pName = cachedShader->entryPoint.c_str();
 
             VkComputePipelineCreateInfo cpci{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
             cpci.stage = stage;
@@ -563,10 +647,10 @@ TaskResult VulkanExecutor::executeTask(const TaskData& task) {
         // Cleanup resources
         for (auto& b : inputBuffers) destroyBuffer(b);
         for (auto& b : outputBuffers) destroyBuffer(b);
-        if (hasUniforms) destroyBuffer(uniformBuffer);  // FIXED: Clean up uniform buffer
+        if (hasUniforms) destroyBuffer(uniformBuffer);
 
+        // NOTE: Don't destroy cached shader module - it's managed by the cache
         if (pipeline) vkDestroyPipeline(device_, pipeline, nullptr);
-        if (shaderModule) vkDestroyShaderModule(device_, shaderModule, nullptr);
         if (descPool) vkDestroyDescriptorPool(device_, descPool, nullptr);
         if (pipelineLayout) vkDestroyPipelineLayout(device_, pipelineLayout, nullptr);
         if (dsetLayout) vkDestroyDescriptorSetLayout(device_, dsetLayout, nullptr);
@@ -576,15 +660,14 @@ TaskResult VulkanExecutor::executeTask(const TaskData& task) {
         result.success = true;
 
         std::cout << "Task " << task.id << " completed successfully in "
-                  << result.processingTime << "ms" << std::endl;
+                  << result.processingTime << "ms (shader cache size: " << shaderCache_.size() << ")" << std::endl;
         return result;
 
     } catch (const std::exception& e) {
         std::cerr << "Task " << task.id << " failed: " << e.what() << std::endl;
 
-        // Cleanup on error
+        // Cleanup on error (but don't destroy cached shaders)
         if (pipeline) vkDestroyPipeline(device_, pipeline, nullptr);
-        if (shaderModule) vkDestroyShaderModule(device_, shaderModule, nullptr);
         if (descPool) vkDestroyDescriptorPool(device_, descPool, nullptr);
         if (pipelineLayout) vkDestroyPipelineLayout(device_, pipelineLayout, nullptr);
         if (dsetLayout) vkDestroyDescriptorSetLayout(device_, dsetLayout, nullptr);
