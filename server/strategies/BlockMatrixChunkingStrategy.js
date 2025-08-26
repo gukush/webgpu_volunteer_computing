@@ -1,6 +1,9 @@
 // ENHANCED: BlockMatrixChunkingStrategy.js - Now provides framework-specific shaders
 import { BaseChunkingStrategy } from './base/BaseChunkingStrategy.js';
 import fs from 'fs/promises';
+import { info } from './logger.js';
+const __DEBUG_ON__ = (process.env.LOG_LEVEL || '').toLowerCase() === 'debug';
+
 
 export default class BlockMatrixChunkingStrategy extends BaseChunkingStrategy {
   constructor() {
@@ -64,8 +67,8 @@ export default class BlockMatrixChunkingStrategy extends BaseChunkingStrategy {
   async createChunkDescriptors(plan) {
     const { matrixSize, blockSize, blocksPerDim, blockByteSize } = plan.metadata;
     const framework = plan.framework || 'webgpu';
-    console.log(`[STRATEGY DEBUG] createChunkDescriptors called with framework: ${framework}`);
-    console.log(`[STRATEGY DEBUG] Plan framework: ${plan.framework}`);
+    if (__DEBUG_ON__) console.log(`[STRATEGY DEBUG] createChunkDescriptors called with framework: ${framework}`);
+    if (__DEBUG_ON__) console.log(`[STRATEGY DEBUG] Plan framework: ${plan.framework}`);
     // Get input data
     const inputFileRef = (plan.inputRefs || []).find(r => r.name === 'combined_matrix')
                       || (plan.inputRefs || []).find(r => r.name === 'input');
@@ -111,18 +114,18 @@ export default class BlockMatrixChunkingStrategy extends BaseChunkingStrategy {
             } else {
               throw new Error('No input data available');
             }
-            console.log(`[STRATEGY DEBUG] About to create descriptor for framework: ${framework}, chunk: ${i}-${j}-k${k}`);
+            if (__DEBUG_ON__) console.log(`[STRATEGY DEBUG] About to create descriptor for framework: ${framework}, chunk: ${i}-${j}-k${k}`);
             // NEW: Framework-specific descriptor creation
             const descriptor = this.createFrameworkSpecificDescriptor(
               framework, chunkIndex, i, j, k, blockA, blockB, blockSize, matrixSize, plan.parentId, blockByteSize
             );
-            console.log(`[STRATEGY DEBUG] Created descriptor keys:`, Object.keys(descriptor));
-            console.log(`[STRATEGY DEBUG] Descriptor has webglVertexShader:`, !!descriptor.webglVertexShader);
-            console.log(`[STRATEGY DEBUG] Descriptor has kernel:`, !!descriptor.kernel);
-            console.log(`[STRATEGY DEBUG] Descriptor framework:`, descriptor.framework);
+            if (__DEBUG_ON__) console.log(`[STRATEGY DEBUG] Created descriptor keys:`, Object.keys(descriptor));
+            if (__DEBUG_ON__) console.log(`[STRATEGY DEBUG] Descriptor has webglVertexShader:`, !!descriptor.webglVertexShader);
+            if (__DEBUG_ON__) console.log(`[STRATEGY DEBUG] Descriptor has kernel:`, !!descriptor.kernel);
+            if (__DEBUG_ON__) console.log(`[STRATEGY DEBUG] Descriptor framework:`, descriptor.framework);
             if (descriptor.webglVertexShader) {
-              console.log(`[STRATEGY DEBUG] WebGL vertex shader length:`, descriptor.webglVertexShader.length);
-              console.log(`[STRATEGY DEBUG] WebGL vertex shader preview:`, descriptor.webglVertexShader.substring(0, 100) + '...');
+              if (__DEBUG_ON__) console.log(`[STRATEGY DEBUG] WebGL vertex shader length:`, descriptor.webglVertexShader.length);
+              if (__DEBUG_ON__) console.log(`[STRATEGY DEBUG] WebGL vertex shader preview:`, descriptor.webglVertexShader.substring(0, 100) + '...');
             }
             descriptors.push(descriptor);
             chunkIndex++;
@@ -149,10 +152,10 @@ async createChunkDescriptorsStreaming(plan, dispatchCallback) {
   const { matrixSize, blockSize, blocksPerDim, blockByteSize } = plan.metadata;
   const framework = plan.framework || 'webgpu';
 
-  console.log(` [CHUNKING STRATEGY] Starting streaming chunk creation`);
-  console.log(` [CHUNKING STRATEGY] Framework: ${framework}`);
-  console.log(` [CHUNKING STRATEGY] Matrix: ${matrixSize}x${matrixSize}, Block: ${blockSize}x${blockSize}`);
-  console.log(` [CHUNKING STRATEGY] Expected chunks: ${blocksPerDim * blocksPerDim * blocksPerDim}`);
+  if (__DEBUG_ON__) console.log(` [CHUNKING STRATEGY] Starting streaming chunk creation`);
+  if (__DEBUG_ON__) console.log(` [CHUNKING STRATEGY] Framework: ${framework}`);
+  if (__DEBUG_ON__) console.log(` [CHUNKING STRATEGY] Matrix: ${matrixSize}x${matrixSize}, Block: ${blockSize}x${blockSize}`);
+  if (__DEBUG_ON__) console.log(` [CHUNKING STRATEGY] Expected chunks: ${blocksPerDim * blocksPerDim * blocksPerDim}`);
 
   // Get input data (same logic as batch mode)
   const inputFileRef = (plan.inputRefs || []).find(r => r.name === 'combined_matrix')
@@ -251,7 +254,7 @@ async createChunkDescriptorsStreaming(plan, dispatchCallback) {
       console.warn(`️  Streaming completed with ${errors.length} errors out of ${totalExpected} chunks`);
     }
 
-    console.log(` Streaming chunk creation completed: ${dispatchedCount}/${totalExpected} chunks dispatched`);
+    if (__DEBUG_ON__) console.log(` Streaming chunk creation completed: ${dispatchedCount}/${totalExpected} chunks dispatched`);
 
     return {
       success: true,
@@ -297,7 +300,7 @@ async createChunkDescriptorsStreaming(plan, dispatchCallback) {
 
   // NEW: Create framework-specific chunk descriptors
   createFrameworkSpecificDescriptor(framework, chunkIndex, i, j, k, blockA, blockB, blockSize, matrixSize, parentId, blockByteSize) {
-    console.log(`[STRATEGY DEBUG] createFrameworkSpecificDescriptor called with framework: ${framework}`);
+    if (__DEBUG_ON__) console.log(`[STRATEGY DEBUG] createFrameworkSpecificDescriptor called with framework: ${framework}`);
     const baseDescriptor = {
       chunkId: `block-${i}-${j}-k${k}`,
       chunkIndex,
@@ -311,7 +314,7 @@ async createChunkDescriptorsStreaming(plan, dispatchCallback) {
       metadata: { block_size: blockSize, matrix_size: matrixSize },
       assemblyMetadata: { outputBlockRow: i, outputBlockCol: j, kIndex: k }
     };
-    console.log(`[STRATEGY DEBUG] Base descriptor created, framework: ${framework}`);
+    if (__DEBUG_ON__) console.log(`[STRATEGY DEBUG] Base descriptor created, framework: ${framework}`);
 
     switch (framework) {
       case 'webgpu':
@@ -323,12 +326,12 @@ async createChunkDescriptorsStreaming(plan, dispatchCallback) {
         };
 
       case 'webgl':
-        console.log(`[STRATEGY DEBUG] Creating WebGL descriptor`);
+        if (__DEBUG_ON__) console.log(`[STRATEGY DEBUG] Creating WebGL descriptor`);
         const webglVertexShader = this.getWebGLVertexShader();
         const webglFragmentShader = this.getWebGLFragmentShader();
-        console.log(`[STRATEGY DEBUG] Retrieved WebGL shaders:`);
-        console.log(`[STRATEGY DEBUG] - Vertex shader length:`, webglVertexShader ? webglVertexShader.length : 'undefined');
-        console.log(`[STRATEGY DEBUG] - Fragment shader length:`, webglFragmentShader ? webglFragmentShader.length : 'undefined');
+        if (__DEBUG_ON__) console.log(`[STRATEGY DEBUG] Retrieved WebGL shaders:`);
+        if (__DEBUG_ON__) console.log(`[STRATEGY DEBUG] - Vertex shader length:`, webglVertexShader ? webglVertexShader.length : 'undefined');
+        if (__DEBUG_ON__) console.log(`[STRATEGY DEBUG] - Fragment shader length:`, webglFragmentShader ? webglFragmentShader.length : 'undefined');
 
         const descriptor = {
           ...baseDescriptor,
@@ -345,8 +348,8 @@ async createChunkDescriptorsStreaming(plan, dispatchCallback) {
           }
         };
 
-        console.log(`[STRATEGY DEBUG] Final descriptor keys:`, Object.keys(descriptor));
-        console.log(`[STRATEGY DEBUG] Has webglVertexShader:`, !!descriptor.webglVertexShader);
+        if (__DEBUG_ON__) console.log(`[STRATEGY DEBUG] Final descriptor keys:`, Object.keys(descriptor));
+        if (__DEBUG_ON__) console.log(`[STRATEGY DEBUG] Has webglVertexShader:`, !!descriptor.webglVertexShader);
         return descriptor;
       case 'javascript':
       return {
@@ -361,7 +364,7 @@ async createChunkDescriptorsStreaming(plan, dispatchCallback) {
         }
       };
       case 'vulkan':  // NEW: Add Vulkan support
-        console.log(`[STRATEGY DEBUG] Creating Vulkan descriptor`);
+        if (__DEBUG_ON__) console.log(`[STRATEGY DEBUG] Creating Vulkan descriptor`);
         return {
           ...baseDescriptor,
           kernel: this.getVulkanShader(),

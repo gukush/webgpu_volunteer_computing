@@ -1,6 +1,9 @@
 // ENHANCED: EnhancedChunkingManager.js - Complete version with streaming support
 import { ChunkingStrategyRegistry } from './ChunkingStrategyRegistry.js';
 import { v4 as uuidv4 } from 'uuid';
+import { info } from './logger.js';
+const __DEBUG_ON__ = (process.env.LOG_LEVEL || '').toLowerCase() === 'debug';
+
 
 export class EnhancedChunkingManager {
   constructor() {
@@ -98,9 +101,9 @@ export class EnhancedChunkingManager {
         framework: workload.framework
       };
 
-      console.log(`[CHUNKING MANAGER DEBUG] Plan framework: ${plan.framework}`);
-      console.log(`[CHUNKING MANAGER DEBUG] Workload framework: ${workload.framework}`);
-      console.log(`[STREAMING] Processing workload ${workload.id} in ${streamingMode ? 'streaming' : 'batch'} mode`);
+      if (__DEBUG_ON__) console.log(`[CHUNKING MANAGER DEBUG] Plan framework: ${plan.framework}`);
+      if (__DEBUG_ON__) console.log(`[CHUNKING MANAGER DEBUG] Workload framework: ${workload.framework}`);
+      if (__DEBUG_ON__) console.log(`[STREAMING] Processing workload ${workload.id} in ${streamingMode ? 'streaming' : 'batch'} mode`);
 
       // Check for multi-phase execution
       if (plan.executionModel === 'iterative_refinement') {
@@ -116,11 +119,11 @@ export class EnhancedChunkingManager {
       // Initialize streaming assembly if supported
       let assembler = null;
       if (streamingMode && this.supportsStreamingAssembly(workload.assemblyStrategy)) {
-        console.log(` Initializing streaming assembly for ${workload.id} with strategy: ${workload.assemblyStrategy}`);
+        if (__DEBUG_ON__) console.log(` Initializing streaming assembly for ${workload.id} with strategy: ${workload.assemblyStrategy}`);
         try {
           assembler = await this.initializeStreamingAssembly(workload, fullPlan);
           this.streamingAssemblers.set(workload.id, assembler);
-          console.log(` Streaming assembler initialized for ${workload.id}`);
+          info.bind(null, 'STREAMING')(`Streaming assembler initialized for ${workload.id}`);
         } catch (assemblyError) {
           console.error(` Failed to initialize streaming assembler:`, assemblyError);
           return {
@@ -142,7 +145,7 @@ export class EnhancedChunkingManager {
         const dispatchCallback = this.createDispatchCallback(workload.id);
         result = await chunkingStrategy.createChunkDescriptorsStreaming(fullPlan, dispatchCallback);
 
-        console.log(` Streaming chunk creation started for ${workload.id}`);
+        if (__DEBUG_ON__) console.log(` Streaming chunk creation started for ${workload.id}`);
 
         return {
           success: true,
@@ -207,7 +210,7 @@ export class EnhancedChunkingManager {
       throw new Error(`Assembly strategy '${assemblyStrategyName}' not found`);
     }
 
-    console.log(` Initializing streaming assembly with ${assemblyStrategyName}`);
+    if (__DEBUG_ON__) console.log(` Initializing streaming assembly with ${assemblyStrategyName}`);
 
     // Initialize the assembly strategy's output store
     if (typeof assemblyStrategy.initOutputStore === 'function') {
@@ -242,7 +245,7 @@ export class EnhancedChunkingManager {
         throw new Error('Invalid chunk descriptor');
       }
 
-      console.log(` Dispatching chunk ${chunkDescriptor.chunkId} for workload ${workloadId}`);
+      if (__DEBUG_ON__) console.log(` Dispatching chunk ${chunkDescriptor.chunkId} for workload ${workloadId}`);
 
       // Add to active workload tracking
       const workload = this.activeWorkloads.get(workloadId);
@@ -357,13 +360,13 @@ export class EnhancedChunkingManager {
         assemblyMetadata: chunkDescriptor.assemblyMetadata
       };
 
-      console.log(` Processing streaming chunk result: ${chunkId}`);
+      if (__DEBUG_ON__) console.log(` Processing streaming chunk result: ${chunkId}`);
 
       // Process through streaming assembler
       const assemblyResult = await assembler.processChunkResult(chunkResult);
 
       if (assemblyResult.success && assemblyResult.complete) {
-        console.log(` Streaming assembly completed for workload ${parentId}!`);
+        info.bind(null, 'STREAMING')(`Streaming assembly completed for workload ${parentId}!`);
 
         // Clean up
         this.streamingAssemblers.delete(parentId);
@@ -402,7 +405,7 @@ export class EnhancedChunkingManager {
    * Handle streaming assembly completion
    */
   async handleStreamingAssemblyComplete(workloadId, result) {
-    console.log(` Streaming assembly completed for workload ${workloadId}`);
+    info.bind(null, 'STREAMING')(`Streaming assembly completed for workload ${workloadId}`);
 
     // Emit completion event (this would be handled by server)
     if (typeof this.onWorkloadComplete === 'function') {
@@ -422,7 +425,7 @@ export class EnhancedChunkingManager {
    * Emit assembly progress events
    */
   emitAssemblyProgress(workloadId, progress) {
-    console.log(` Assembly progress for ${workloadId}: ${progress.completedBlocks}/${progress.totalBlocks} blocks (${progress.progress.toFixed(1)}%)`);
+    if (__DEBUG_ON__) console.log(` Assembly progress for ${workloadId}: ${progress.completedBlocks}/${progress.totalBlocks} blocks (${progress.progress.toFixed(1)}%)`);
 
     // This would be handled by the server to emit to clients
     if (typeof this.onAssemblyProgress === 'function') {
@@ -460,7 +463,7 @@ export class EnhancedChunkingManager {
     }
 
     this.activeWorkloads.set(workloadId, workloadInfo);
-    console.log(` Registered ${streamingMode ? 'streaming' : 'batch'} workload ${workloadId}`);
+    if (__DEBUG_ON__) console.log(` Registered ${streamingMode ? 'streaming' : 'batch'} workload ${workloadId}`);
   }
 
   /**
@@ -621,7 +624,7 @@ export class EnhancedChunkingManager {
    * Process an iterative workload with multiple phases
    */
   async processIterativeWorkload(workload, plan, strategy) {
-    console.log(`Starting iterative workload ${workload.id} with ${plan.totalPhases} phases`);
+    if (__DEBUG_ON__) console.log(`Starting iterative workload ${workload.id} with ${plan.totalPhases} phases`);
 
     // Initialize global state
     let globalState = {
@@ -634,7 +637,7 @@ export class EnhancedChunkingManager {
     for (let phaseIndex = 0; phaseIndex < plan.phases.length; phaseIndex++) {
       const phase = plan.phases[phaseIndex];
 
-      console.log(`Executing phase ${phaseIndex + 1}/${plan.phases.length}: ${phase.phaseId}`);
+      if (__DEBUG_ON__) console.log(`Executing phase ${phaseIndex + 1}/${plan.phases.length}: ${phase.phaseId}`);
 
       // Create chunk descriptors for this phase
       const phaseChunks = strategy.createPhaseChunkDescriptors(plan, phase, globalState);
@@ -653,7 +656,7 @@ export class EnhancedChunkingManager {
 
       // Check if we should continue
       if (!strategy.shouldContinue(globalState, phase, plan)) {
-        console.log(`Early termination after phase ${phase.phaseId}`);
+        if (__DEBUG_ON__) console.log(`Early termination after phase ${phase.phaseId}`);
         break;
       }
     }
@@ -661,7 +664,7 @@ export class EnhancedChunkingManager {
     // Assemble final result
     const finalResult = strategy.assembleFinalResult(globalState, plan);
 
-    console.log(` Iterative workload ${workload.id} completed after ${globalState.completedPhases} phases`);
+    if (__DEBUG_ON__) console.log(` Iterative workload ${workload.id} completed after ${globalState.completedPhases} phases`);
 
     return {
       success: true,
@@ -755,11 +758,11 @@ export class EnhancedChunkingManager {
     const completedCount = workload.completedChunks.size;
     const totalChunks = workload.streamingMode ? workload.expectedTotalChunks : workload.totalChunks;
 
-    console.log(` Chunk progress for ${parentId}: ${completedCount}/${totalChunks} chunks (${results.length} outputs)`);
+    if (__DEBUG_ON__) console.log(` Chunk progress for ${parentId}: ${completedCount}/${totalChunks} chunks (${results.length} outputs)`);
 
     // Check if all chunks are complete
     if (completedCount === totalChunks) {
-      console.log(` All chunks completed for ${parentId}, ready for assembly`);
+      if (__DEBUG_ON__) console.log(` All chunks completed for ${parentId}, ready for assembly`);
 
       return {
         success: true,
@@ -868,7 +871,7 @@ export class EnhancedChunkingManager {
     this.streamingAssemblers.delete(workloadId);
 
     if (removed) {
-      console.log(` Cleaned up workload ${workloadId}`);
+      if (__DEBUG_ON__) console.log(` Cleaned up workload ${workloadId}`);
     }
 
     return removed;

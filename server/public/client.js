@@ -1,3 +1,10 @@
+// --- lightweight client logger (debug guard) ---
+(function(){
+  const q = new URLSearchParams(location.search);
+  const lvl = (window.LOG_LEVEL || q.get('log') || 'info').toLowerCase();
+  window.__DEBUG_ON__ = lvl === 'debug';
+})();
+// -----------------------------------------------
 // client.js - Complete Enhanced Version
 const state = {
   webgpuSupported: false,
@@ -103,8 +110,8 @@ const socket = io({
 socket.on("connect_error", (err) => {
   console.error("[client] connect_error", err);
 });
-socket.io.on("reconnect_attempt", n => console.log("reconnect_attempt", n));
-socket.io.on("upgrade", t => console.log("upgraded to", t && t.name));
+socket.io.on("reconnect_attempt", n => (__DEBUG_ON__ ? console.log : function(){})("reconnect_attempt", n));
+socket.io.on("upgrade", t => (__DEBUG_ON__ ? console.log : function(){})("upgraded to", t && t.name));
 // Enhanced: Multi-framework capability detection
 async function detectFrameworkCapabilities() {
   const capabilities = {
@@ -128,7 +135,7 @@ async function detectFrameworkCapabilities() {
 
         frameworkState.webgpu = { supported: true, device, adapterInfo };
         capabilities.supportedFrameworks.push('webgpu');
-        console.log('WebGPU available!')
+        (__DEBUG_ON__ ? console.log : function(){})('WebGPU available!')
       }
     } catch (e) {
       console.warn('WebGPU not available:', e.message);
@@ -173,7 +180,7 @@ async function detectFrameworkCapabilities() {
         renderer: gl.getParameter(gl.RENDERER)
       };
       capabilities.supportedFrameworks.push('webgl');
-      console.log(`[WebGL] Detection successful:`, {
+      (__DEBUG_ON__ ? console.log : function(){})(`[WebGL] Detection successful:`, {
         version: frameworkState.webgl.version,
         vendor: frameworkState.webgl.vendor,
         canCompute: true,
@@ -199,14 +206,14 @@ async function detectFrameworkCapabilities() {
     cores: navigator.hardwareConcurrency || 4
   };
 
-  console.log(`[JavaScript] CPU framework available with ${frameworkState.javascript.cores} logical cores`);
+  (__DEBUG_ON__ ? console.log : function(){})(`[JavaScript] CPU framework available with ${frameworkState.javascript.cores} logical cores`);
 
   return capabilities;
 }
 
 async function executeUnifiedChunk(chunk) {
-  console.log(`[UNIFIED] Starting execution for ${chunk.chunkId}`);
-  console.log(`[UNIFIED] Chunk structure:`, {
+  (__DEBUG_ON__ ? console.log : function(){})(`[UNIFIED] Starting execution for ${chunk.chunkId}`);
+  (__DEBUG_ON__ ? console.log : function(){})(`[UNIFIED] Chunk structure:`, {
     hasInputs: !!chunk.inputs,
     inputsLength: chunk.inputs?.length || 0,
     hasOutputs: !!chunk.outputs,
@@ -235,7 +242,7 @@ async function executeUnifiedChunk(chunk) {
 
   try {
     // Create shader module
-    console.log(`[UNIFIED] Creating shader module...`);
+    (__DEBUG_ON__ ? console.log : function(){})(`[UNIFIED] Creating shader module...`);
     const shaderCode = chunk.kernel || chunk.wgsl;
     const shader = state.device.createShaderModule({
       code: shaderCode
@@ -259,7 +266,7 @@ async function executeUnifiedChunk(chunk) {
 
     // Handle uniforms/metadata
     if (chunk.metadata && Object.keys(chunk.metadata).length > 0) {
-      console.log(`[UNIFIED] Setting up uniforms from metadata:`, chunk.metadata);
+      (__DEBUG_ON__ ? console.log : function(){})(`[UNIFIED] Setting up uniforms from metadata:`, chunk.metadata);
 
       // Create uniform array from metadata
       const uniformValues = [];
@@ -297,13 +304,13 @@ async function executeUnifiedChunk(chunk) {
         });
         buffers.push(uniformBuffer);
 
-        console.log(`[UNIFIED] Created uniform buffer with ${uniformValues.length} values at binding ${bindingIndex - 1}`);
+        (__DEBUG_ON__ ? console.log : function(){})(`[UNIFIED] Created uniform buffer with ${uniformValues.length} values at binding ${bindingIndex - 1}`);
       }
     }
 
     // Handle inputs
     if (chunk.inputs && chunk.inputs.length > 0) {
-      console.log(`[UNIFIED] Processing ${chunk.inputs.length} inputs`);
+      (__DEBUG_ON__ ? console.log : function(){})(`[UNIFIED] Processing ${chunk.inputs.length} inputs`);
 
       for (let i = 0; i < chunk.inputs.length; i++) {
         const input = chunk.inputs[i];
@@ -331,7 +338,7 @@ async function executeUnifiedChunk(chunk) {
           });
           buffers.push(inputBuffer);
 
-          console.log(`[UNIFIED] Input ${input.name || i}: ${inputBytes.length} bytes at binding ${bindingIndex - 1}`);
+          (__DEBUG_ON__ ? console.log : function(){})(`[UNIFIED] Input ${input.name || i}: ${inputBytes.length} bytes at binding ${bindingIndex - 1}`);
         } catch (err) {
           console.error(`[UNIFIED] Failed to process input ${i}:`, err);
           throw new Error(`Failed to decode input ${input.name || i}: ${err.message}`);
@@ -341,7 +348,7 @@ async function executeUnifiedChunk(chunk) {
 
     // Handle outputs
     const outputBuffers = [];
-    console.log(`[UNIFIED] Creating ${chunk.outputs.length} output buffers`);
+    (__DEBUG_ON__ ? console.log : function(){})(`[UNIFIED] Creating ${chunk.outputs.length} output buffers`);
 
     for (let i = 0; i < chunk.outputs.length; i++) {
       const output = chunk.outputs[i];
@@ -362,7 +369,7 @@ async function executeUnifiedChunk(chunk) {
       buffers.push(outputBuffer);
       outputBuffers.push(outputBuffer);
 
-      console.log(`[UNIFIED] Output ${output.name || i}: ${output.size} bytes at binding ${bindingIndex - 1}`);
+      (__DEBUG_ON__ ? console.log : function(){})(`[UNIFIED] Output ${output.name || i}: ${output.size} bytes at binding ${bindingIndex - 1}`);
     }
 
     // Create bind group and execute
@@ -372,7 +379,7 @@ async function executeUnifiedChunk(chunk) {
     });
 
     const workgroupCount = chunk.workgroupCount || [1, 1, 1];
-    console.log(`[UNIFIED] Dispatching workgroups:`, workgroupCount);
+    (__DEBUG_ON__ ? console.log : function(){})(`[UNIFIED] Dispatching workgroups:`, workgroupCount);
 
     const encoder = state.device.createCommandEncoder();
     const computePass = encoder.beginComputePass();
@@ -408,7 +415,7 @@ async function executeUnifiedChunk(chunk) {
       const resultBase64 = btoa(String.fromCharCode(...resultBytes));
       results.push(resultBase64);
 
-      console.log(`[UNIFIED] Output ${i}: ${resultBytes.length} bytes -> ${resultBase64.length} chars base64`);
+      (__DEBUG_ON__ ? console.log : function(){})(`[UNIFIED] Output ${i}: ${resultBytes.length} bytes -> ${resultBase64.length} chars base64`);
     }
 
     // Cleanup buffers
@@ -416,7 +423,7 @@ async function executeUnifiedChunk(chunk) {
     readBuffers.forEach(buffer => buffer.destroy());
 
     const dt = performance.now() - t0;
-    console.log(`[UNIFIED] Chunk ${chunk.chunkId} completed in ${dt.toFixed(0)}ms`);
+    (__DEBUG_ON__ ? console.log : function(){})(`[UNIFIED] Chunk ${chunk.chunkId} completed in ${dt.toFixed(0)}ms`);
 
     return {
       results: results,
@@ -444,7 +451,7 @@ function createUniformArrayFromSchema(metadata, uniformDef) {
 // Enhanced: Multi-input, multi-framework execution
 /*
 async function executeEnhancedChunk(chunk) {
-  console.log(`[ENHANCED] Starting execution for ${chunk.chunkId} with strategy ${chunk.chunkingStrategy || 'unknown'}`);
+  (__DEBUG_ON__ ? console.log : function(){})(`[ENHANCED] Starting execution for ${chunk.chunkId} with strategy ${chunk.chunkingStrategy || 'unknown'}`);
 
   if (!state.device) {
     throw new Error('No GPU device available');
@@ -457,7 +464,7 @@ async function executeEnhancedChunk(chunk) {
   const t0 = performance.now();
 
   try {
-    console.log(`[ENHANCED] Creating shader module...`);
+    (__DEBUG_ON__ ? console.log : function(){})(`[ENHANCED] Creating shader module...`);
     const shader = state.device.createShaderModule({
       code: chunk.kernel || chunk.wgsl
     });
@@ -481,7 +488,7 @@ async function executeEnhancedChunk(chunk) {
 
     // Enhanced: Handle multiple inputs based on schema
     if (chunk.inputSchema && chunk.chunkInputs) {
-      console.log(`[MULTI-INPUT] Processing chunk with ${chunk.inputSchema.inputs.length} inputs`);
+      (__DEBUG_ON__ ? console.log : function(){})(`[MULTI-INPUT] Processing chunk with ${chunk.inputSchema.inputs.length} inputs`);
 
       // Handle uniforms first
       for (const uniformDef of chunk.inputSchema.uniforms || []) {
@@ -513,7 +520,7 @@ async function executeEnhancedChunk(chunk) {
 
       // Add uniforms buffer if present
       if (chunk.uniforms && Object.keys(chunk.uniforms).length > 0) {
-        console.log(`[ENHANCED] Setting up uniforms:`, chunk.uniforms);
+        (__DEBUG_ON__ ? console.log : function(){})(`[ENHANCED] Setting up uniforms:`, chunk.uniforms);
 
         const uniformArray = createUniformArray(chunk.uniforms, chunk.chunkingStrategy);
 
@@ -543,7 +550,7 @@ async function executeEnhancedChunk(chunk) {
       }
 
       // Create output buffer
-      console.log(`[ENHANCED] Creating output buffer: ${chunk.outputSize} bytes`);
+      (__DEBUG_ON__ ? console.log : function(){})(`[ENHANCED] Creating output buffer: ${chunk.outputSize} bytes`);
       const outputBuffer = state.device.createBuffer({
         size: Math.max(16, parseInt(chunk.outputSize)),
         usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC
@@ -557,7 +564,7 @@ async function executeEnhancedChunk(chunk) {
       entries
     });
 
-    console.log(`[ENHANCED] Dispatching workgroups:`, chunk.workgroupCount);
+    (__DEBUG_ON__ ? console.log : function(){})(`[ENHANCED] Dispatching workgroups:`, chunk.workgroupCount);
     const encoder = state.device.createCommandEncoder();
     const computePass = encoder.beginComputePass();
     computePass.setPipeline(pipeline);
@@ -580,7 +587,7 @@ async function executeEnhancedChunk(chunk) {
     readBuffer.unmap();
 
     const dt = performance.now() - t0;
-    console.log(`[ENHANCED] Chunk ${chunk.chunkId} completed in ${dt.toFixed(0)}ms, ${resultBytes.length} bytes output`);
+    (__DEBUG_ON__ ? console.log : function(){})(`[ENHANCED] Chunk ${chunk.chunkId} completed in ${dt.toFixed(0)}ms, ${resultBytes.length} bytes output`);
 
     const resultBase64 = btoa(String.fromCharCode(...resultBytes));
 
@@ -691,7 +698,7 @@ async function executeFrameworkKernel(meta) {
 }
 
 async function executeJavaScriptCompute(chunk) {
-  console.log(`[JavaScript] Starting CPU execution for ${chunk.chunkId || chunk.id}`);
+  (__DEBUG_ON__ ? console.log : function(){})(`[JavaScript] Starting CPU execution for ${chunk.chunkId || chunk.id}`);
 
   const outputs = chunk.outputs || [];
   if (outputs.length === 0) {
@@ -719,13 +726,13 @@ async function executeJavaScriptCompute(chunk) {
     const blockSize = metadata.block_size || metadata.blockSize || 64;
     const matrixSize = metadata.matrix_size || metadata.matrixSize || 512;
 
-    console.log(`[JavaScript] Processing block: ${blockSize}x${blockSize}, matrix: ${matrixSize}x${matrixSize}`);
+    (__DEBUG_ON__ ? console.log : function(){})(`[JavaScript] Processing block: ${blockSize}x${blockSize}, matrix: ${matrixSize}x${matrixSize}`);
 
     let results = [];
 
     // Execute dynamic kernel if provided by server
     if (chunk.kernel && chunk.entry) {
-      console.log(`[JavaScript] Executing dynamic kernel: ${chunk.entry}`);
+      (__DEBUG_ON__ ? console.log : function(){})(`[JavaScript] Executing dynamic kernel: ${chunk.entry}`);
 
       try {
         // Create execution context with inputs and metadata available
@@ -748,11 +755,11 @@ async function executeJavaScriptCompute(chunk) {
           throw new Error('Kernel must return Float32Array');
         }
 
-        console.log(`[JavaScript] Dynamic kernel executed successfully`);
+        (__DEBUG_ON__ ? console.log : function(){})(`[JavaScript] Dynamic kernel executed successfully`);
 
       } catch (kernelError) {
         console.error(`[JavaScript] Dynamic kernel execution failed:`, kernelError);
-        console.log(`[JavaScript] Falling back to built-in implementation`);
+        (__DEBUG_ON__ ? console.log : function(){})(`[JavaScript] Falling back to built-in implementation`);
 
         // Fallback to built-in implementation
         if (inputs.length >= 2) {
@@ -764,7 +771,7 @@ async function executeJavaScriptCompute(chunk) {
       }
     } else {
       // No dynamic kernel - use built-in implementations
-      console.log(`[JavaScript] Using built-in computation (no dynamic kernel provided)`);
+      (__DEBUG_ON__ ? console.log : function(){})(`[JavaScript] Using built-in computation (no dynamic kernel provided)`);
 
       if (inputs.length >= 2) {
         // Matrix block multiplication
@@ -792,7 +799,7 @@ async function executeJavaScriptCompute(chunk) {
     });
 
     const dt = performance.now() - t0;
-    console.log(`[JavaScript] Computation completed in ${dt.toFixed(0)}ms`);
+    (__DEBUG_ON__ ? console.log : function(){})(`[JavaScript] Computation completed in ${dt.toFixed(0)}ms`);
 
     return {
       results: base64Results,
@@ -807,7 +814,7 @@ async function executeJavaScriptCompute(chunk) {
 }
 
 async function executeWGSL(meta) {
-  console.log(`[HEADLESS] Starting WGSL execution for ${meta.id || meta.chunkId}`);
+  (__DEBUG_ON__ ? console.log : function(){})(`[HEADLESS] Starting WGSL execution for ${meta.id || meta.chunkId}`);
 
   if (!state.device) {
     throw new Error('No GPU device available');
@@ -820,10 +827,10 @@ async function executeWGSL(meta) {
   const t0 = performance.now();
 
   try {
-    console.log(`[HEADLESS] Creating shader module...`);
+    (__DEBUG_ON__ ? console.log : function(){})(`[HEADLESS] Creating shader module...`);
     const shader = state.device.createShaderModule({ code: meta.wgsl || meta.kernel });
 
-    console.log(`[HEADLESS] Getting compilation info...`);
+    (__DEBUG_ON__ ? console.log : function(){})(`[HEADLESS] Getting compilation info...`);
     const ci = await shader.getCompilationInfo();
     if (ci.messages.some(m => m.type === 'error')) {
       const errors = ci.messages.filter(m => m.type === 'error').map(m => m.message).join('\n');
@@ -831,7 +838,7 @@ async function executeWGSL(meta) {
       throw new Error(`Shader compilation failed: ${errors}`);
     }
 
-    console.log(`[HEADLESS] Creating compute pipeline...`);
+    (__DEBUG_ON__ ? console.log : function(){})(`[HEADLESS] Creating compute pipeline...`);
     const pipeline = state.device.createComputePipeline({
       layout: 'auto',
       compute: {
@@ -880,7 +887,7 @@ async function executeWGSL(meta) {
       entries.push({ binding: binding++, resource: { buffer: inBuf } });
     }
 
-    console.log(`[HEADLESS] Creating output buffer with size: ${meta.outputSize} bytes`);
+    (__DEBUG_ON__ ? console.log : function(){})(`[HEADLESS] Creating output buffer with size: ${meta.outputSize} bytes`);
     const outBuf = state.device.createBuffer({
       size: Math.max(16, parseInt(meta.outputSize)),
       usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC
@@ -892,7 +899,7 @@ async function executeWGSL(meta) {
       entries
     });
 
-    console.log(`[HEADLESS] Dispatching workgroups: ${meta.workgroupCount}`);
+    (__DEBUG_ON__ ? console.log : function(){})(`[HEADLESS] Dispatching workgroups: ${meta.workgroupCount}`);
     const enc = state.device.createCommandEncoder();
     const pass = enc.beginComputePass();
     pass.setPipeline(pipeline);
@@ -912,7 +919,7 @@ async function executeWGSL(meta) {
     readBuf.unmap();
 
     const dt = performance.now() - t0;
-    console.log(`[HEADLESS] WGSL completed in ${dt.toFixed(0)}ms, ${resultBytes.length} bytes output`);
+    (__DEBUG_ON__ ? console.log : function(){})(`[HEADLESS] WGSL completed in ${dt.toFixed(0)}ms, ${resultBytes.length} bytes output`);
 
     const resultBase64 = btoa(String.fromCharCode(...resultBytes));
 
@@ -932,7 +939,7 @@ async function executeWGSL(meta) {
 
 
 async function executeWebGPUCompute(chunk) {
-  console.log(`[WebGPU] Starting compute execution for ${chunk.chunkId || chunk.id}`);
+  (__DEBUG_ON__ ? console.log : function(){})(`[WebGPU] Starting compute execution for ${chunk.chunkId || chunk.id}`);
 
   if (!state.device) {
     throw new Error('No WebGPU device available');
@@ -949,7 +956,7 @@ async function executeWebGPUCompute(chunk) {
 
   try {
     // Create shader module from strategy-provided WGSL
-    console.log(`[WebGPU] Creating shader module...`);
+    (__DEBUG_ON__ ? console.log : function(){})(`[WebGPU] Creating shader module...`);
     const shaderCode = chunk.kernel || chunk.wgsl;
     if (!shaderCode) {
       throw new Error('No WGSL shader code provided by strategy');
@@ -979,7 +986,7 @@ async function executeWebGPUCompute(chunk) {
 
     // Handle uniforms/metadata from strategy
     if (chunk.metadata && Object.keys(chunk.metadata).length > 0) {
-      console.log(`[WebGPU] Setting up uniforms from metadata:`, chunk.metadata);
+      (__DEBUG_ON__ ? console.log : function(){})(`[WebGPU] Setting up uniforms from metadata:`, chunk.metadata);
 
       // Create uniform array from metadata fields
       const uniformValues = [];
@@ -1017,13 +1024,13 @@ async function executeWebGPUCompute(chunk) {
         });
         buffers.push(uniformBuffer);
 
-        console.log(`[WebGPU] Created uniform buffer with ${uniformValues.length} values at binding ${bindingIndex - 1}`);
+        (__DEBUG_ON__ ? console.log : function(){})(`[WebGPU] Created uniform buffer with ${uniformValues.length} values at binding ${bindingIndex - 1}`);
       }
     }
 
     // Handle inputs from strategy
     if (chunk.inputs && chunk.inputs.length > 0) {
-      console.log(`[WebGPU] Processing ${chunk.inputs.length} inputs`);
+      (__DEBUG_ON__ ? console.log : function(){})(`[WebGPU] Processing ${chunk.inputs.length} inputs`);
 
       for (let i = 0; i < chunk.inputs.length; i++) {
         const input = chunk.inputs[i];
@@ -1051,7 +1058,7 @@ async function executeWebGPUCompute(chunk) {
           });
           buffers.push(inputBuffer);
 
-          console.log(`[WebGPU] Input ${input.name || i}: ${inputBytes.length} bytes at binding ${bindingIndex - 1}`);
+          (__DEBUG_ON__ ? console.log : function(){})(`[WebGPU] Input ${input.name || i}: ${inputBytes.length} bytes at binding ${bindingIndex - 1}`);
         } catch (err) {
           console.error(`[WebGPU] Failed to process input ${i}:`, err);
           throw new Error(`Failed to decode input ${input.name || i}: ${err.message}`);
@@ -1061,7 +1068,7 @@ async function executeWebGPUCompute(chunk) {
 
     // Handle outputs from strategy
     const outputBuffers = [];
-    console.log(`[WebGPU] Creating ${chunk.outputs.length} output buffers`);
+    (__DEBUG_ON__ ? console.log : function(){})(`[WebGPU] Creating ${chunk.outputs.length} output buffers`);
 
     for (let i = 0; i < chunk.outputs.length; i++) {
       const output = chunk.outputs[i];
@@ -1082,7 +1089,7 @@ async function executeWebGPUCompute(chunk) {
       buffers.push(outputBuffer);
       outputBuffers.push(outputBuffer);
 
-      console.log(`[WebGPU] Output ${output.name || i}: ${output.size} bytes at binding ${bindingIndex - 1}`);
+      (__DEBUG_ON__ ? console.log : function(){})(`[WebGPU] Output ${output.name || i}: ${output.size} bytes at binding ${bindingIndex - 1}`);
     }
 
     // Create bind group and execute
@@ -1093,7 +1100,7 @@ async function executeWebGPUCompute(chunk) {
 
     // Get workgroup count from strategy
     const workgroupCount = chunk.workgroupCount || [1, 1, 1];
-    console.log(`[WebGPU] Dispatching workgroups:`, workgroupCount);
+    (__DEBUG_ON__ ? console.log : function(){})(`[WebGPU] Dispatching workgroups:`, workgroupCount);
 
     const encoder = state.device.createCommandEncoder();
     const computePass = encoder.beginComputePass();
@@ -1129,7 +1136,7 @@ async function executeWebGPUCompute(chunk) {
       const resultBase64 = btoa(String.fromCharCode(...resultBytes));
       results.push(resultBase64);
 
-      console.log(`[WebGPU] Output ${i}: ${resultBytes.length} bytes -> ${resultBase64.length} chars base64`);
+      (__DEBUG_ON__ ? console.log : function(){})(`[WebGPU] Output ${i}: ${resultBytes.length} bytes -> ${resultBase64.length} chars base64`);
     }
 
     // Cleanup buffers
@@ -1137,7 +1144,7 @@ async function executeWebGPUCompute(chunk) {
     readBuffers.forEach(buffer => buffer.destroy());
 
     const dt = performance.now() - t0;
-    console.log(`[WebGPU] Chunk ${chunk.chunkId} completed in ${dt.toFixed(0)}ms`);
+    (__DEBUG_ON__ ? console.log : function(){})(`[WebGPU] Chunk ${chunk.chunkId} completed in ${dt.toFixed(0)}ms`);
 
     return {
       results: results,
@@ -1159,7 +1166,7 @@ async function executeWebGPUCompute(chunk) {
 // Basic WebGL compute support (simplified)
 // Basic WebGL compute support (task-agnostic, multi-output)
 async function executeWebGLCompute(chunk) {
-  console.log(`[WebGL] Starting compute execution for ${chunk.chunkId || chunk.id}`);
+  (__DEBUG_ON__ ? console.log : function(){})(`[WebGL] Starting compute execution for ${chunk.chunkId || chunk.id}`);
 
   if (!frameworkState.webgl.supported) {
     throw new Error('WebGL not available');
@@ -1187,10 +1194,10 @@ async function executeWebGLCompute(chunk) {
 
     // Use strategy-provided shaders for WebGL
     if (chunk.webglVertexShader) {
-      console.log(`[WebGL] Using strategy-provided WebGL shaders`);
+      (__DEBUG_ON__ ? console.log : function(){})(`[WebGL] Using strategy-provided WebGL shaders`);
       return await executeWebGLTransformFeedback(computeGL, chunk, t0);
     } else {
-      console.log(`[WebGL] No WebGL shaders provided, attempting WGSL->GLSL conversion`);
+      (__DEBUG_ON__ ? console.log : function(){})(`[WebGL] No WebGL shaders provided, attempting WGSL->GLSL conversion`);
       // Fallback: try to convert WGSL to GLSL (limited support)
       return await executeWebGLWithWGSLFallback(computeGL, chunk, t0);
     }
@@ -1203,7 +1210,7 @@ async function executeWebGLCompute(chunk) {
 
 // WebGL Transform Feedback execution with strategy-provided shaders (multi-output)
 async function executeWebGLTransformFeedback(gl, chunk, t0) {
-  console.log(`[WebGL] Executing transform feedback compute...`);
+  (__DEBUG_ON__ ? console.log : function(){})(`[WebGL] Executing transform feedback compute...`);
 
   // Use strategy-provided shaders
   const vertexShaderSource   = chunk.webglVertexShader;
@@ -1273,7 +1280,7 @@ async function executeWebGLTransformFeedback(gl, chunk, t0) {
     gl.vertexAttribPointer(a_index, 1, gl.FLOAT, false, 0, 0);
   }
 
-  console.log(`[WebGL DEBUG] Execution parameters:`, {
+  (__DEBUG_ON__ ? console.log : function(){})(`[WebGL DEBUG] Execution parameters:`, {
     numElements,
     outputs: outputs.map(o => o.size),
     inputsLength: (chunk.inputs || []).length,
@@ -1368,7 +1375,7 @@ async function executeWebGLTransformFeedback(gl, chunk, t0) {
   gl.deleteProgram(program);
 
   const dt = performance.now() - t0;
-  console.log(`[WebGL] Transform feedback completed in ${dt.toFixed(0)}ms, results: ${results.length}`);
+  (__DEBUG_ON__ ? console.log : function(){})(`[WebGL] Transform feedback completed in ${dt.toFixed(0)}ms, results: ${results.length}`);
 
   return {
     results,
@@ -1448,7 +1455,7 @@ function setupWebGLInputs(gl, program, chunk) {
       // Choose width/height: from spec.textureShape, metadata.block_size, or a square fallback
       let width, height;
 
-      console.log(`[WebGL INPUT DEBUG] Input ${i} processing:`, {
+      (__DEBUG_ON__ ? console.log : function(){})(`[WebGL INPUT DEBUG] Input ${i} processing:`, {
         hasTextureShape: Array.isArray(spec.textureShape),
         textureShapeLength: spec.textureShape?.length,
         hasBlockSize: !!chunk.metadata?.block_size,
@@ -1514,7 +1521,7 @@ function bindWorkloadListener() {
 
   function onWorkloadNew(meta) {
     const framework = meta.framework || 'webgpu';
-    console.log(`[FRAMEWORK] workload:new ${meta.id} (${framework})`, meta.label);
+    (__DEBUG_ON__ ? console.log : function(){})(`[FRAMEWORK] workload:new ${meta.id} (${framework})`, meta.label);
 
     if (inFlightWorkloads.has(meta.id)) {
       console.warn(`[FRAMEWORK] duplicate workload event, declining ${meta.id}`);
@@ -1537,7 +1544,7 @@ function bindWorkloadListener() {
 
     state.isComputingWgsl = true;
     inFlightWorkloads.add(meta.id);
-    console.log(`[FRAMEWORK] Accepting ${framework} workload ${meta.id}`);
+    (__DEBUG_ON__ ? console.log : function(){})(`[FRAMEWORK] Accepting ${framework} workload ${meta.id}`);
 
     (async () => {
       try {
@@ -1558,7 +1565,7 @@ function bindWorkloadListener() {
       } finally {
         state.isComputingWgsl = false;
         inFlightWorkloads.delete(meta.id);
-        console.log(`[FRAMEWORK] ${framework} workload finished ${meta.id}`);
+        (__DEBUG_ON__ ? console.log : function(){})(`[FRAMEWORK] ${framework} workload finished ${meta.id}`);
       }
     })();
   }
@@ -1567,9 +1574,9 @@ function bindWorkloadListener() {
 }
 
 async function initWebGPU() {
-  console.log(`[HEADLESS] Checking WebGPU support...`);
-  console.log(`[HEADLESS] isSecureContext: ${window.isSecureContext}`);
-  console.log(`[HEADLESS] navigator.gpu available: ${!!navigator.gpu}`);
+  (__DEBUG_ON__ ? console.log : function(){})(`[HEADLESS] Checking WebGPU support...`);
+  (__DEBUG_ON__ ? console.log : function(){})(`[HEADLESS] isSecureContext: ${window.isSecureContext}`);
+  (__DEBUG_ON__ ? console.log : function(){})(`[HEADLESS] navigator.gpu available: ${!!navigator.gpu}`);
 
   if (!window.isSecureContext) {
     console.error(`[HEADLESS] Not a secure context`);
@@ -1651,7 +1658,7 @@ async function initWebGPU() {
 async function init() {
   if (IS_HEADLESS) {
     document.documentElement.style.display = 'none';
-    console.log(`Headless worker ${WORKER_ID}`);
+    (__DEBUG_ON__ ? console.log : function(){})(`Headless worker ${WORKER_ID}`);
   }
 
   await initWebGPU();
@@ -1914,7 +1921,7 @@ function logTaskActivity(msg, type='info') {
 }
 
 function logAdminActivity(msg, panel='matrix', type='info') {
-  if (IS_HEADLESS) { console.log(`[ADMIN] ${msg}`); return; }
+  if (IS_HEADLESS) { (__DEBUG_ON__ ? console.log : function(){})(`[ADMIN] ${msg}`); return; }
   let container = elements.adminLogMatrix;
   if (panel === 'wgsl') container = elements.adminLogWgsl;
   if (panel === 'system') container = elements.adminLogSystem;
@@ -1979,7 +1986,7 @@ socket.on('connect', async () => {
       clientType: capabilities.clientType
     });
 
-    console.log(`[CLIENT] Auto-joined with frameworks: ${capabilities.supportedFrameworks.join(', ')}`);
+    (__DEBUG_ON__ ? console.log : function(){})(`[CLIENT] Auto-joined with frameworks: ${capabilities.supportedFrameworks.join(', ')}`);
   }
   bindWorkloadListener();
 });
@@ -2053,7 +2060,7 @@ socket.on('workload:removed', ({ id }) => {
 
 // Enhanced: Enhanced chunk assignment handler
 socket.on('workload:chunk_assign', async chunk => {
-  console.log(`[CLIENT DEBUG] Received chunk assignment:`, {
+  (__DEBUG_ON__ ? console.log : function(){})(`[CLIENT DEBUG] Received chunk assignment:`, {
     chunkId: chunk.chunkId,
     framework: chunk.framework,
     hasInputs: !!chunk.inputs,
@@ -2063,9 +2070,9 @@ socket.on('workload:chunk_assign', async chunk => {
     hasKernel: !!(chunk.kernel || chunk.wgsl),
     enhanced: chunk.enhanced
   });
-  console.log(`[CHUNK RECEIVED] Streaming mode: ${chunk.streaming}`);
+  (__DEBUG_ON__ ? console.log : function(){})(`[CHUNK RECEIVED] Streaming mode: ${chunk.streaming}`);
   // NEW: Debug WebGL-specific properties
-  console.log(`[CLIENT DEBUG] WebGL properties:`, {
+  (__DEBUG_ON__ ? console.log : function(){})(`[CLIENT DEBUG] WebGL properties:`, {
     hasWebglVertexShader: !!chunk.webglVertexShader,
     hasWebglFragmentShader: !!chunk.webglFragmentShader,
     webglShaderType: chunk.webglShaderType,
@@ -2074,15 +2081,15 @@ socket.on('workload:chunk_assign', async chunk => {
   });
 
   if (chunk.webglVertexShader) {
-    console.log(`[CLIENT DEBUG] WebGL vertex shader length:`, chunk.webglVertexShader.length);
-    console.log(`[CLIENT DEBUG] WebGL vertex shader preview:`, chunk.webglVertexShader.substring(0, 100) + '...');
+    (__DEBUG_ON__ ? console.log : function(){})(`[CLIENT DEBUG] WebGL vertex shader length:`, chunk.webglVertexShader.length);
+    (__DEBUG_ON__ ? console.log : function(){})(`[CLIENT DEBUG] WebGL vertex shader preview:`, chunk.webglVertexShader.substring(0, 100) + '...');
   }
 
   if (chunk.webglFragmentShader) {
-    console.log(`[CLIENT DEBUG] WebGL fragment shader length:`, chunk.webglFragmentShader.length);
+    (__DEBUG_ON__ ? console.log : function(){})(`[CLIENT DEBUG] WebGL fragment shader length:`, chunk.webglFragmentShader.length);
   }
 
-  console.log(`[CLIENT DEBUG] All chunk properties:`, Object.keys(chunk));
+  (__DEBUG_ON__ ? console.log : function(){})(`[CLIENT DEBUG] All chunk properties:`, Object.keys(chunk));
 
   const framework = chunk.framework || 'webgpu';
 
@@ -2155,30 +2162,30 @@ socket.on('workload:chunk_assign', async chunk => {
 
   switch (framework) {
     case 'webgpu':
-      console.log(`[WebGPU] Routing chunk ${chunk.chunkId} to WebGPU execution`);
+      (__DEBUG_ON__ ? console.log : function(){})(`[WebGPU] Routing chunk ${chunk.chunkId} to WebGPU execution`);
       result = await executeWebGPUCompute(chunk);
       break;
 
     case 'webgl':
-      console.log(`[WebGL] Routing chunk ${chunk.chunkId} to WebGL execution`);
+      (__DEBUG_ON__ ? console.log : function(){})(`[WebGL] Routing chunk ${chunk.chunkId} to WebGL execution`);
       result = await executeWebGLCompute(chunk);
       break;
     case 'javascript':
-      console.log(`[JS] Routing chunk ${chunk.chunkId} to JavaScript execution`);
+      (__DEBUG_ON__ ? console.log : function(){})(`[JS] Routing chunk ${chunk.chunkId} to JavaScript execution`);
       result = await executeJavaScriptCompute(chunk);
       break;
     case 'cuda':
-      console.log(`[CUDA] Routing chunk ${chunk.chunkId} to CUDA execution`);
+      (__DEBUG_ON__ ? console.log : function(){})(`[CUDA] Routing chunk ${chunk.chunkId} to CUDA execution`);
       // TODO: Implement CUDA execution
       throw new Error('CUDA execution not yet implemented');
 
     case 'opencl':
-      console.log(`[OpenCL] Routing chunk ${chunk.chunkId} to OpenCL execution`);
+      (__DEBUG_ON__ ? console.log : function(){})(`[OpenCL] Routing chunk ${chunk.chunkId} to OpenCL execution`);
       // TODO: Implement OpenCL execution
       throw new Error('OpenCL execution not yet implemented');
 
     case 'vulkan':
-      console.log(`[Vulkan] Routing chunk ${chunk.chunkId} to Vulkan execution`);
+      (__DEBUG_ON__ ? console.log : function(){})(`[Vulkan] Routing chunk ${chunk.chunkId} to Vulkan execution`);
       // TODO: Implement Vulkan execution
       throw new Error('Vulkan execution not yet implemented');
 
@@ -2211,7 +2218,7 @@ socket.on('workload:chunk_assign', async chunk => {
     eventData.reportedChecksum = await checksumBase64(result.result);
   }
 
-  console.log(`[${framework.toUpperCase()}] Sending results for ${chunk.chunkId}:`, {
+  (__DEBUG_ON__ ? console.log : function(){})(`[${framework.toUpperCase()}] Sending results for ${chunk.chunkId}:`, {
     resultsCount: result.results.length,
     resultSizes: result.results.map(r => Math.round(r.length * 0.75))
   });
@@ -2219,7 +2226,7 @@ socket.on('workload:chunk_assign', async chunk => {
   socket.emit(eventName, eventData);
 
   logTaskActivity(`[${framework.toUpperCase()}] Chunk ${chunk.chunkId} complete: ${outputCount} outputs`, 'success');
-  console.log(`[CLIENT DEBUG] Chunk ${chunk.chunkId} completion:`, {
+  (__DEBUG_ON__ ? console.log : function(){})(`[CLIENT DEBUG] Chunk ${chunk.chunkId} completion:`, {
   enhanced: chunk.enhanced,
   streaming: chunk.streaming,
   eventName: eventName,
@@ -2237,7 +2244,7 @@ socket.on('workload:chunk_assign', async chunk => {
       message: `${framework}: ${err.message}`
     });
 
-    console.log(`[CLIENT] Sent ${errorEventName} for chunk ${chunk.chunkId}`);
+    (__DEBUG_ON__ ? console.log : function(){})(`[CLIENT] Sent ${errorEventName} for chunk ${chunk.chunkId}`);
 
   } finally {
     state.isComputingChunk = false;
@@ -2310,7 +2317,7 @@ socket.on('workloads:list_update', all => {
 
 // Duplicate 'workload:new' path (non-bindWorkloadListener) — keep in sync with above.
 socket.on('workload:new', async meta => {
-  console.log(`[HEADLESS] Received WGSL workload: ${meta.id}, label: ${meta.label}`);
+  (__DEBUG_ON__ ? console.log : function(){})(`[HEADLESS] Received WGSL workload: ${meta.id}, label: ${meta.label}`);
   if (meta.isChunkParent) return;
   if (state.isComputingMatrix || state.isComputingWgsl || state.isComputingChunk) {
     socket.emit('workload:error', { id: meta.id, message: 'Busy' });

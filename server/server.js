@@ -14,6 +14,9 @@ import url from 'url';
 
 // Enhanced: Import chunking system
 import { EnhancedChunkingManager } from './strategies/EnhancedChunkingManager.js';
+import { info } from './logger.js';
+const __DEBUG_ON__ = (process.env.LOG_LEVEL || '').toLowerCase() === 'debug';
+
 const streamingChunkQueues = new Map(); // workloadId -> queue of pending chunks
 const maxQueueSize = 1000; // Prevent memory bloat
 const app = express();
@@ -126,7 +129,7 @@ try {
   const credentials = { key: privateKey, cert: certificate };
   server = https.createServer(credentials, app);
   useHttps = true;
-  console.log('Using HTTPS server with self-signed certificates');
+  info('SERVER', 'Using HTTPS server with self-signed certificates');
 } catch (error) {
   console.warn('SSL certificates not found or unreadable, falling back to HTTP. Error:', error.message);
   server = http.createServer(app);
@@ -153,7 +156,7 @@ const wss = new WebSocketServer({
   noServer: true, // Important: Don't auto-attach to the HTTP server
   path: '/ws-native',
   verifyClient: (info) => {
-    console.log(`[WS-NATIVE] Connection attempt from ${info.origin || 'unknown'}`);
+    if (__DEBUG_ON__) console.log(`[WS-NATIVE] Connection attempt from ${info.origin || 'unknown'}`);
     return true;
   }
 });
@@ -199,7 +202,7 @@ class WebSocketClientWrapper {
     this.ws.on('message', (data) => {
       try {
         const message = JSON.parse(data.toString());
-        console.log(`[WS-NATIVE] Received from ${this.id}:`, message.type);
+        if (__DEBUG_ON__) console.log(`[WS-NATIVE] Received from ${this.id}:`, message.type);
 
         if (message.type && this.eventHandlers.has(message.type)) {
           this.eventHandlers.get(message.type)(message.data || {});
@@ -210,7 +213,7 @@ class WebSocketClientWrapper {
     });
 
     this.ws.on('close', () => {
-      console.log(`[WS-NATIVE] Client ${this.id} disconnected`);
+      if (__DEBUG_ON__) console.log(`[WS-NATIVE] Client ${this.id} disconnected`);
       this.connected = false;
       handleClientDisconnect(this.id);
       broadcastClientList();
@@ -232,7 +235,7 @@ class WebSocketClientWrapper {
       try {
         const message = JSON.stringify({ type: event, data });
         this.ws.send(message);
-        console.log(`[WS-NATIVE] Sent to ${this.id}:`, event);
+        if (__DEBUG_ON__) console.log(`[WS-NATIVE] Sent to ${this.id}:`, event);
       } catch (err) {
         console.error(`[WS-NATIVE] Failed to send to ${this.id}:`, err);
       }
@@ -247,7 +250,7 @@ class WebSocketClientWrapper {
 // Handle WebSocket connections
 wss.on('connection', (ws, request) => {
   const clientId = `ws-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
-  console.log(`[WS-NATIVE] New native client connected: ${clientId}`);
+  if (__DEBUG_ON__) console.log(`[WS-NATIVE] New native client connected: ${clientId}`);
 
   // Create wrapper that mimics Socket.IO client
   const client = new WebSocketClientWrapper(ws, clientId);
@@ -273,7 +276,7 @@ wss.on('connection', (ws, request) => {
     client.supportedFrameworks = data.supportedFrameworks || ['vulkan'];
     client.clientType = data.clientType || 'native';
 
-    console.log(`[WS-NATIVE] Client ${clientId} joined; supports frameworks: ${client.supportedFrameworks.join(', ')}`);
+    if (__DEBUG_ON__) console.log(`[WS-NATIVE] Client ${clientId} joined; supports frameworks: ${client.supportedFrameworks.join(', ')}`);
     broadcastClientList();
   });
 
@@ -394,7 +397,7 @@ wss.on('connection', (ws, request) => {
       wl.finalResults = winner.results;
       wl.finalResultBase64 = Buffer.concat(winner.results.map(r => Buffer.from(r, 'base64'))).toString('base64');
       wl.completedAt = Date.now();
-      console.log(` ${wl.framework} workload ${id} VERIFIED & COMPLETE.`);
+      info('WORKLOAD', ` ${wl.framework} workload ${id} VERIFIED & COMPLETE.`);
 
       // Broadcast to ALL clients (Socket.IO and WebSocket)
       io.emit('workload:complete', {
@@ -425,7 +428,7 @@ wss.on('connection', (ws, request) => {
 
   // Enhanced chunk completion
   client.on('workload:chunk_done_enhanced', ({ parentId, chunkId, results, result, processingTime, strategy, metadata, reportedChecksum }) => {
-    console.log(`[CHUNK RESULT] Enhanced chunk ${chunkId} completed by native client ${clientId}`);
+    if (__DEBUG_ON__) console.log(`[CHUNK RESULT] Enhanced chunk ${chunkId} completed by native client ${clientId}`);
 
     client.isBusyWithCustomChunk = false;
 
@@ -451,12 +454,12 @@ wss.on('connection', (ws, request) => {
     let finalResults = results || [result];
     if (!Array.isArray(finalResults)) finalResults = [finalResults];
 
-    console.log(`[CHUNK RESULT] Processing ${finalResults.length} results for chunk ${chunkId}`);
+    if (__DEBUG_ON__) console.log(`[CHUNK RESULT] Processing ${finalResults.length} results for chunk ${chunkId}`);
 
     let checksumData;
     try {
       checksumData = checksumFromResults(finalResults);
-      console.log(`[CHUNK RESULT] Chunk ${chunkId} checksum: ${checksumData.serverChecksum.slice(0, 8)}... (${checksumData.byteLength} bytes)`);
+      if (__DEBUG_ON__) console.log(`[CHUNK RESULT] Chunk ${chunkId} checksum: ${checksumData.serverChecksum.slice(0, 8)}... (${checksumData.byteLength} bytes)`);
     } catch (err) {
       console.error(`[CHUNK RESULT] Enhanced chunk ${chunkId} from ${clientId} invalid base64:`, err);
       return;
@@ -479,11 +482,11 @@ wss.on('connection', (ws, request) => {
 
       const verifiedResults = cd.verified_results;
 
-      console.log(`[CHUNK RESULT] Calling chunkingManager.handleChunkCompletion for ${chunkId}`);
+      if (__DEBUG_ON__) console.log(`[CHUNK RESULT] Calling chunkingManager.handleChunkCompletion for ${chunkId}`);
 
       try {
         const assemblyResult = chunkingManager.handleChunkCompletion(parentId, chunkId, verifiedResults, processingTime);
-        console.log(`[CHUNK RESULT] Assembly result for ${chunkId}:`, {
+        if (__DEBUG_ON__) console.log(`[CHUNK RESULT] Assembly result for ${chunkId}:`, {
           success: assemblyResult.success,
           status: assemblyResult.status,
           error: assemblyResult.error
@@ -509,7 +512,7 @@ wss.on('connection', (ws, request) => {
 
           workloadState.finalResultBase64 = finalBase64;
 
-          console.log(`[CHUNK RESULT] Cleaning up workload ${parentId}`);
+          if (__DEBUG_ON__) console.log(`[CHUNK RESULT] Cleaning up workload ${parentId}`);
           try {
             chunkingManager.cleanupWorkload(parentId);
           } catch (cleanupError) {
@@ -620,7 +623,7 @@ wss.on('connection', (ws, request) => {
     }
   });
 
-  console.log(`[WS-NATIVE] Client ${clientId} event handlers registered`);
+  if (__DEBUG_ON__) console.log(`[WS-NATIVE] Client ${clientId} event handlers registered`);
 });
 
 // Update broadcastClientList to include native clients
@@ -1002,18 +1005,18 @@ if (streamingMode) {
     // Check for recent callback
     const lastCallback = recentCallbacks.get(callbackKey);
     if (lastCallback && (now - lastCallback) < 5000) {
-      console.log(`[CALLBACK] Ignoring duplicate callback for ${chunkDescriptor.chunkId}`);
+      if (__DEBUG_ON__) console.log(`[CALLBACK] Ignoring duplicate callback for ${chunkDescriptor.chunkId}`);
       return { success: true, duplicate: true };
     }
 
     recentCallbacks.set(callbackKey, now);
-    console.log(` [STREAMING] Dispatch callback triggered for ${chunkDescriptor.chunkId}`);
+    if (__DEBUG_ON__) console.log(` [STREAMING] Dispatch callback triggered for ${chunkDescriptor.chunkId}`);
     return await dispatchStreamingChunkEnhanced(wid, chunkDescriptor);
   });
   /*
   chunkingManager.setDispatchCallback(wid, async (chunkDescriptor) => {
-    console.log(` [STREAMING] Dispatch callback triggered for ${chunkDescriptor.chunkId}`);
-    console.log(` [STREAMING] Workload still exists: ${!!customWorkloads.get(wid)}`);
+    if (__DEBUG_ON__) console.log(` [STREAMING] Dispatch callback triggered for ${chunkDescriptor.chunkId}`);
+    if (__DEBUG_ON__) console.log(` [STREAMING] Workload still exists: ${!!customWorkloads.get(wid)}`);
     return await dispatchStreamingChunkEnhanced(wid, chunkDescriptor);
   });
   */
@@ -1025,7 +1028,7 @@ if (streamingMode) {
   // Check for recent callback
   const lastCallback = recentCallbacks.get(callbackKey);
   if (lastCallback && (now - lastCallback) < 5000) {
-    console.log(`[CALLBACK] Ignoring duplicate callback for ${chunkDescriptor.chunkId}`);
+    if (__DEBUG_ON__) console.log(`[CALLBACK] Ignoring duplicate callback for ${chunkDescriptor.chunkId}`);
     return { success: true, duplicate: true };
   }
 
@@ -1036,11 +1039,11 @@ if (streamingMode) {
   // Set up server callbacks for streaming events
   chunkingManager.setServerCallbacks({
     onWorkloadComplete: async (workloadId, result) => {
-      console.log(` [STREAMING CALLBACK] Workload complete: ${workloadId}`);
+      if (__DEBUG_ON__) console.log(` [STREAMING CALLBACK] Workload complete: ${workloadId}`);
       await handleStreamingWorkloadComplete(workloadId, result);
     },
     onAssemblyProgress: (workloadId, progress) => {
-      console.log(` [STREAMING CALLBACK] Assembly progress: ${workloadId} - ${progress.completedBlocks}/${progress.totalBlocks}`);
+      if (__DEBUG_ON__) console.log(` [STREAMING CALLBACK] Assembly progress: ${workloadId} - ${progress.completedBlocks}/${progress.totalBlocks}`);
 
       io.emit('assembly:progress', {
         workloadId,
@@ -1080,7 +1083,7 @@ if (streamingMode) {
 
         // Set up dispatch callback for streaming chunk creation
         chunkingManager.setDispatchCallback(wid, async (chunkDescriptor) => {
-          console.log(` [STREAMING] Immediate dispatch: ${chunkDescriptor.chunkId} (framework: ${chunkDescriptor.framework})`);
+          if (__DEBUG_ON__) console.log(` [STREAMING] Immediate dispatch: ${chunkDescriptor.chunkId} (framework: ${chunkDescriptor.framework})`);
           return await dispatchStreamingChunkEnhanced(wid, chunkDescriptor);
         });
 
@@ -1090,7 +1093,7 @@ if (streamingMode) {
             await handleStreamingWorkloadComplete(workloadId, result);
           },
           onAssemblyProgress: (workloadId, progress) => {
-            console.log(` [STREAMING] Assembly progress: ${progress.completedBlocks}/${progress.totalBlocks} blocks`);
+            if (__DEBUG_ON__) console.log(` [STREAMING] Assembly progress: ${progress.completedBlocks}/${progress.totalBlocks} blocks`);
 
             io.emit('assembly:progress', {
               workloadId,
@@ -1244,15 +1247,15 @@ async function dispatchChunkToClient(client, chunkDescriptor, workloadId) {
   const now = Date.now();
   const lastDispatched = activeChunkDispatches.get(dispatchKey);
   if (lastDispatched && (now - lastDispatched) < 10000) { // 10 second window
-    console.log(`[DISPATCH] Preventing duplicate dispatch: ${chunkDescriptor.chunkId} to ${client.id}`);
+    if (__DEBUG_ON__) console.log(`[DISPATCH] Preventing duplicate dispatch: ${chunkDescriptor.chunkId} to ${client.id}`);
     return { success: true, duplicate: true };
   }
   activeChunkDispatches.set(dispatchKey, now);
-  console.log(`[CHUNK DISPATCH] === SENDING TO CLIENT ===`);
-  console.log(`[CHUNK DISPATCH] Client ID: ${client.id.substring(0, 8)}...`);
-  console.log(`[CHUNK DISPATCH] Client Type: ${client.clientType || 'browser'}`);
-  console.log(`[CHUNK DISPATCH] Chunk ID: ${chunkDescriptor.chunkId}`);
-  console.log(`[CHUNK DISPATCH] Framework: ${chunkDescriptor.framework}`);
+  if (__DEBUG_ON__) console.log(`[CHUNK DISPATCH] === SENDING TO CLIENT ===`);
+  if (__DEBUG_ON__) console.log(`[CHUNK DISPATCH] Client ID: ${client.id.substring(0, 8)}...`);
+  if (__DEBUG_ON__) console.log(`[CHUNK DISPATCH] Client Type: ${client.clientType || 'browser'}`);
+  if (__DEBUG_ON__) console.log(`[CHUNK DISPATCH] Chunk ID: ${chunkDescriptor.chunkId}`);
+  if (__DEBUG_ON__) console.log(`[CHUNK DISPATCH] Framework: ${chunkDescriptor.framework}`);
   try {
     client.isBusyWithCustomChunk = true;
 
@@ -1298,7 +1301,7 @@ async function dispatchChunkToClient(client, chunkDescriptor, workloadId) {
       streamingMetadata: chunkDescriptor.streamingMetadata
     };
 
-    console.log(` [DISPATCH] Sending ${chunkDescriptor.framework} chunk ${chunkDescriptor.chunkId} to ${client.clientType || 'browser'} client ${client.id}`);
+    if (__DEBUG_ON__) console.log(` [DISPATCH] Sending ${chunkDescriptor.framework} chunk ${chunkDescriptor.chunkId} to ${client.clientType || 'browser'} client ${client.id}`);
 
     // Send to appropriate client type with timeout
     const dispatchPromise = new Promise((resolve, reject) => {
@@ -2193,41 +2196,41 @@ function assignCustomChunkToAvailableClients() {
             framework: parent.framework
           });
 
-          console.log(`[SERVER DEBUG] Sending chunk ${cd.chunkId} to ${clientId}:`);
-          console.log(`[SERVER DEBUG] Framework: ${parent.framework}`);
-          console.log(`[SERVER DEBUG] Client type: ${client.clientType || 'browser'}`);
-          console.log(`[SERVER DEBUG] TaskData keys:`, Object.keys(taskData));
+          if (__DEBUG_ON__) console.log(`[SERVER DEBUG] Sending chunk ${cd.chunkId} to ${clientId}:`);
+          if (__DEBUG_ON__) console.log(`[SERVER DEBUG] Framework: ${parent.framework}`);
+          if (__DEBUG_ON__) console.log(`[SERVER DEBUG] Client type: ${client.clientType || 'browser'}`);
+          if (__DEBUG_ON__) console.log(`[SERVER DEBUG] TaskData keys:`, Object.keys(taskData));
 
           // Framework-specific debug logging
           if (parent.framework === 'webgl') {
-            console.log(`[SERVER DEBUG] Has webglVertexShader:`, !!taskData.webglVertexShader);
-            console.log(`[SERVER DEBUG] Has webglFragmentShader:`, !!taskData.webglFragmentShader);
+            if (__DEBUG_ON__) console.log(`[SERVER DEBUG] Has webglVertexShader:`, !!taskData.webglVertexShader);
+            if (__DEBUG_ON__) console.log(`[SERVER DEBUG] Has webglFragmentShader:`, !!taskData.webglFragmentShader);
             if (taskData.webglVertexShader) {
-              console.log(`[SERVER DEBUG] WebGL vertex shader length:`, taskData.webglVertexShader.length);
-              console.log(`[SERVER DEBUG] WebGL vertex shader preview:`, taskData.webglVertexShader.substring(0, 100) + '...');
+              if (__DEBUG_ON__) console.log(`[SERVER DEBUG] WebGL vertex shader length:`, taskData.webglVertexShader.length);
+              if (__DEBUG_ON__) console.log(`[SERVER DEBUG] WebGL vertex shader preview:`, taskData.webglVertexShader.substring(0, 100) + '...');
             }
           } else if (parent.framework === 'vulkan') {
-            console.log(`[SERVER DEBUG] Has vulkanShader:`, !!taskData.vulkanShader);
-            console.log(`[SERVER DEBUG] Has computeShader:`, !!taskData.computeShader);
+            if (__DEBUG_ON__) console.log(`[SERVER DEBUG] Has vulkanShader:`, !!taskData.vulkanShader);
+            if (__DEBUG_ON__) console.log(`[SERVER DEBUG] Has computeShader:`, !!taskData.computeShader);
           } else if (parent.framework === 'cuda') {
-            console.log(`[SERVER DEBUG] Has cudaKernel:`, !!taskData.cudaKernel);
-            console.log(`[SERVER DEBUG] blockDim:`, taskData.blockDim);
-            console.log(`[SERVER DEBUG] gridDim:`, taskData.gridDim);
+            if (__DEBUG_ON__) console.log(`[SERVER DEBUG] Has cudaKernel:`, !!taskData.cudaKernel);
+            if (__DEBUG_ON__) console.log(`[SERVER DEBUG] blockDim:`, taskData.blockDim);
+            if (__DEBUG_ON__) console.log(`[SERVER DEBUG] gridDim:`, taskData.gridDim);
           } else if (parent.framework === 'opencl') {
-            console.log(`[SERVER DEBUG] Has openclKernel:`, !!taskData.openclKernel);
-            console.log(`[SERVER DEBUG] globalWorkSize:`, taskData.globalWorkSize);
+            if (__DEBUG_ON__) console.log(`[SERVER DEBUG] Has openclKernel:`, !!taskData.openclKernel);
+            if (__DEBUG_ON__) console.log(`[SERVER DEBUG] globalWorkSize:`, taskData.globalWorkSize);
           }
 
-          console.log(`[SERVER DEBUG] Has kernel:`, !!taskData.kernel);
+          if (__DEBUG_ON__) console.log(`[SERVER DEBUG] Has kernel:`, !!taskData.kernel);
 
           // Send chunk assignment based on client type
           if (client.socket) {
             // Socket.IO client (browser)
-            console.log(`[DISPATCH] Sending to Socket.IO client ${clientId}`);
+            if (__DEBUG_ON__) console.log(`[DISPATCH] Sending to Socket.IO client ${clientId}`);
             client.socket.emit('workload:chunk_assign', taskData);
           } else if (client.emit) {
             // Native WebSocket client (C++/native)
-            console.log(`[DISPATCH] Sending to native WebSocket client ${clientId}`);
+            if (__DEBUG_ON__) console.log(`[DISPATCH] Sending to native WebSocket client ${clientId}`);
             client.emit('workload:chunk_assign', taskData);
           } else {
             // Fallback: try both methods (shouldn't happen with updated filter)
@@ -2311,9 +2314,9 @@ function dispatchToAllClients(eventName, eventData, frameworkFilter = null) {
   });
 
   if (frameworkFilter) {
-    console.log(`[DISPATCH] Sent ${eventName} to ${socketIoCount} Socket.IO + ${nativeWsCount} native clients supporting ${frameworkFilter}`);
+    if (__DEBUG_ON__) console.log(`[DISPATCH] Sent ${eventName} to ${socketIoCount} Socket.IO + ${nativeWsCount} native clients supporting ${frameworkFilter}`);
   } else {
-    console.log(`[DISPATCH] Sent ${eventName} to ${socketIoCount} Socket.IO + ${nativeWsCount} native clients`);
+    if (__DEBUG_ON__) console.log(`[DISPATCH] Sent ${eventName} to ${socketIoCount} Socket.IO + ${nativeWsCount} native clients`);
   }
 }
 
@@ -2418,7 +2421,7 @@ function tryDispatchNonChunkedWorkloads() { // Enhanced
 
 
 function debugMatrixTiledChunk(chunkDef, parentWorkload) {
-  console.log(`[MATRIX TILED DEBUG] Chunk ${chunkDef.chunkId}:`, {
+  if (__DEBUG_ON__) console.log(`[MATRIX TILED DEBUG] Chunk ${chunkDef.chunkId}:`, {
     hasInputs: !!chunkDef.inputs,
     inputNames: chunkDef.inputs?.map(i => i.name) || [],
     hasOutputs: !!chunkDef.outputs,
@@ -2749,7 +2752,7 @@ function handleClientDisconnectFixed(clientId) {
 
 
 io.on('connection', socket => {
-  console.log(`[IO] connected: ${socket.id}`);
+  if (__DEBUG_ON__) console.log(`[IO] connected: ${socket.id}`);
   matrixState.clients.set(socket.id, {
     id: socket.id,
     socket,
@@ -2782,7 +2785,7 @@ io.on('connection', socket => {
     c.supportedFrameworks = data.supportedFrameworks || ['webgpu'];
     c.clientType = data.clientType || 'browser';
 
-    console.log(`Client ${socket.id} joined; supports frameworks: ${c.supportedFrameworks.join(', ')}`);
+    info('CLIENT', `Client ${socket.id} joined; supports frameworks: ${c.supportedFrameworks.join(', ')}`);
     broadcastClientList();
   });
 
@@ -2905,7 +2908,7 @@ io.on('connection', socket => {
       wl.finalResults = winner.results;
       wl.finalResultBase64 = Buffer.concat(winner.results.map(r => Buffer.from(r, 'base64'))).toString('base64');
       wl.completedAt = Date.now();
-      console.log(` ${wl.framework} workload ${id} VERIFIED & COMPLETE.`);
+      info('WORKLOAD', ` ${wl.framework} workload ${id} VERIFIED & COMPLETE.`);
       io.emit('workload:complete', {
         id,
         label: wl.label,
@@ -2928,32 +2931,32 @@ io.on('connection', socket => {
     const now = Date.now();
     const lastProcessed = processedChunkCompletions.get(chunkKey);
       if (lastProcessed && (now - lastProcessed) < 5000) { // 5 second window
-      console.log(`[CHUNK RESULT] Ignoring duplicate chunk completion: ${chunkId} from client ${socket.id}`);
+      if (__DEBUG_ON__) console.log(`[CHUNK RESULT] Ignoring duplicate chunk completion: ${chunkId} from client ${socket.id}`);
       return;
     }
     processedChunkCompletions.set(chunkKey, now);
-    console.log(`[CHUNK RESULT] Enhanced chunk ${chunkId} completed by ${socket.id}`);
-    console.log(`[CHUNK RESULT] Parent ID: ${parentId}`);
-    console.log(`[CHUNK RESULT] Chunk ID: ${chunkId}`);
-    console.log(`[CHUNK RESULT] Results count: ${results?.length || (result ? 1 : 0)}`);
-    console.log(`[CHUNK RESULT] Processing time: ${processingTime}ms`);
+    if (__DEBUG_ON__) console.log(`[CHUNK RESULT] Enhanced chunk ${chunkId} completed by ${socket.id}`);
+    if (__DEBUG_ON__) console.log(`[CHUNK RESULT] Parent ID: ${parentId}`);
+    if (__DEBUG_ON__) console.log(`[CHUNK RESULT] Chunk ID: ${chunkId}`);
+    if (__DEBUG_ON__) console.log(`[CHUNK RESULT] Results count: ${results?.length || (result ? 1 : 0)}`);
+    if (__DEBUG_ON__) console.log(`[CHUNK RESULT] Processing time: ${processingTime}ms`);
 
     const client = matrixState.clients.get(socket.id);
     if (client) client.isBusyWithCustomChunk = false;
     clientDispatchLock.delete(socket.id);
     dispatchLock.delete(chunkId);
-    console.log(`[CHUNK RESULT] Enhanced chunk ${chunkId} completed by ${socket.id}`);
+    if (__DEBUG_ON__) console.log(`[CHUNK RESULT] Enhanced chunk ${chunkId} completed by ${socket.id}`);
     updateStreamingWorkloadProgress(parentId, chunkId, 'completed');
-     console.log(`[CHUNK RESULT] Looking up workload: ${parentId}`);
+     if (__DEBUG_ON__) console.log(`[CHUNK RESULT] Looking up workload: ${parentId}`);
     const workloadState = customWorkloads.get(parentId);
-    console.log(`[CHUNK RESULT] Workload found: ${!!workloadState}`);
+    if (__DEBUG_ON__) console.log(`[CHUNK RESULT] Workload found: ${!!workloadState}`);
     if (workloadState) {
-      console.log(`[CHUNK RESULT] Workload status: ${workloadState.status}`);
-      console.log(`[CHUNK RESULT] Workload streaming mode: ${workloadState.streamingMode}`);
+      if (__DEBUG_ON__) console.log(`[CHUNK RESULT] Workload status: ${workloadState.status}`);
+      if (__DEBUG_ON__) console.log(`[CHUNK RESULT] Workload streaming mode: ${workloadState.streamingMode}`);
     }
 
     if (workloadState && workloadState.streamingMode) {
-    console.log(`[CHUNK RESULT] Processing streaming chunk ${chunkId} via chunking manager`);
+    if (__DEBUG_ON__) console.log(`[CHUNK RESULT] Processing streaming chunk ${chunkId} via chunking manager`);
 
     let finalResults = results || [result];
     if (!Array.isArray(finalResults)) finalResults = [finalResults];
@@ -2961,7 +2964,7 @@ io.on('connection', socket => {
     try {
       // For streaming: Call chunking manager directly (no chunk store needed)
       const assemblyResult = await chunkingManager.handleChunkCompletion(parentId, chunkId, finalResults, processingTime);
-      console.log(`[CHUNK RESULT] Streaming assembly result:`, {
+      if (__DEBUG_ON__) console.log(`[CHUNK RESULT] Streaming assembly result:`, {
         success: assemblyResult.success,
         status: assemblyResult.status,
         error: assemblyResult.error
@@ -2990,11 +2993,11 @@ io.on('connection', socket => {
   }
 
     const chunkStore = customWorkloadChunks.get(parentId);
-    console.log(`[CHUNK RESULT] Chunk store found: ${!!chunkStore}`);
+    if (__DEBUG_ON__) console.log(`[CHUNK RESULT] Chunk store found: ${!!chunkStore}`);
     if (chunkStore) {
-    console.log(`[CHUNK RESULT] Store enhanced: ${chunkStore.enhanced}`);
-    console.log(`[CHUNK RESULT] Store expected chunks: ${chunkStore.expectedChunks}`);
-    console.log(`[CHUNK RESULT] Store completed chunks: ${chunkStore.completedChunksData?.size || 0}`);
+    if (__DEBUG_ON__) console.log(`[CHUNK RESULT] Store enhanced: ${chunkStore.enhanced}`);
+    if (__DEBUG_ON__) console.log(`[CHUNK RESULT] Store expected chunks: ${chunkStore.expectedChunks}`);
+    if (__DEBUG_ON__) console.log(`[CHUNK RESULT] Store completed chunks: ${chunkStore.completedChunksData?.size || 0}`);
   }
     if (!workloadState || !chunkStore) {
       console.error(`[CHUNK RESULT] Workload ${parentId} not found for chunk ${chunkId}`);
@@ -3015,12 +3018,12 @@ io.on('connection', socket => {
     let finalResults = results || [result];
     if (!Array.isArray(finalResults)) finalResults = [finalResults];
 
-    console.log(`[CHUNK RESULT] Processing ${finalResults.length} results for chunk ${chunkId}`);
+    if (__DEBUG_ON__) console.log(`[CHUNK RESULT] Processing ${finalResults.length} results for chunk ${chunkId}`);
 
     let checksumData;
     try {
       checksumData = checksumFromResults(finalResults);
-      console.log(`[CHUNK RESULT] Chunk ${chunkId} checksum: ${checksumData.serverChecksum.slice(0, 8)}... (${checksumData.byteLength} bytes)`);
+      if (__DEBUG_ON__) console.log(`[CHUNK RESULT] Chunk ${chunkId} checksum: ${checksumData.serverChecksum.slice(0, 8)}... (${checksumData.byteLength} bytes)`);
     } catch (err) {
       console.error(`[CHUNK RESULT] Enhanced chunk ${chunkId} from ${socket.id} invalid base64:`, err);
       return;
@@ -3044,11 +3047,11 @@ io.on('connection', socket => {
       const verifiedResults = cd.verified_results;
 
       // Use the enhanced chunking manager for completion handling
-      console.log(`[CHUNK RESULT] Calling chunkingManager.handleChunkCompletion for ${chunkId}`);
+      if (__DEBUG_ON__) console.log(`[CHUNK RESULT] Calling chunkingManager.handleChunkCompletion for ${chunkId}`);
 
       try {
         const assemblyResult = chunkingManager.handleChunkCompletion(parentId, chunkId, verifiedResults, processingTime);
-        console.log(`[CHUNK RESULT] Assembly result for ${chunkId}:`, {
+        if (__DEBUG_ON__) console.log(`[CHUNK RESULT] Assembly result for ${chunkId}:`, {
           success: assemblyResult.success,
           status: assemblyResult.status,
           error: assemblyResult.error
@@ -3076,7 +3079,7 @@ io.on('connection', socket => {
           workloadState.finalResultBase64 = finalBase64;
 
           // Clean up
-          console.log(`[CHUNK RESULT] Cleaning up workload ${parentId}`);
+          if (__DEBUG_ON__) console.log(`[CHUNK RESULT] Cleaning up workload ${parentId}`);
           try {
             chunkingManager.cleanupWorkload(parentId);
           } catch (cleanupError) {
@@ -3137,7 +3140,7 @@ io.on('connection', socket => {
     const lastProcessed = processedChunkCompletions.get(chunkKey);
 
     if (lastProcessed && (now - lastProcessed) < 5000) { // 5 second window
-      console.log(`[CHUNK RESULT] Ignoring duplicate chunk completion: ${chunkId} from client ${socket.id}`);
+      if (__DEBUG_ON__) console.log(`[CHUNK RESULT] Ignoring duplicate chunk completion: ${chunkId} from client ${socket.id}`);
       return;
     }
     processedChunkCompletions.set(chunkKey, now);
@@ -3479,7 +3482,7 @@ io.on('connection', socket => {
   });
 
   socket.on('disconnect', () => {
-    console.log(`Client disconnected: ${socket.id}`);
+    info('CLIENT', `Client disconnected: ${socket.id}`);
     handleClientDisconnect(socket.id);
     broadcastClientList();
     broadcastStatus();
@@ -3520,7 +3523,7 @@ function assignTasksToAvailableClients() {
 server.listen(PORT, () => {
   loadCustomWorkloads();
   loadCustomWorkloadChunks();
-  console.log(`Server on ${useHttps ? 'HTTPS' : 'HTTP'}://localhost:${PORT}`);
+  info('SERVER', `Server on ${useHttps ? 'HTTPS' : 'HTTP'}://localhost:${PORT}`);
   try {
     const counts = chunkingManager.registry && chunkingManager.registry.listStrategies ? chunkingManager.registry.listStrategies() : chunkingManager.getAvailableStrategies();
     const nChunking = (counts && counts.chunking) ? counts.chunking.length : (counts.chunking ? counts.chunking.length : 0);
@@ -3807,7 +3810,7 @@ app.get('/api/workloads/:id/status', (req, res) => {
 });
 
 async function queueStreamingChunk(workloadId, chunkDescriptor) {
-  console.log(` [QUEUE] Queuing chunk ${chunkDescriptor.chunkId} - no available clients`);
+  if (__DEBUG_ON__) console.log(` [QUEUE] Queuing chunk ${chunkDescriptor.chunkId} - no available clients`);
 
   // Initialize queue for this workload if it doesn't exist
   if (!streamingChunkQueues.has(workloadId)) {
@@ -3835,7 +3838,7 @@ async function queueStreamingChunk(workloadId, chunkDescriptor) {
     priority: chunkDescriptor.streamingMetadata?.tileProgress || 0
   });
 
-  console.log(` [QUEUE] Workload ${workloadId} queue: ${queue.length} chunks waiting`);
+  if (__DEBUG_ON__) console.log(` [QUEUE] Workload ${workloadId} queue: ${queue.length} chunks waiting`);
 
   return {
     success: true,
@@ -3852,7 +3855,7 @@ async function processStreamingQueues() {
   const startTime = Date.now();
   let totalProcessed = 0;
 
-  console.log(` [QUEUE] Processing ${streamingChunkQueues.size} streaming queues...`);
+  if (__DEBUG_ON__) console.log(` [QUEUE] Processing ${streamingChunkQueues.size} streaming queues...`);
 
   // Get available clients by framework
   const clientsByFramework = new Map();
@@ -3919,7 +3922,7 @@ async function processStreamingQueues() {
         queueProcessed++;
         totalProcessed++;
 
-        console.log(` [QUEUE] Dispatched queued chunk ${descriptor.chunkId} to ${availableClient.clientId}`);
+        if (__DEBUG_ON__) console.log(` [QUEUE] Dispatched queued chunk ${descriptor.chunkId} to ${availableClient.clientId}`);
 
       } catch (error) {
         // Re-queue the chunk with incremented attempt count
@@ -3936,19 +3939,19 @@ async function processStreamingQueues() {
     }
 
     if (queueProcessed > 0) {
-      console.log(` [QUEUE] Processed ${queueProcessed} chunks for workload ${workloadId} (${queue.length} remaining)`);
+      if (__DEBUG_ON__) console.log(` [QUEUE] Processed ${queueProcessed} chunks for workload ${workloadId} (${queue.length} remaining)`);
     }
 
     // Clean up empty queues
     if (queue.length === 0) {
       streamingChunkQueues.delete(workloadId);
-      console.log(` [QUEUE] Cleared empty queue for workload ${workloadId}`);
+      if (__DEBUG_ON__) console.log(` [QUEUE] Cleared empty queue for workload ${workloadId}`);
     }
   }
 
   const processingTime = Date.now() - startTime;
   if (totalProcessed > 0) {
-    console.log(` [QUEUE] Processed ${totalProcessed} total chunks in ${processingTime}ms`);
+    if (__DEBUG_ON__) console.log(` [QUEUE] Processed ${totalProcessed} total chunks in ${processingTime}ms`);
   }
 }
 
@@ -3958,7 +3961,7 @@ async function processStreamingQueuesFixed() {
   const startTime = Date.now();
   let totalProcessed = 0;
 
-  console.log(` [QUEUE] Processing ${streamingChunkQueues.size} streaming queues...`);
+  if (__DEBUG_ON__) console.log(` [QUEUE] Processing ${streamingChunkQueues.size} streaming queues...`);
 
   // Get available clients by framework (with atomic client locking)
   const clientsByFramework = getAvailableClientsByFramework();
@@ -3988,7 +3991,7 @@ async function processStreamingQueuesFixed() {
       if (dispatchLock.has(descriptor.chunkId)) {
         const lockTime = dispatchLock.get(descriptor.chunkId);
         if (Date.now() - lockTime < 30000) { // 30 second lock
-          console.log(`[DISPATCH LOCK] Chunk ${descriptor.chunkId} already being dispatched, skipping queue`);
+          if (__DEBUG_ON__) console.log(`[DISPATCH LOCK] Chunk ${descriptor.chunkId} already being dispatched, skipping queue`);
           break; // Stop processing this queue for now
         } else {
           // Lock expired, remove it
@@ -4037,7 +4040,7 @@ async function processStreamingQueuesFixed() {
         queueProcessed++;
         totalProcessed++;
 
-        console.log(` [QUEUE] Dispatched queued chunk ${descriptor.chunkId} to ${clientId}`);
+        if (__DEBUG_ON__) console.log(` [QUEUE] Dispatched queued chunk ${descriptor.chunkId} to ${clientId}`);
 
       } catch (error) {
         //  Re-queue the chunk with incremented attempt count and unlock
@@ -4061,19 +4064,19 @@ async function processStreamingQueuesFixed() {
     }
 
     if (queueProcessed > 0) {
-      console.log(` [QUEUE] Processed ${queueProcessed} chunks for workload ${workloadId} (${queue.length} remaining)`);
+      if (__DEBUG_ON__) console.log(` [QUEUE] Processed ${queueProcessed} chunks for workload ${workloadId} (${queue.length} remaining)`);
     }
 
     // Clean up empty queues
     if (queue.length === 0) {
       streamingChunkQueues.delete(workloadId);
-      console.log(` [QUEUE] Cleared empty queue for workload ${workloadId}`);
+      if (__DEBUG_ON__) console.log(` [QUEUE] Cleared empty queue for workload ${workloadId}`);
     }
   }
 
   const processingTime = Date.now() - startTime;
   if (totalProcessed > 0) {
-    console.log(` [QUEUE] Processed ${totalProcessed} total chunks in ${processingTime}ms`);
+    if (__DEBUG_ON__) console.log(` [QUEUE] Processed ${totalProcessed} total chunks in ${processingTime}ms`);
   }
 }
 
@@ -4112,18 +4115,18 @@ async function dispatchChunkToClientFixed(client, chunkDescriptor, workloadId) {
   // Enhanced deduplication check
   const lastDispatched = activeChunkDispatches.get(dispatchKey);
   if (lastDispatched && (now - lastDispatched) < 10000) {
-    console.log(`[DISPATCH] Preventing duplicate dispatch: ${chunkDescriptor.chunkId} to ${client.id}`);
+    if (__DEBUG_ON__) console.log(`[DISPATCH] Preventing duplicate dispatch: ${chunkDescriptor.chunkId} to ${client.id}`);
     throw new Error('Duplicate dispatch prevented');
   }
 
   // ATOMIC: Record dispatch immediately
   activeChunkDispatches.set(dispatchKey, now);
 
-  console.log(`[CHUNK DISPATCH] === SENDING TO CLIENT ===`);
-  console.log(`[CHUNK DISPATCH] Client ID: ${client.id.substring(0, 8)}...`);
-  console.log(`[CHUNK DISPATCH] Client Type: ${client.clientType || 'browser'}`);
-  console.log(`[CHUNK DISPATCH] Chunk ID: ${chunkDescriptor.chunkId}`);
-  console.log(`[CHUNK DISPATCH] Framework: ${chunkDescriptor.framework}`);
+  if (__DEBUG_ON__) console.log(`[CHUNK DISPATCH] === SENDING TO CLIENT ===`);
+  if (__DEBUG_ON__) console.log(`[CHUNK DISPATCH] Client ID: ${client.id.substring(0, 8)}...`);
+  if (__DEBUG_ON__) console.log(`[CHUNK DISPATCH] Client Type: ${client.clientType || 'browser'}`);
+  if (__DEBUG_ON__) console.log(`[CHUNK DISPATCH] Chunk ID: ${chunkDescriptor.chunkId}`);
+  if (__DEBUG_ON__) console.log(`[CHUNK DISPATCH] Framework: ${chunkDescriptor.framework}`);
 
   try {
     // Create unified task data
@@ -4166,7 +4169,7 @@ async function dispatchChunkToClientFixed(client, chunkDescriptor, workloadId) {
       streamingMetadata: chunkDescriptor.streamingMetadata
     };
 
-    console.log(` [DISPATCH] Sending ${chunkDescriptor.framework} chunk ${chunkDescriptor.chunkId} to ${client.clientType || 'browser'} client ${client.id}`);
+    if (__DEBUG_ON__) console.log(` [DISPATCH] Sending ${chunkDescriptor.framework} chunk ${chunkDescriptor.chunkId} to ${client.clientType || 'browser'} client ${client.id}`);
 
     // Send to appropriate client type with timeout
     const dispatchPromise = new Promise((resolve, reject) => {
@@ -4334,12 +4337,12 @@ function assignCustomChunkToAvailableClientsFixed() {
 }
 
 async function dispatchStreamingChunkEnhanced(workloadId, chunkDescriptor) {
-  console.log(`[STREAMING DISPATCH] === STARTING DISPATCH ===`);
-  console.log(`[STREAMING DISPATCH] Workload: ${workloadId}`);
-  console.log(`[STREAMING DISPATCH] Chunk: ${chunkDescriptor.chunkId}`);
-  console.log(`[STREAMING DISPATCH] Framework: ${chunkDescriptor.framework}`);
-  console.log(`[STREAMING DISPATCH] Has inputs: ${!!chunkDescriptor.inputs} (${chunkDescriptor.inputs?.length || 0})`);
-  console.log(`[STREAMING DISPATCH] Has outputs: ${!!chunkDescriptor.outputs} (${chunkDescriptor.outputs?.length || 0})`);
+  if (__DEBUG_ON__) console.log(`[STREAMING DISPATCH] === STARTING DISPATCH ===`);
+  if (__DEBUG_ON__) console.log(`[STREAMING DISPATCH] Workload: ${workloadId}`);
+  if (__DEBUG_ON__) console.log(`[STREAMING DISPATCH] Chunk: ${chunkDescriptor.chunkId}`);
+  if (__DEBUG_ON__) console.log(`[STREAMING DISPATCH] Framework: ${chunkDescriptor.framework}`);
+  if (__DEBUG_ON__) console.log(`[STREAMING DISPATCH] Has inputs: ${!!chunkDescriptor.inputs} (${chunkDescriptor.inputs?.length || 0})`);
+  if (__DEBUG_ON__) console.log(`[STREAMING DISPATCH] Has outputs: ${!!chunkDescriptor.outputs} (${chunkDescriptor.outputs?.length || 0})`);
 
   try {
     // Find available clients that support the framework
@@ -4373,7 +4376,7 @@ async function dispatchStreamingChunkEnhanced(workloadId, chunkDescriptor) {
 }
 
 function updateStreamingWorkloadProgress(workloadId, chunkId, status) {
-  console.log(` [PROGRESS] Updating streaming progress: ${workloadId} - ${chunkId} - ${status}`);
+  if (__DEBUG_ON__) console.log(` [PROGRESS] Updating streaming progress: ${workloadId} - ${chunkId} - ${status}`);
 
   const workload = customWorkloads.get(workloadId);
   if (!workload) {
@@ -4390,7 +4393,7 @@ function updateStreamingWorkloadProgress(workloadId, chunkId, status) {
       totalCompleted: 0,
       totalFailed: 0
     };
-    console.log(` [PROGRESS] Initialized streaming progress for ${workloadId}`);
+    if (__DEBUG_ON__) console.log(` [PROGRESS] Initialized streaming progress for ${workloadId}`);
   }
 
   const progress = workload.streamingProgress;
@@ -4399,21 +4402,21 @@ function updateStreamingWorkloadProgress(workloadId, chunkId, status) {
     case 'dispatched':
       progress.dispatched.set(chunkId, Date.now());
       progress.totalDispatched++;
-      console.log(` [PROGRESS] Workload ${workloadId}: ${progress.totalDispatched} chunks dispatched`);
+      if (__DEBUG_ON__) console.log(` [PROGRESS] Workload ${workloadId}: ${progress.totalDispatched} chunks dispatched`);
       break;
 
     case 'completed':
       progress.completed.set(chunkId, Date.now());
       progress.totalCompleted++;
       progress.dispatched.delete(chunkId);
-      console.log(` [PROGRESS] Workload ${workloadId}: ${progress.totalCompleted} chunks completed`);
+      if (__DEBUG_ON__) console.log(` [PROGRESS] Workload ${workloadId}: ${progress.totalCompleted} chunks completed`);
       break;
 
     case 'failed':
       progress.failed.set(chunkId, Date.now());
       progress.totalFailed++;
       progress.dispatched.delete(chunkId);
-      console.log(` [PROGRESS] Workload ${workloadId}: ${progress.totalFailed} chunks failed`);
+      if (__DEBUG_ON__) console.log(` [PROGRESS] Workload ${workloadId}: ${progress.totalFailed} chunks failed`);
       break;
   }
 

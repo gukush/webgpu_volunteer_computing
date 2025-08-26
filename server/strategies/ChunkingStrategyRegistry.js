@@ -18,6 +18,9 @@ import DistributedConvolutionAssemblyStrategy from './DistributedConvolutionAsse
 import vm from 'vm';
 import { fileURLToPath } from 'url';
 import path from 'path';
+import { info } from './logger.js';
+const __DEBUG_ON__ = (process.env.LOG_LEVEL || '').toLowerCase() === 'debug';
+
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -44,7 +47,7 @@ export class ChunkingStrategyRegistry {
     this.chunkingStrategies.set(strategy.name, strategy);
     const capabilities = this.analyzeChunkingCapabilities(strategy);
     this.streamingCapabilities.set(strategy.name, capabilities);
-    console.log(`Registered chunking strategy: ${strategy.name}`);
+    if (__DEBUG_ON__) console.log(`Registered chunking strategy: ${strategy.name}`);
   }
 
   /**
@@ -60,7 +63,7 @@ export class ChunkingStrategyRegistry {
     const capabilities = this.analyzeAssemblyCapabilities(strategy);
     this.streamingCapabilities.set(strategy.name, capabilities);
 
-    console.log(`Registered assembly strategy: ${strategy.name}`);
+    if (__DEBUG_ON__) console.log(`Registered assembly strategy: ${strategy.name}`);
   }
 
   analyzeChunkingCapabilities(strategy) {
@@ -128,7 +131,7 @@ export class ChunkingStrategyRegistry {
    */
   registerShaderTemplate(name, shaderCode) {
     this.shaderTemplates.set(name, shaderCode);
-    console.log(`Registered shader template: ${name}`);
+    if (__DEBUG_ON__) console.log(`Registered shader template: ${name}`);
   }
 
   /**
@@ -446,7 +449,7 @@ generateCompatibilityRecommendations(chunkingStrategy, assemblyStrategy, framewo
     this.registerShaderTemplate('matrix_multiply_tiled', this.getMatrixMultiplyTiledShader());
     this.registerShaderTemplate('matrix_tile_extract', this.getMatrixTileExtractShader());
 
-    console.log(`Initialized ${this.chunkingStrategies.size} chunking strategies and ${this.assemblyStrategies.size} assembly strategies`);
+    if (__DEBUG_ON__) console.log(`Initialized ${this.chunkingStrategies.size} chunking strategies and ${this.assemblyStrategies.size} assembly strategies`);
   }
 
   /**
