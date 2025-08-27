@@ -329,7 +329,7 @@ async function executeUnifiedChunk(chunk) {
         console.warn('[UNIFIED] Failed to build explicit uniforms, falling back to metadata if available:', e);
       }
     }
-    
+
     // Handle uniforms/metadata
     if (!chunk.uniforms && chunk.metadata && Object.keys(chunk.metadata).length > 0) {
       (__DEBUG_ON__ ? console.log : function(){})(`[UNIFIED] Setting up uniforms from metadata:`, chunk.metadata);
@@ -1107,7 +1107,7 @@ async function executeWebGPUCompute(chunk) {
         console.warn('[WebGPU] Failed to build explicit uniforms, falling back to metadata if available:', e);
       }
     }
-    
+
     // Handle uniforms/metadata from strategy
     if (!chunk.uniforms && chunk.metadata && Object.keys(chunk.metadata).length > 0) {
       (__DEBUG_ON__ ? console.log : function(){})(`[WebGPU] Setting up uniforms from metadata:`, chunk.metadata);

@@ -8,6 +8,9 @@ import { BaseAssemblyStrategy } from './base/BaseAssemblyStrategy.js';
 import BlockMatrixChunkingStrategy from './BlockMatrixChunkingStrategy.js';
 import BlockMatrixAssemblyStrategy from './BlockMatrixAssemblyStrategy.js';
 
+import SimpleNeuralNetworkChunkingStrategy from './SimpleNeuralNetworkChunkingStrategy.js';
+import SimpleNeuralNetworkAssemblyStrategy from './SimpleNeuralNetworkAssemblyStrategy.js';
+
 import DistributedSortChunkingStrategy from './DistributedSortChunkingStrategy.js';
 import DistributedSortAssemblyStrategy from './DistributedSortAssemblyStrategy.js';
 
@@ -321,6 +324,9 @@ export class ChunkingStrategyRegistry {
 
     this.registerChunkingStrategy(new BlockMatrixChunkingStrategy());
     this.registerAssemblyStrategy(new BlockMatrixAssemblyStrategy());
+
+    this.registerChunkingStrategy(new SimpleNeuralNetworkChunkingStrategy());
+    this.registerAssemblyStrategy(new SimpleNeuralNetworkAssemblyStrategy());
 
     // NEW: Transformer strategies
     this.registerChunkingStrategy(new AttentionChunkingStrategy());
