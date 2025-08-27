@@ -1,7 +1,7 @@
 // ENHANCED: BlockMatrixChunkingStrategy.js - Now provides framework-specific shaders
 import { BaseChunkingStrategy } from './base/BaseChunkingStrategy.js';
 import fs from 'fs/promises';
-import { info } from './logger.js';
+import { info } from '../logger.js';
 const __DEBUG_ON__ = (process.env.LOG_LEVEL || '').toLowerCase() === 'debug';
 
 

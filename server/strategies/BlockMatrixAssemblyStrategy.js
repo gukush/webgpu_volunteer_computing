@@ -3,7 +3,7 @@ import { BaseAssemblyStrategy } from './base/BaseAssemblyStrategy.js';
 import { selectStore } from './storage/MatrixStore.js';
 import path from 'path';
 import os from 'os';
-import { info } from './logger.js';
+import { info } from '../logger.js';
 const __DEBUG_ON__ = (process.env.LOG_LEVEL || '').toLowerCase() === 'debug';
 
 

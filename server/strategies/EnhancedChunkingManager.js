@@ -1,9 +1,9 @@
-// ENHANCED: EnhancedChunkingManager.js - Complete version with streaming support
+// ENHANCED: EnhancedChunkingManager.js - Complete version with streaming support + file-output opts
 import { ChunkingStrategyRegistry } from './ChunkingStrategyRegistry.js';
 import { v4 as uuidv4 } from 'uuid';
-import { info } from './logger.js';
-const __DEBUG_ON__ = (process.env.LOG_LEVEL || '').toLowerCase() === 'debug';
+import { info } from '../logger.js';
 
+const __DEBUG_ON__ = (process.env.LOG_LEVEL || '').toLowerCase() === 'debug';
 
 export class EnhancedChunkingManager {
   constructor() {
@@ -12,6 +12,59 @@ export class EnhancedChunkingManager {
     this.streamingAssemblers = new Map(); // workloadId -> assembler instance
     this.dispatchCallbacks = new Map(); // workloadId -> dispatch function
     this.phaseCompletionHandlers = new Map();
+  }
+
+  // -------- NEW: shared helpers for file-output aware assembly strategies --------
+
+  /**
+   * Build assembly options from workload + plan metadata.
+   * Mirrors BaseAssemblyStrategy constructor opts.
+   */
+  buildAssemblyOptions(workload, plan) {
+    const md = {
+      ...(plan?.metadata || {}),
+      ...(workload?.metadata || {})
+    };
+
+    return {
+      workloadId: workload?.id,
+      metadata: md,
+      storageRoot: process.env.VOLUNTEER_STORAGE,
+      outputMode: md.outputMode,                       // 'file' | 'memory'
+      outputPath: md.outputPath,                       // dir or file path
+      outputFilename: md.outputFilename ?? 'final.bin',
+      splitOutputsAsFiles: !!md.splitOutputsAsFiles,
+      suppressInMemoryOutputs: !!md.suppressInMemoryOutputs
+    };
+  }
+
+  /**
+   * Apply assembly options onto a strategy instance (non-breaking).
+   * Supports multiple conventions, then falls back to setting _opts.
+   */
+  _applyAssemblyOptions(strategy, workload, plan) {
+    if (!strategy) return;
+    const opts = this.buildAssemblyOptions(workload, plan);
+
+    if (typeof strategy.configure === 'function') {
+      strategy.configure(opts);
+      return;
+    }
+    if (typeof strategy.setOptions === 'function') {
+      strategy.setOptions(opts);
+      return;
+    }
+    if (typeof strategy.applyOptions === 'function') {
+      strategy.applyOptions(opts);
+      return;
+    }
+
+    // Fallback: merge into private _opts bag used by BaseAssemblyStrategy extension
+    try {
+      strategy._opts = { ...(strategy._opts || {}), ...opts };
+    } catch {
+      /* no-op */
+    }
   }
 
   /**
@@ -45,6 +98,10 @@ export class EnhancedChunkingManager {
           error: schemaValidation.error
         };
       }
+
+      // Include assembly options early so later phases (batch/stream) can access them
+      plan.metadata = { ...(plan.metadata || {}), ...(workload.metadata || {}) };
+      plan.assemblyOptions = this.buildAssemblyOptions(workload, plan);
 
       return {
         success: true,
@@ -101,6 +158,9 @@ export class EnhancedChunkingManager {
         framework: workload.framework
       };
 
+      // attach assembly options here as well
+      plan.assemblyOptions = this.buildAssemblyOptions(workload, plan);
+
       if (__DEBUG_ON__) console.log(`[CHUNKING MANAGER DEBUG] Plan framework: ${plan.framework}`);
       if (__DEBUG_ON__) console.log(`[CHUNKING MANAGER DEBUG] Workload framework: ${workload.framework}`);
       if (__DEBUG_ON__) console.log(`[STREAMING] Processing workload ${workload.id} in ${streamingMode ? 'streaming' : 'batch'} mode`);
@@ -110,12 +170,14 @@ export class EnhancedChunkingManager {
         return await this.processIterativeWorkload(workload, plan, chunkingStrategy);
       }
 
-      // Initialize streaming assembly if supported
-       const fullPlan = {
-         ...plan,
-         inputRefs: workload.inputRefs,
-         metadata: { ...plan.metadata, ...workload.metadata }
-       };
+      // Build full plan used by dispatch/assembly
+      const fullPlan = {
+        ...plan,
+        inputRefs: workload.inputRefs,
+        metadata: { ...plan.metadata, ...workload.metadata },
+        assemblyOptions: plan.assemblyOptions
+      };
+
       // Initialize streaming assembly if supported
       let assembler = null;
       if (streamingMode && this.supportsStreamingAssembly(workload.assemblyStrategy)) {
@@ -131,19 +193,17 @@ export class EnhancedChunkingManager {
             error: `Failed to initialize streaming assembly: ${assemblyError.message}`
           };
         }
-      }
-      else if (streamingMode) {
+      } else if (streamingMode) {
         console.warn(`️ Streaming mode requested but assembly strategy '${workload.assemblyStrategy}' doesn't support streaming`);
       }
 
       // Register the workload for tracking
       this.registerActiveWorkload(workload.id, fullPlan, [], streamingMode);
 
-      let result;
       if (streamingMode && typeof chunkingStrategy.createChunkDescriptorsStreaming === 'function') {
         // STREAMING MODE: Create and dispatch chunks on-demand
         const dispatchCallback = this.createDispatchCallback(workload.id);
-        result = await chunkingStrategy.createChunkDescriptorsStreaming(fullPlan, dispatchCallback);
+        const result = await chunkingStrategy.createChunkDescriptorsStreaming(fullPlan, dispatchCallback);
 
         if (__DEBUG_ON__) console.log(` Streaming chunk creation started for ${workload.id}`);
 
@@ -156,13 +216,6 @@ export class EnhancedChunkingManager {
         };
       } else {
         // BATCH MODE: Create all chunks upfront
-        // fullPlan already built above
-        /*const fullPlan = {
-          ...plan,
-          inputRefs: workload.inputRefs,
-          metadata: { ...plan.metadata, ...workload.metadata }
-        };
-        */
         let chunkDescriptors;
         if (typeof chunkingStrategy.createChunkDescriptors === 'function') {
           chunkDescriptors = await chunkingStrategy.createChunkDescriptors(fullPlan);
@@ -183,7 +236,7 @@ export class EnhancedChunkingManager {
 
         return {
           success: true,
-          plan,
+          plan: fullPlan,
           chunkDescriptors,
           totalChunks: chunkDescriptors.length,
           streamingMode: false
@@ -204,10 +257,25 @@ export class EnhancedChunkingManager {
    */
   async initializeStreamingAssembly(workload, plan) {
     const assemblyStrategyName = plan.assemblyStrategy || workload.assemblyStrategy;
-    const assemblyStrategy = this.registry.getAssemblyStrategy(assemblyStrategyName);
+    let assemblyStrategy = this.registry.getAssemblyStrategy(assemblyStrategyName);
 
     if (!assemblyStrategy) {
       throw new Error(`Assembly strategy '${assemblyStrategyName}' not found`);
+    }
+
+    // The registry may return a class or an instance; support both
+    if (typeof assemblyStrategy === 'function') {
+      // Assume constructor signature (name, opts) to support BaseAssemblyStrategy extension
+      try {
+        assemblyStrategy = new assemblyStrategy(assemblyStrategyName, this.buildAssemblyOptions(workload, plan));
+      } catch {
+        // Fallback: parameterless
+        assemblyStrategy = new assemblyStrategy();
+        this._applyAssemblyOptions(assemblyStrategy, workload, plan);
+      }
+    } else {
+      // Instance path: apply opts directly
+      this._applyAssemblyOptions(assemblyStrategy, workload, plan);
     }
 
     if (__DEBUG_ON__) console.log(` Initializing streaming assembly with ${assemblyStrategyName}`);
@@ -220,14 +288,12 @@ export class EnhancedChunkingManager {
     // Set up streaming callbacks
     if (typeof assemblyStrategy.onBlockComplete === 'function') {
       assemblyStrategy.onBlockComplete(async (progress) => {
-        // Emit progress updates to clients
         this.emitAssemblyProgress(workload.id, progress);
       });
     }
 
     if (typeof assemblyStrategy.onAssemblyComplete === 'function') {
       assemblyStrategy.onAssemblyComplete(async (result) => {
-        // Handle final assembly completion
         await this.handleStreamingAssemblyComplete(workload.id, result);
       });
     }
@@ -284,10 +350,12 @@ export class EnhancedChunkingManager {
 
   /**
    * Check if strategy supports streaming assembly
+   * (works whether registry returns a class or an instance)
    */
   supportsStreamingAssembly(assemblyStrategyName) {
-    const strategy = this.registry.getAssemblyStrategy(assemblyStrategyName);
-    return strategy && typeof strategy.processChunkResult === 'function';
+    const s = this.registry.getAssemblyStrategy(assemblyStrategyName);
+    const ref = typeof s === 'function' ? s.prototype : s;
+    return ref && typeof ref.processChunkResult === 'function';
   }
 
   /**
@@ -454,7 +522,9 @@ export class EnhancedChunkingManager {
       startedAt: Date.now(),
       completedChunks: new Map(),
       totalChunks: streamingMode ? 0 : chunkDescriptors.length, // Will be updated in streaming mode
-      streamingMode
+      streamingMode,
+      // Include assembly options for later (batch) finalization paths
+      assemblyOptions: plan.assemblyOptions
     };
 
     if (streamingMode) {
@@ -687,12 +757,12 @@ export class EnhancedChunkingManager {
       let completedChunks = 0;
 
       // Set up completion handler for this phase
-      const phaseCompletionHandler = (chunkId, results, processingTime) => {
+      const phaseCompletionHandler = (chunkId, resultsArr, processingTime) => {
         const chunkDesc = chunkDescriptors.find(desc => desc.chunkId === chunkId);
         if (!chunkDesc) return;
 
         // NEW: Handle multi-result format
-        let finalResults = results;
+        let finalResults = resultsArr;
         if (!Array.isArray(finalResults)) {
           finalResults = [finalResults];
         }
@@ -764,12 +834,14 @@ export class EnhancedChunkingManager {
     if (completedCount === totalChunks) {
       if (__DEBUG_ON__) console.log(` All chunks completed for ${parentId}, ready for assembly`);
 
+      // Include assemblyOptions so caller assembling later can honor file-output prefs
       return {
         success: true,
         status: 'complete',
         finalResult: {
           completedChunks: Array.from(workload.completedChunks.values()),
-          plan: workload.plan
+          plan: workload.plan,
+          assemblyOptions: workload.assemblyOptions || workload.plan?.assemblyOptions
         },
         stats: {
           chunkingStrategy: workload.chunkingStrategy,

@@ -12,4 +12,5 @@ services:
     environment:
       - NODE_ENV=development
       - HOST=0.0.0.0  # Listen on all interfaces
+      - LOG_LEVEL=debug
     restart: unless-stopped
