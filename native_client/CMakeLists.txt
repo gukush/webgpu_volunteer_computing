@@ -334,8 +334,58 @@ if(HAVE_VULKAN)
     message(STATUS "Created target: vulkan_client")
 endif()
 
+# Cling (C++ JIT) support
+option(ENABLE_CLING "Enable Cling (C++ JIT) support" ON)
+
+if(ENABLE_CLING)
+    # You can hint these with CLING_HOME or ROOTSYS if needed
+    set(_cling_hint_paths
+        $ENV{CLING_HOME}
+        $ENV{ROOTSYS}
+        /usr/local
+        /usr
+        /opt
+    )
+
+    # Headers
+    find_path(CLING_INCLUDE_DIR cling/Interpreter/Interpreter.h
+        HINTS ${_cling_hint_paths}
+        PATH_SUFFIXES include include/root include/cling
+    )
+
+    # Library (names differ depending on install)
+    find_library(CLING_LIBRARY
+        NAMES cling clingInterpreter
+        HINTS ${_cling_hint_paths}
+        PATH_SUFFIXES lib lib64
+    )
+
+    if(CLING_INCLUDE_DIR AND CLING_LIBRARY)
+        message(STATUS "Cling found - enabling Cling executor")
+        set(HAVE_CLING ON)
+
+        # Create an imported target for Cling
+        add_library(Cling::cling SHARED IMPORTED)
+        set_target_properties(Cling::cling PROPERTIES
+            IMPORTED_LOCATION "${CLING_LIBRARY}"
+            INTERFACE_INCLUDE_DIRECTORIES "${CLING_INCLUDE_DIR}"
+        )
+
+        # NOTE: On some systems you may also need to link libclang / libLLVM.
+        # If linking fails, add additional find_library() calls and append those libs to CLING_EXTRA_LIBS.
+        set(CLING_EXTRA_LIBS "")  # extend if your system needs libclang / libLLVM, e.g. list(APPEND CLING_EXTRA_LIBS clang LLVM)
+
+    else()
+        message(WARNING "Cling not found - disabling Cling executor")
+        set(HAVE_CLING OFF)
+    endif()
+else()
+    message(STATUS "Cling support disabled by user")
+    set(HAVE_CLING OFF)
+endif()
+
 # Universal client that can be built with all available frameworks
-if(HAVE_CUDA OR HAVE_OPENCL OR HAVE_VULKAN)
+if(HAVE_CUDA OR HAVE_OPENCL OR HAVE_VULKAN OR HAVE_CLING)
     set(UNIVERSAL_SOURCES ${COMMON_SOURCES})
     set(UNIVERSAL_LIBS ${BASE_LIBS})
     set(UNIVERSAL_DEFS "")
@@ -364,7 +414,11 @@ if(HAVE_CUDA OR HAVE_OPENCL OR HAVE_VULKAN)
             list(APPEND UNIVERSAL_LIBS shaderc_shared)
         endif()
     endif()
-
+        if(HAVE_CLING)
+        list(APPEND UNIVERSAL_SOURCES cling/cling_executor.cpp)
+        list(APPEND UNIVERSAL_LIBS Cling::cling ${CLING_EXTRA_LIBS})
+        list(APPEND UNIVERSAL_DEFS HAVE_CLING=1)
+    endif()
     add_executable(universal_client
         main.cpp
         ${UNIVERSAL_SOURCES}
@@ -387,6 +441,7 @@ message(STATUS "=== Build Summary ===")
 message(STATUS "CUDA Support: ${HAVE_CUDA}")
 message(STATUS "OpenCL Support: ${HAVE_OPENCL}")
 message(STATUS "Vulkan Support: ${HAVE_VULKAN}")
+message(STATUS "Cling Support: ${HAVE_CLING}")
 if(HAVE_VULKAN)
     message(STATUS "Shaderc Support: ${HAVE_SHADERC}")
 endif()
@@ -397,12 +452,16 @@ endif()
 if(HAVE_CUDA)
     message(STATUS "CUDA Include Path: ${CUDA_INCLUDE_PATH}")
 endif()
+if(HAVE_CLING)
+    message(STATUS "Cling Include: ${CLING_INCLUDE_DIR}")
+    message(STATUS "Cling Library: ${CLING_LIBRARY}")
+endif()
 message(STATUS "====================")
 
 # Installation rules
 set(INSTALL_TARGETS "")
 
-if(HAVE_CUDA OR HAVE_OPENCL OR HAVE_VULKAN)
+if(HAVE_CUDA OR HAVE_OPENCL OR HAVE_VULKAN OR HAVE_CLING)
     list(APPEND INSTALL_TARGETS universal_client)
 endif()
 
@@ -416,6 +475,14 @@ endif()
 
 if(HAVE_VULKAN)
     list(APPEND INSTALL_TARGETS vulkan_client)
+endif()
+
+if(HAVE_CUDA OR HAVE_OPENCL OR HAVE_VULKAN OR HAVE_CLING)
+    list(APPEND INSTALL_TARGETS universal_client)
+endif()
+
+if(HAVE_CLING)
+    list(APPEND INSTALL_TARGETS cling_client)
 endif()
 
 if(INSTALL_TARGETS)
