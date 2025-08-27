@@ -696,21 +696,37 @@ const CUSTOM_CHUNKS_FILE = 'custom_chunks.json';
 const CUSTOM_CHUNK_TIMEOUT = 5 * 60 * 1000;
 
 function saveCustomWorkloads() {
-  /*
   const workloadsArray = Array.from(customWorkloads.values()).map(wl => {
     const workloadToSave = { ...wl };
+
+    // Convert Sets to Arrays for JSON serialization
     if (workloadToSave.activeAssignments instanceof Set) {
       workloadToSave.activeAssignments = Array.from(workloadToSave.activeAssignments);
     }
-    // remove socket references etc if present
+
+    // Save large results to disk to avoid memory issues
+    if (workloadToSave.finalResultBase64 && workloadToSave.finalResultBase64.length > 10 * 1024 * 1024) { // > 10MB
+      const resultPath = path.join(STORAGE_ROOT, wl.id, 'final_result.bin');
+      try {
+        ensureDir(path.dirname(resultPath));
+        fs.writeFileSync(resultPath, Buffer.from(workloadToSave.finalResultBase64, 'base64'));
+        workloadToSave.finalResultPath = resultPath;
+        delete workloadToSave.finalResultBase64; // Remove from memory
+        console.log(`Saved large result to disk: ${resultPath}`);
+      } catch (err) {
+        console.error('Failed to save large result to disk:', err);
+      }
+    }
+
     return workloadToSave;
   });
+
   try {
     fs.writeFileSync(CUSTOM_TASKS_FILE, JSON.stringify(workloadsArray, null, 2));
+    console.log(`Saved ${customWorkloads.size} workloads to ${CUSTOM_TASKS_FILE}`);
   } catch (err) {
     console.error('Error saving custom workloads:', err);
-  }*/
-  console.log('Workload saving disabled for proof of concept');
+  }
 }
 
 function saveCustomWorkloadChunks() {
@@ -743,33 +759,57 @@ function saveCustomWorkloadChunks() {
  console.log('Chunk saving disabled for proof of concept');
 }
 
+
 function loadCustomWorkloads() {
-  /*
   try {
     if (fs.existsSync(CUSTOM_TASKS_FILE)) {
       const data = fs.readFileSync(CUSTOM_TASKS_FILE, 'utf8');
       const workloadsArray = JSON.parse(data);
+
       workloadsArray.forEach(workload => {
+        // Restore default values
         if (workload.status === undefined) {
-          if (workload.finalResult) workload.status = 'complete';
-          else if (workload.results && workload.results.length > 0) workload.status = 'processing';
-          else workload.status = 'queued';
+          if (workload.finalResult || workload.finalResultBase64 || workload.finalResultPath) {
+            workload.status = 'complete';
+          } else if (workload.results && workload.results.length > 0) {
+            workload.status = 'processing';
+          } else {
+            workload.status = 'queued';
+          }
         }
+
         workload.processingTimes = workload.processingTimes || [];
         workload.results = workload.results || [];
         workload.dispatchesMade = workload.dispatchesMade || 0;
         workload.activeAssignments = new Set(workload.activeAssignments || []);
-        if (!workload.outputSizes && workload.outputSize) workload.outputSizes = [workload.outputSize];
-        if (!workload.chunkOutputSizes && workload.chunkOutputSize) workload.chunkOutputSizes = [workload.chunkOutputSize];
+
+        // Handle output size compatibility
+        if (!workload.outputSizes && workload.outputSize) {
+          workload.outputSizes = [workload.outputSize];
+        }
+        if (!workload.chunkOutputSizes && workload.chunkOutputSize) {
+          workload.chunkOutputSizes = [workload.chunkOutputSize];
+        }
+
+        // Load large results from disk if needed
+        if (workload.finalResultPath && fs.existsSync(workload.finalResultPath)) {
+          try {
+            const buffer = fs.readFileSync(workload.finalResultPath);
+            workload.finalResultBase64 = buffer.toString('base64');
+            console.log(`Loaded result from disk: ${workload.finalResultPath}`);
+          } catch (err) {
+            console.warn(`Failed to load result from disk: ${workload.finalResultPath}`, err);
+          }
+        }
+
         customWorkloads.set(workload.id, workload);
       });
+
       console.log(`Loaded ${customWorkloads.size} custom workloads from ${CUSTOM_TASKS_FILE}`);
     }
   } catch (err) {
     console.error('Error loading custom workloads:', err);
   }
-  */
- console.log('Workload loading disabled for proof of concept - starting fresh');
 }
 
 function loadCustomWorkloadChunks() {
@@ -948,6 +988,91 @@ app.post('/api/workloads/advanced', async (req, res) => {
   }
 });
 
+
+
+app.get('/api/workloads/results', (req, res) => {
+  const results = Array.from(customWorkloads.values())
+    .filter(wl => wl.status === 'complete')
+    .map(wl => ({
+      id: wl.id,
+      label: wl.label,
+      completedAt: wl.completedAt,
+      hasResult: !!(wl.finalResultBase64 || wl.finalResultPath),
+      resultSize: wl.finalResultBase64 ? Buffer.from(wl.finalResultBase64, 'base64').length :
+                  (wl.finalResultPath && fs.existsSync(wl.finalResultPath) ? fs.statSync(wl.finalResultPath).size : 0),
+      framework: wl.framework,
+      enhanced: wl.enhanced
+    }));
+
+  res.json({
+    totalResults: results.length,
+    results: results
+  });
+});
+
+app.get('/api/workloads/:id/result/status', (req, res) => {
+  const wl = customWorkloads.get(req.params.id);
+  if (!wl) {
+    return res.status(404).json({ error: 'Workload not found' });
+  }
+
+  const hasMemoryResult = !!wl.finalResultBase64;
+  const hasFileResult = wl.finalResultPath && fs.existsSync(wl.finalResultPath);
+
+  res.json({
+    workloadId: wl.id,
+    status: wl.status,
+    hasResult: hasMemoryResult || hasFileResult,
+    resultLocation: hasMemoryResult ? 'memory' : hasFileResult ? 'disk' : 'none',
+    resultSize: hasMemoryResult ? Buffer.from(wl.finalResultBase64, 'base64').length :
+                hasFileResult ? fs.statSync(wl.finalResultPath).size : 0,
+    completedAt: wl.completedAt
+  });
+});
+
+
+app.delete('/api/workloads/cleanup', (req, res) => {
+  const maxAge = parseInt(req.query.maxAge) || 3600000; // 1 hour default
+  const cutoff = Date.now() - maxAge;
+
+  let cleanedCount = 0;
+  let freedBytes = 0;
+
+  const toDelete = [];
+  customWorkloads.forEach((wl, id) => {
+    if (wl.status === 'complete' && wl.completedAt && wl.completedAt < cutoff) {
+      // Calculate memory freed
+      if (wl.finalResultBase64) {
+        freedBytes += Buffer.from(wl.finalResultBase64, 'base64').length;
+      }
+
+      // Clean up disk files
+      if (wl.finalResultPath && fs.existsSync(wl.finalResultPath)) {
+        try {
+          freedBytes += fs.statSync(wl.finalResultPath).size;
+          fs.unlinkSync(wl.finalResultPath);
+        } catch (err) {
+          console.warn(`Failed to delete result file: ${wl.finalResultPath}`, err);
+        }
+      }
+
+      toDelete.push(id);
+      cleanedCount++;
+    }
+  });
+
+  // Remove from memory
+  toDelete.forEach(id => customWorkloads.delete(id));
+
+  // Save updated state
+  saveCustomWorkloads();
+
+  res.json({
+    cleaned: cleanedCount,
+    freedBytes: freedBytes,
+    remainingWorkloads: customWorkloads.size
+  });
+});
 
 app.get('/api/streaming/queues', (req, res) => {
   const queueInfo = {};
@@ -3742,15 +3867,109 @@ app.post('/api/streaming/process-queues', async (req, res) => {
 });
 
 // --- Download final result if stored on disk ---
-app.get('/api/workloads/:id/download/final', (req, res) => {
+app.get('/api/workloads/:id/download/final', async (req, res) => {
   const wid = req.params.id;
   const wl = customWorkloads.get(wid);
-  if (!wl) return res.status(404).json({ error: 'not found' });
+
+  if (!wl) {
+    return res.status(404).json({ error: 'Workload not found' });
+  }
+
+  if (wl.status !== 'complete') {
+    return res.status(400).json({ error: `Workload not complete (status: ${wl.status})` });
+  }
+
+  // Try memory first
+  if (wl.finalResultBase64) {
+    const buffer = Buffer.from(wl.finalResultBase64, 'base64');
+    res.setHeader('Content-Type', 'application/octet-stream');
+    res.setHeader('Content-Length', buffer.length);
+    res.setHeader('Cache-Control', 'public, max-age=3600'); // Cache for 1 hour
+    return res.send(buffer);
+  }
+
+  // Try disk file
   const outPath = wl.finalResultPath || (wl.metadata && wl.metadata.outputPath);
-  if (!outPath || !fs.existsSync(outPath)) return res.status(404).json({ error: 'no final file' });
-  res.setHeader('Content-Type', 'application/octet-stream');
-  fs.createReadStream(outPath).pipe(res);
+  if (outPath && fs.existsSync(outPath)) {
+    const stats = fs.statSync(outPath);
+    res.setHeader('Content-Type', 'application/octet-stream');
+    res.setHeader('Content-Length', stats.size);
+    res.setHeader('Cache-Control', 'public, max-age=3600');
+
+    const stream = fs.createReadStream(outPath);
+    stream.on('error', (err) => {
+      console.error(`Stream error for ${outPath}:`, err);
+      if (!res.headersSent) {
+        res.status(500).json({ error: 'Stream error' });
+      }
+    });
+    return stream.pipe(res);
+  }
+
+  return res.status(404).json({ error: 'Result data not found' });
 });
+
+function getMemoryUsage() {
+  const usage = process.memoryUsage();
+  let workloadMemory = 0;
+
+  customWorkloads.forEach(wl => {
+    if (wl.finalResultBase64) {
+      workloadMemory += Buffer.from(wl.finalResultBase64, 'base64').length;
+    }
+  });
+
+  return {
+    process: {
+      rss: usage.rss,
+      heapUsed: usage.heapUsed,
+      heapTotal: usage.heapTotal,
+      external: usage.external
+    },
+    workloads: {
+      total: customWorkloads.size,
+      completed: Array.from(customWorkloads.values()).filter(w => w.status === 'complete').length,
+      memoryUsed: workloadMemory
+    }
+  };
+}
+
+
+app.get('/api/system/memory', (req, res) => {
+  res.json(getMemoryUsage());
+});
+
+if (process.env.AUTO_CLEANUP_INTERVAL) {
+  const interval = parseInt(process.env.AUTO_CLEANUP_INTERVAL) || 3600000; // 1 hour
+  const maxAge = parseInt(process.env.AUTO_CLEANUP_MAX_AGE) || 7200000; // 2 hours
+
+  setInterval(() => {
+    const cutoff = Date.now() - maxAge;
+    let cleaned = 0;
+
+    const toDelete = [];
+    customWorkloads.forEach((wl, id) => {
+      if (wl.status === 'complete' && wl.completedAt && wl.completedAt < cutoff) {
+        if (wl.finalResultPath && fs.existsSync(wl.finalResultPath)) {
+          try {
+            fs.unlinkSync(wl.finalResultPath);
+          } catch (err) {
+            console.warn(`Auto-cleanup failed for ${wl.finalResultPath}:`, err);
+          }
+        }
+        toDelete.push(id);
+        cleaned++;
+      }
+    });
+
+    toDelete.forEach(id => customWorkloads.delete(id));
+
+    if (cleaned > 0) {
+      console.log(`Auto-cleanup: removed ${cleaned} old workloads`);
+      saveCustomWorkloads();
+    }
+  }, interval);
+}
 
 app.get('/api/workloads/:id/status', (req, res) => {
   const wid = req.params.id;

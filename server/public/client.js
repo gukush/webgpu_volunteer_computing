@@ -264,8 +264,74 @@ async function executeUnifiedChunk(chunk) {
 
     let bindingIndex = 0;
 
+    // === Explicit binding & uniforms support (keeps legacy fallback) ===
+    const __usedBindings = new Set();
+    function __pushEntryWithBinding(bindingMaybe, buffer) {
+      let binding;
+      if (typeof bindingMaybe === 'number' && Number.isFinite(bindingMaybe)) {
+        binding = bindingMaybe >>> 0;
+      } else {
+        while (__usedBindings.has(bindingIndex)) bindingIndex++;
+        binding = bindingIndex++;
+      }
+      __usedBindings.add(binding);
+      entries.push({ binding, resource: { buffer } });
+      buffers.push(buffer);
+      return binding;
+    }
+    function __buildUniformBufferFromUniforms(uniforms) {
+      if (uniforms && typeof uniforms.data === 'string') {
+        const bytes = Uint8Array.from(atob(uniforms.data), c => c.charCodeAt(0));
+        const size = Math.max(16, bytes.byteLength);
+        const buf = state.device.createBuffer({
+          size,
+          usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+          mappedAtCreation: true
+        });
+        new Uint8Array(buf.getMappedRange()).set(bytes);
+        buf.unmap();
+        return buf;
+      }
+      const keys = Array.isArray(uniforms?.order) && uniforms.order.length
+        ? uniforms.order
+        : Object.keys(uniforms || {}).filter(k => k !== 'binding' && k !== 'order');
+      const BYTES_PER = 4;
+      const size = Math.max(16, keys.length * BYTES_PER);
+      const ab = new ArrayBuffer(size);
+      const dv = new DataView(ab);
+      let off = 0;
+      for (const k of keys) {
+        if (k === 'binding' || k === 'order') continue;
+        const v = uniforms[k];
+        if (Number.isInteger(v)) {
+          dv.setUint32(off, v >>> 0, true);
+        } else {
+          dv.setFloat32(off, Number(v) || 0, true);
+        }
+        off += BYTES_PER;
+      }
+      const buf = state.device.createBuffer({
+        size,
+        usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST
+      });
+      state.device.queue.writeBuffer(buf, 0, ab);
+      return buf;
+    }
+
+    // Prefer explicit uniforms provided by strategy (with optional explicit binding)
+    if (chunk.uniforms) {
+      try {
+        const ubuf = __buildUniformBufferFromUniforms(chunk.uniforms);
+        const ubinding = (typeof chunk.uniforms.binding === 'number') ? chunk.uniforms.binding : 0;
+        __pushEntryWithBinding(ubinding, ubuf);
+        (__DEBUG_ON__ ? console.log : function(){})(`[UNIFIED] Added explicit uniforms at binding ${ubinding}`);
+      } catch (e) {
+        console.warn('[UNIFIED] Failed to build explicit uniforms, falling back to metadata if available:', e);
+      }
+    }
+    
     // Handle uniforms/metadata
-    if (chunk.metadata && Object.keys(chunk.metadata).length > 0) {
+    if (!chunk.uniforms && chunk.metadata && Object.keys(chunk.metadata).length > 0) {
       (__DEBUG_ON__ ? console.log : function(){})(`[UNIFIED] Setting up uniforms from metadata:`, chunk.metadata);
 
       // Create uniform array from metadata
@@ -332,11 +398,7 @@ async function executeUnifiedChunk(chunk) {
           new Uint8Array(inputBuffer.getMappedRange()).set(inputBytes);
           inputBuffer.unmap();
 
-          entries.push({
-            binding: bindingIndex++,
-            resource: { buffer: inputBuffer }
-          });
-          buffers.push(inputBuffer);
+          __pushEntryWithBinding((input && typeof input.binding === 'number') ? input.binding : undefined, inputBuffer);
 
           (__DEBUG_ON__ ? console.log : function(){})(`[UNIFIED] Input ${input.name || i}: ${inputBytes.length} bytes at binding ${bindingIndex - 1}`);
         } catch (err) {
@@ -362,11 +424,7 @@ async function executeUnifiedChunk(chunk) {
         usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC
       });
 
-      entries.push({
-        binding: bindingIndex++,
-        resource: { buffer: outputBuffer }
-      });
-      buffers.push(outputBuffer);
+      __pushEntryWithBinding((output && typeof output.binding === 'number') ? output.binding : undefined, outputBuffer);
       outputBuffers.push(outputBuffer);
 
       (__DEBUG_ON__ ? console.log : function(){})(`[UNIFIED] Output ${output.name || i}: ${output.size} bytes at binding ${bindingIndex - 1}`);
@@ -984,8 +1042,74 @@ async function executeWebGPUCompute(chunk) {
 
     let bindingIndex = 0;
 
+    // === Explicit binding & uniforms support (keeps legacy fallback) ===
+    const __usedBindings = new Set();
+    function __pushEntryWithBinding(bindingMaybe, buffer) {
+      let binding;
+      if (typeof bindingMaybe === 'number' && Number.isFinite(bindingMaybe)) {
+        binding = bindingMaybe >>> 0;
+      } else {
+        while (__usedBindings.has(bindingIndex)) bindingIndex++;
+        binding = bindingIndex++;
+      }
+      __usedBindings.add(binding);
+      entries.push({ binding, resource: { buffer } });
+      buffers.push(buffer);
+      return binding;
+    }
+    function __buildUniformBufferFromUniforms(uniforms) {
+      if (uniforms && typeof uniforms.data === 'string') {
+        const bytes = Uint8Array.from(atob(uniforms.data), c => c.charCodeAt(0));
+        const size = Math.max(16, bytes.byteLength);
+        const buf = state.device.createBuffer({
+          size,
+          usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+          mappedAtCreation: true
+        });
+        new Uint8Array(buf.getMappedRange()).set(bytes);
+        buf.unmap();
+        return buf;
+      }
+      const keys = Array.isArray(uniforms?.order) && uniforms.order.length
+        ? uniforms.order
+        : Object.keys(uniforms || {}).filter(k => k !== 'binding' && k !== 'order');
+      const BYTES_PER = 4;
+      const size = Math.max(16, keys.length * BYTES_PER);
+      const ab = new ArrayBuffer(size);
+      const dv = new DataView(ab);
+      let off = 0;
+      for (const k of keys) {
+        if (k === 'binding' || k === 'order') continue;
+        const v = uniforms[k];
+        if (Number.isInteger(v)) {
+          dv.setUint32(off, v >>> 0, true);
+        } else {
+          dv.setFloat32(off, Number(v) || 0, true);
+        }
+        off += BYTES_PER;
+      }
+      const buf = state.device.createBuffer({
+        size,
+        usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST
+      });
+      state.device.queue.writeBuffer(buf, 0, ab);
+      return buf;
+    }
+
+    // Prefer explicit uniforms provided by strategy (with optional explicit binding)
+    if (chunk.uniforms) {
+      try {
+        const ubuf = __buildUniformBufferFromUniforms(chunk.uniforms);
+        const ubinding = (typeof chunk.uniforms.binding === 'number') ? chunk.uniforms.binding : 0;
+        __pushEntryWithBinding(ubinding, ubuf);
+        (__DEBUG_ON__ ? console.log : function(){})(`[WebGPU] Added explicit uniforms at binding ${ubinding}`);
+      } catch (e) {
+        console.warn('[WebGPU] Failed to build explicit uniforms, falling back to metadata if available:', e);
+      }
+    }
+    
     // Handle uniforms/metadata from strategy
-    if (chunk.metadata && Object.keys(chunk.metadata).length > 0) {
+    if (!chunk.uniforms && chunk.metadata && Object.keys(chunk.metadata).length > 0) {
       (__DEBUG_ON__ ? console.log : function(){})(`[WebGPU] Setting up uniforms from metadata:`, chunk.metadata);
 
       // Create uniform array from metadata fields
@@ -1052,11 +1176,7 @@ async function executeWebGPUCompute(chunk) {
           new Uint8Array(inputBuffer.getMappedRange()).set(inputBytes);
           inputBuffer.unmap();
 
-          entries.push({
-            binding: bindingIndex++,
-            resource: { buffer: inputBuffer }
-          });
-          buffers.push(inputBuffer);
+          __pushEntryWithBinding((input && typeof input.binding === 'number') ? input.binding : undefined, inputBuffer);
 
           (__DEBUG_ON__ ? console.log : function(){})(`[WebGPU] Input ${input.name || i}: ${inputBytes.length} bytes at binding ${bindingIndex - 1}`);
         } catch (err) {
@@ -1082,11 +1202,7 @@ async function executeWebGPUCompute(chunk) {
         usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC
       });
 
-      entries.push({
-        binding: bindingIndex++,
-        resource: { buffer: outputBuffer }
-      });
-      buffers.push(outputBuffer);
+      __pushEntryWithBinding((output && typeof output.binding === 'number') ? output.binding : undefined, outputBuffer);
       outputBuffers.push(outputBuffer);
 
       (__DEBUG_ON__ ? console.log : function(){})(`[WebGPU] Output ${output.name || i}: ${output.size} bytes at binding ${bindingIndex - 1}`);
