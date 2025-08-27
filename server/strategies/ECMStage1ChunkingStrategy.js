@@ -104,15 +104,20 @@ function curveFromSigma64(n, sigma) {
 // WGSL kernel (u64, shift-add mulmod, Montgomery ladder x-only)
 const WGSL_ECM_STAGE1 = /* wgsl */`
 struct Uniforms {
-  n: u64;
-  numCurves: u32;
-  numPrimePowers: u32;
-  _pad: u32;
-};
+  n: u64,
+  numCurves: u32,
+  numPrimePowers: u32,
+  _pad: u32
+}
+
 @group(0) @binding(0) var<uniform> U : Uniforms;
 
 // pairs of (A24, X1) per curve
-struct Curve { A24: u64, X1: u64 };
+struct Curve {
+  A24: u64,
+  X1: u64
+}
+
 @group(0) @binding(1) var<storage, read> CURVES : array<Curve>;
 
 // prime powers pe (each is p^e, u64)
@@ -120,15 +125,17 @@ struct Curve { A24: u64, X1: u64 };
 
 // result: atomic flag + factor (u64 split in two u32)
 struct Result {
-  flag: atomic<u32>;
-  fac_lo: u32;
-  fac_hi: u32;
-};
+  flag: u32,
+  fac_lo: u32,
+  fac_hi: u32
+}
+
 @group(0) @binding(3) var<storage, read_write> OUT : Result;
 
 fn pack_u64(x: u64) -> vec2<u32> {
   return vec2<u32>(u32(x & 0xffff_ffffu), u32(x >> 32u));
 }
+
 fn unpack_u64(v: vec2<u32>) -> u64 {
   return (u64(v.y) << 32u) | u64(v.x);
 }
@@ -168,14 +175,17 @@ fn sqrmod(a: u64, m: u64) -> u64 {
   return mulmod(a, a, m);
 }
 
-fn gcd_u64(mut a: u64, mut b: u64) -> u64 {
-  if (a == 0u) { return b; }
-  if (b == 0u) { return a; }
+fn gcd_u64(a: u64, b: u64) -> u64 {
+  var a_var = a;
+  var b_var = b;
+  if (a_var == 0u) { return b_var; }
+  if (b_var == 0u) { return a_var; }
   // Euclid
   loop {
-    let r = a % b;
-    if (r == 0u) { return b; }
-    a = b; b = r;
+    let r = a_var % b_var;
+    if (r == 0u) { return b_var; }
+    a_var = b_var;
+    b_var = r;
   }
 }
 
@@ -241,7 +251,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   if (idx >= U.numCurves) { return; }
 
   // Early stop if some other thread found a factor
-  if (atomicLoad(&OUT.flag) != 0u) { return; }
+  if (OUT.flag != 0u) { return; }
 
   let n = U.n;
   let c = CURVES[idx];
@@ -256,13 +266,15 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     X = XZ.x; Z = XZ.y;
 
     // Optional early poll: cheap check flag to bail quickly
-    if ((i & 31u) == 0u && atomicLoad(&OUT.flag) != 0u) { return; }
+    if ((i & 31u) == 0u && OUT.flag != 0u) { return; }
   }
 
   // gcd(Z, n): success if 1 < g < n
   let g = gcd_u64(Z % n, n);
   if (g > 1u && g < n) {
-    if (atomicCompareExchangeWeak(&OUT.flag, 0u, 1u).exchanged) {
+    // Set flag and store factor (first thread wins)
+    if (OUT.flag == 0u) {
+      OUT.flag = 1u;
       let v = pack_u64(g);
       OUT.fac_lo = v.x;
       OUT.fac_hi = v.y;
@@ -363,7 +375,7 @@ export default class ECMStage1ChunkingStrategy extends BaseChunkingStrategy {
         chunkId: `${plan.parentId}:${emitted}`,
         chunkIndex: emitted,
         framework: plan.framework || 'webgpu',
-        wgsl: WGSL_ECM_STAGE1,
+        kernel: WGSL_ECM_STAGE1,
         entry: 'main',
         metadata: {
           n_lo: Number(n & 0xffff_ffffn),

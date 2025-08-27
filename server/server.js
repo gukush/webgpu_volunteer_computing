@@ -1395,7 +1395,7 @@ async function dispatchChunkToClient(client, chunkDescriptor, workloadId) {
 
       // Shader code and execution parameters
       kernel: chunkDescriptor.kernel,
-      wgsl: chunkDescriptor.kernel,
+      wgsl: chunkDescriptor.wgsl || chunkDescriptor.kernel,
       entry: chunkDescriptor.entry || 'main',
       workgroupCount: chunkDescriptor.workgroupCount || [1, 1, 1],
 

@@ -20,13 +20,13 @@ import DistributedConvolutionAssemblyStrategy from './DistributedConvolutionAsse
 import ECMStage1ChunkingStrategy from './ECMStage1ChunkingStrategy.js';
 import ECMStage1AssemblyStrategy from './ECMStage1AssemblyStrategy.js';
 
-// NEW: Transformer strategies
-import AttentionChunkingStrategy from './AttentionChunkingStrategy.js';
-import AttentionAssemblyStrategy from './AttentionAssemblyStrategy.js';
-import FeedForwardChunkingStrategy from './FeedForwardChunkingStrategy.js';
-import FeedForwardAssemblyStrategy from './FeedForwardAssemblyStrategy.js';
-import LayerNormChunkingStrategy from './LayerNormChunkingStrategy.js';
-import LayerNormAssemblyStrategy from './LayerNormAssemblyStrategy.js';
+// NEW: Transformer strategies (commented out until implemented)
+// import AttentionChunkingStrategy from './AttentionChunkingStrategy.js';
+// import AttentionAssemblyStrategy from './AttentionAssemblyStrategy.js';
+// import FeedForwardChunkingStrategy from './FeedForwardChunkingStrategy.js';
+// import FeedForwardAssemblyStrategy from './FeedForwardAssemblyStrategy.js';
+// import LayerNormChunkingStrategy from './LayerNormChunkingStrategy.js';
+// import LayerNormAssemblyStrategy from './LayerNormAssemblyStrategy.js';
 
 import vm from 'vm';
 import { fileURLToPath } from 'url';
@@ -329,12 +329,12 @@ export class ChunkingStrategyRegistry {
     this.registerAssemblyStrategy(new SimpleNeuralNetworkAssemblyStrategy());
 
     // NEW: Transformer strategies
-    this.registerChunkingStrategy(new AttentionChunkingStrategy());
-    this.registerAssemblyStrategy(new AttentionAssemblyStrategy());
-    this.registerChunkingStrategy(new FeedForwardChunkingStrategy());
-    this.registerAssemblyStrategy(new FeedForwardAssemblyStrategy());
-    this.registerChunkingStrategy(new LayerNormChunkingStrategy());
-    this.registerAssemblyStrategy(new LayerNormAssemblyStrategy());
+    // this.registerChunkingStrategy(new AttentionChunkingStrategy());
+    // this.registerAssemblyStrategy(new AttentionAssemblyStrategy());
+    // this.registerChunkingStrategy(new FeedForwardChunkingStrategy());
+    // this.registerAssemblyStrategy(new FeedForwardAssemblyStrategy());
+    // this.registerChunkingStrategy(new LayerNormChunkingStrategy());
+    // this.registerAssemblyStrategy(new LayerNormAssemblyStrategy());
 
     // Shader templates
     this.registerShaderTemplate('linear_process', this.getLinearProcessShader());

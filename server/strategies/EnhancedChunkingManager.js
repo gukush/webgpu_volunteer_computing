@@ -559,6 +559,11 @@ export class EnhancedChunkingManager {
           strategy.name === 'file_processing') {
         return true;
       }
+      
+      // ECM strategy generates all data internally - no file upload needed
+      if (strategy.name === 'ecm_stage1') {
+        return false;
+      }
     }
 
     // Legacy strategies that process inline input don't need separate file upload
