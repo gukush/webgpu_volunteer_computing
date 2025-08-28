@@ -12,6 +12,21 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     pocl-opencl-icd \
     && rm -rf /var/lib/apt/lists/*
 
+# Install Cling dependencies
+# Option 1: Install ROOT which includes Cling (recommended for stability)
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    wget \
+    && wget https://root.cern/download/root_v6.28.10.Linux-ubuntu22-x86_64-gcc11.4.tar.gz \
+    && tar -xzf root_v6.28.10.Linux-ubuntu22-x86_64-gcc11.4.tar.gz -C /opt/ \
+    && rm root_v6.28.10.Linux-ubuntu22-x86_64-gcc11.4.tar.gz \
+    && rm -rf /var/lib/apt/lists/*
+
+# Set ROOT/Cling environment
+ENV ROOTSYS=/opt/root
+ENV PATH=$ROOTSYS/bin:$PATH
+ENV LD_LIBRARY_PATH=$ROOTSYS/lib:$LD_LIBRARY_PATH
+ENV CLING_HOME=$ROOTSYS
+
 # Install vcpkg
 ENV VCPKG_ROOT=/opt/vcpkg
 RUN git clone --depth=1 https://github.com/microsoft/vcpkg.git ${VCPKG_ROOT} \
@@ -21,7 +36,7 @@ RUN git clone --depth=1 https://github.com/microsoft/vcpkg.git ${VCPKG_ROOT} \
 ARG VCPKG_TRIPLET=x64-linux
 ENV VCPKG_TRIPLET=${VCPKG_TRIPLET}
 
-# Install only what we need — rely on system libvulkan loader
+# Install only what we need – rely on system libvulkan loader
 RUN ${VCPKG_ROOT}/vcpkg install --triplet=${VCPKG_TRIPLET} \
     boost-system \
     boost-url \
@@ -46,6 +61,8 @@ RUN cmake -S . -B build \
     -DOPENCL_INCLUDE_DIR=/usr/include \
     -DOPENCL_LIBRARY_PATH=/usr/lib/x86_64-linux-gnu/libOpenCL.so \
     -DENABLE_CUDA=OFF \
+    -DENABLE_CLING=ON \
+    -DCLING_HOME=${CLING_HOME} \
  && cmake --build build --parallel \
  && cmake --install build --prefix /opt/mfc
 
@@ -57,21 +74,32 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libstdc++6 \
     libvulkan1 mesa-vulkan-drivers \
     ocl-icd-libopencl1 pocl-opencl-icd clinfo \
+    python3 \
     && rm -rf /var/lib/apt/lists/*
 
 # FIXED: Set VCPKG_TRIPLET in runtime stage
 ARG VCPKG_TRIPLET=x64-linux
 ENV VCPKG_TRIPLET=${VCPKG_TRIPLET}
 
+# Copy built application
 COPY --from=build /opt/mfc /opt/mfc
 COPY --from=build /opt/vcpkg/installed /opt/vcpkg/installed
 
-# FIXED: Set LD_LIBRARY_PATH properly with fallback
-ENV LD_LIBRARY_PATH=/opt/vcpkg/installed/${VCPKG_TRIPLET}/lib:/opt/vcpkg/installed/${VCPKG_TRIPLET}/lib/manual-link:/usr/local/lib:/usr/lib
+# Copy ROOT/Cling runtime
+COPY --from=build /opt/root /opt/root
+
+# Set environment variables for runtime
+ENV ROOTSYS=/opt/root
+ENV PATH=$ROOTSYS/bin:$PATH
+ENV CLING_HOME=$ROOTSYS
+
+# FIXED: Set LD_LIBRARY_PATH properly with fallback and ROOT libraries
+ENV LD_LIBRARY_PATH=/opt/vcpkg/installed/${VCPKG_TRIPLET}/lib:/opt/vcpkg/installed/${VCPKG_TRIPLET}/lib/manual-link:/opt/root/lib:/usr/local/lib:/usr/lib
 
 WORKDIR /opt/mfc/bin
 
-#ENV FRAMEWORK=vulkan
-#ENV CLIENT_TYPE=vulkan
+# Example environment variables (uncomment as needed)
+#ENV FRAMEWORK=cling
+#ENV CLIENT_TYPE=cling
 #ENV SERVER_URL=https://localhost:3000
 #ENTRYPOINT ["/bin/sh"]
