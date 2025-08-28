@@ -299,7 +299,7 @@ async createChunkDescriptorsStreaming(plan, dispatchCallback) {
 }
 
   // NEW: Create framework-specific chunk descriptors
-  createFrameworkSpecificDescriptor(framework, chunkIndex, i, j, k, blockA, blockB, blockSize, matrixSize, parentId, blockByteSize) {
+  async createFrameworkSpecificDescriptor(framework, chunkIndex, i, j, k, blockA, blockB, blockSize, matrixSize, parentId, blockByteSize) {
     if (__DEBUG_ON__) console.log(`[STRATEGY DEBUG] createFrameworkSpecificDescriptor called with framework: ${framework}`);
     const baseDescriptor = {
       chunkId: `block-${i}-${j}-k${k}`,
@@ -315,20 +315,21 @@ async createChunkDescriptorsStreaming(plan, dispatchCallback) {
       assemblyMetadata: { outputBlockRow: i, outputBlockCol: j, kIndex: k }
     };
     if (__DEBUG_ON__) console.log(`[STRATEGY DEBUG] Base descriptor created, framework: ${framework}`);
-
+    let kernelSource;
     switch (framework) {
       case 'webgpu':
+        kernelSource = await this.getKernelFromFile('webgpu','compute');
         return {
           ...baseDescriptor,
-          kernel: this.getWebGPUShader(),
+          kernel: kernelSource,
           entry: 'main',
           workgroupCount: [Math.ceil(blockSize / 16), Math.ceil(blockSize / 16), 1]
         };
 
       case 'webgl':
         if (__DEBUG_ON__) console.log(`[STRATEGY DEBUG] Creating WebGL descriptor`);
-        const webglVertexShader = this.getWebGLVertexShader();
-        const webglFragmentShader = this.getWebGLFragmentShader();
+        const webglVertexShader = await this.getKernelFromFile('webgl', 'vertex');
+        const webglFragmentShader = await this.getKernelFromFile('webgl', 'fragment');
         if (__DEBUG_ON__) console.log(`[STRATEGY DEBUG] Retrieved WebGL shaders:`);
         if (__DEBUG_ON__) console.log(`[STRATEGY DEBUG] - Vertex shader length:`, webglVertexShader ? webglVertexShader.length : 'undefined');
         if (__DEBUG_ON__) console.log(`[STRATEGY DEBUG] - Fragment shader length:`, webglFragmentShader ? webglFragmentShader.length : 'undefined');
@@ -352,9 +353,10 @@ async createChunkDescriptorsStreaming(plan, dispatchCallback) {
         if (__DEBUG_ON__) console.log(`[STRATEGY DEBUG] Has webglVertexShader:`, !!descriptor.webglVertexShader);
         return descriptor;
       case 'javascript':
+        kernelSource = await this.getKernelFromFile('javascript', 'kernel');
       return {
         ...baseDescriptor,
-        kernel: this.getJavaScriptKernel(),
+        kernel: kernelSource,
         entry: 'blockMatrixMultiply',
         workgroupCount: [1, 1, 1], // Not used for JS, but kept for consistency
         jsExecutionHints: {
@@ -364,28 +366,31 @@ async createChunkDescriptorsStreaming(plan, dispatchCallback) {
         }
       };
       case 'vulkan':  // NEW: Add Vulkan support
+         kernelSource = await this.getKernelFromFile('vulkan', 'compute');
         if (__DEBUG_ON__) console.log(`[STRATEGY DEBUG] Creating Vulkan descriptor`);
         return {
           ...baseDescriptor,
-          kernel: this.getVulkanShader(),
+          kernel: kernelSource,
           entry: 'main',
           workgroupCount: [Math.ceil(blockSize / 16), Math.ceil(blockSize / 16), 1],
           shaderType: 'glsl'  // Indicate this is GLSL for Vulkan
         };
 
       case 'cuda':
+        kernelSource = await this.getKernelFromFile('cuda', 'kernel');
         return {
           ...baseDescriptor,
-          kernel: this.getCUDAKernel(),
+          kernel: kernelSource,
           entry: 'block_matrix_multiply',
           blockDim: [16, 16, 1],
           gridDim: [Math.ceil(blockSize / 16), Math.ceil(blockSize / 16), 1]
         };
 
       case 'opencl':
+        kernelSource = await this.getKernelFromFile('opencl', 'kernel');
         return {
           ...baseDescriptor,
-          kernel: this.getOpenCLKernel(),
+          kernel: kernelSource,
           entry: 'block_matrix_multiply',
           globalWorkSize: [blockSize, blockSize],
           localWorkSize: [16, 16]
@@ -395,320 +400,41 @@ async createChunkDescriptorsStreaming(plan, dispatchCallback) {
         throw new Error(`Unsupported framework: ${framework}`);
     }
   }
-  // WebGPU shader (existing)
-  getWebGPUShader() {
-    return `
-      struct BlockParams {
-        block_size: u32,
-        matrix_size: u32,
-      }
 
-      @group(0) @binding(0) var<uniform> params: BlockParams;
-      @group(0) @binding(1) var<storage, read> block_a: array<f32>;
-      @group(0) @binding(2) var<storage, read> block_b: array<f32>;
-      @group(0) @binding(3) var<storage, read_write> partial_result: array<f32>;
-
-      @compute @workgroup_size(16, 16, 1)
-      fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-        let row = gid.x;
-        let col = gid.y;
-        if (row >= params.block_size || col >= params.block_size) {
-          return;
-        }
-        var sum = 0.0;
-        for (var k = 0u; k < params.block_size; k++) {
-          let a_val = block_a[row * params.block_size + k];
-          let b_val = block_b[k * params.block_size + col];
-          sum = sum + a_val * b_val;
-        }
-        partial_result[row * params.block_size + col] = sum;
-      }
-    `;
-  }
-
-  // NEW: WebGL vertex shader for matrix block multiplication
-  getWebGLVertexShader() {
-    return `#version 300 es
-      precision highp float;
-      precision highp sampler2D;
-
-      in float a_index;
-      uniform int u_block_size;
-      uniform sampler2D u_input_0; // A block, size = block_size x block_size
-      uniform sampler2D u_input_1; // B block, size = block_size x block_size
-
-      out float v_result;
-
-      void main() {
-        int idx = int(a_index);
-        int n = u_block_size;
-        int r = idx / n;
-        int c = idx % n;
-
-        float sum = 0.0;
-        for (int k = 0; k < n; ++k) {
-          float a_val = texelFetch(u_input_0, ivec2(k, r), 0).r; // A[r,k]
-          float b_val = texelFetch(u_input_1, ivec2(c, k), 0).r; // B[k,c]
-          sum += a_val * b_val;
-        }
-        v_result = sum;
-        gl_Position = vec4(0.0);   // rasterizer discard will be enabled
-        gl_PointSize = 1.0;
-      }
-
-    `;
-  }
-
-  // NEW: WebGL fragment shader (minimal, required but not used for transform feedback)
-  getWebGLFragmentShader() {
-    return `#version 300 es
-      precision highp float;
-      out vec4 fragColor;
-
-      void main() {
-        fragColor = vec4(1.0);
-      }
-    `;
-  }
-
-  getJavaScriptKernel() {
-  return `
-    // JavaScript CPU kernel for block matrix multiplication
-    // This function will be executed in the browser's JavaScript engine
-    function blockMatrixMultiply(blockA, blockB, blockSize) {
-      const result = new Float32Array(blockSize * blockSize);
-
-      // Standard matrix multiplication algorithm
-      for (let i = 0; i < blockSize; i++) {
-        for (let j = 0; j < blockSize; j++) {
-          let sum = 0;
-          for (let k = 0; k < blockSize; k++) {
-            const aVal = blockA[i * blockSize + k];
-            const bVal = blockB[k * blockSize + j];
-            sum += aVal * bVal;
-          }
-          result[i * blockSize + j] = sum;
-        }
-      }
-
-      return result;
+    async getKernelFromFile(framework, type) {
+    const filename = `block_matrix_multiply_${framework}_${type}`;
+    let extension;
+    switch (framework) {
+      case 'webgpu':
+      case 'vulkan':
+        extension = 'wgsl'; // or .comp, .glsl, etc. for Vulkan
+        break;
+      case 'webgl':
+        extension = 'glsl';
+        break;
+      case 'javascript':
+        extension = 'js';
+        break;
+      case 'cuda':
+        extension = 'cu';
+        break;
+      case 'opencl':
+        extension = 'cl';
+        break;
+      default:
+        throw new Error(`Unknown extension for framework: ${framework}`);
     }
-
-    // Metadata for the kernel
-    // block_size: Size of the matrix block (N x N)
-    // matrix_size: Size of the full matrix (for reference)
-  `;
-  }
-  // NEW: CUDA kernel
-  getCUDAKernel() {
-    return `
-      extern "C" __global__ void block_matrix_multiply(
-          int block_size,            // Uniform 0: Block size
-          int matrix_size,           // Uniform 1: Matrix size
-          const float* block_a,      // Input 0: A block data
-          const float* block_b,      // Input 1: B block data
-          float* partial_result      // Output 0: Result block
-      ) {
-          int row = blockIdx.x * blockDim.x + threadIdx.x;
-          int col = blockIdx.y * blockDim.y + threadIdx.y;
-
-          // Bounds checking
-          if (row >= block_size || col >= block_size) return;
-
-          // Debug: Print thread info for first few threads
-          if (row == 0 && col == 0) {
-              printf("CUDA kernel: block_size=%d, matrix_size=%d\\n", block_size, matrix_size);
-              printf("CUDA kernel: gridDim=(%d,%d,%d), blockDim=(%d,%d,%d)\\n",
-                    gridDim.x, gridDim.y, gridDim.z, blockDim.x, blockDim.y, blockDim.z);
-          }
-
-          float sum = 0.0f;
-          for (int k = 0; k < block_size; k++) {
-              float a_val = block_a[row * block_size + k];
-              float b_val = block_b[k * block_size + col];
-              sum += a_val * b_val;
-          }
-
-          int output_idx = row * block_size + col;
-          partial_result[output_idx] = sum;
-
-          // Debug: Print first result
-          if (row == 0 && col == 0) {
-              printf("CUDA kernel: first result = %f (a[0]=%f, b[0]=%f)\\n",
-                    sum, block_a[0], block_b[0]);
-          }
-      }
-    `;
+    const kernelPath = path.join(process.cwd(), 'kernels', `${filename}.${extension}`);
+    if (__DEBUG_ON__) console.log(`[FILE IO] Attempting to read kernel from: ${kernelPath}`);
+    try {
+      const content = await fs.readFile(kernelPath, 'utf8');
+      return content;
+    } catch (err) {
+      console.error(`Error reading kernel file from ${kernelPath}:`, err);
+      throw new Error(`Failed to load kernel for ${framework} from file: ${kernelPath}`);
+    }
   }
 
-  getCUDAKernel2() {
-  return `
-#include <cuda_fp16.h>
-#include <mma.h>
-using namespace nvcuda;
-
-// Tensor Core (WMMA) block-matmul.
-// - Computes one block_size x block_size result tile made of 16x16 WMMA tiles
-// - Assumes row-major inputs/outputs
-// - Works even if block_size is not a multiple of 16 (last tile is zero-padded)
-
-extern "C" __global__ void block_matrix_multiply(
-    int block_size,                   // Uniform 0
-    int matrix_size,                  // Uniform 1 (unused but kept for parity)
-    const float* __restrict__ block_a,// Input 0 (row-major, f32)
-    const float* __restrict__ block_b,// Input 1 (row-major, f32)
-    float* __restrict__ partial_result// Output 0 (row-major, f32)
-){
-#if __CUDA_ARCH__ >= 700
-    // Which 16x16 output tile do we compute?
-    const int tile_m = blockIdx.y * 16;   // row offset in C
-    const int tile_n = blockIdx.x * 16;   // col offset in C
-
-    // We'll let a single warp compute one 16x16 tile via WMMA.
-    // If you keep blockDim=(16,16,1) like the old kernel, only warp 0 will do work.
-    const int linear_tid = threadIdx.y * blockDim.x + threadIdx.x;
-    const int warp_id    = linear_tid / warpSize; // 0..(threads/32 - 1)
-    const int lane_id    = linear_tid % warpSize;
-
-    // Shared staging to convert f32 -> f16 for A and B tiles
-    __shared__ half  shA[16*16];
-    __shared__ half  shB[16*16];
-    __shared__ float shC[16*16];  // for ragged-edge safe store
-
-    if (warp_id == 0) {
-      // WMMA fragments
-      wmma::fragment<wmma::matrix_a, 16, 16, 16, half,  wmma::row_major> a_frag;
-      wmma::fragment<wmma::matrix_b, 16, 16, 16, half,  wmma::row_major> b_frag;
-      wmma::fragment<wmma::accumulator, 16, 16, 16, float>                c_frag;
-
-      wmma::fill_fragment(c_frag, 0.0f);
-
-      // K loop in 16-wide chunks
-      for (int k = 0; k < block_size; k += 16) {
-        // How big are the active subtiles (handle tails)?
-        const int a_rows = min(16, block_size - tile_m);
-        const int a_cols = min(16, block_size - k);
-        const int b_rows = min(16, block_size - k);
-        const int b_cols = min(16, block_size - tile_n);
-
-        // Convert current 16x16 A and B tiles from f32 to f16 into shared
-        for (int i = lane_id; i < 256; i += 32) {
-          const int r = i / 16;
-          const int c = i % 16;
-
-          // A(tile_m:tile_m+16, k:k+16)
-          float a_val = (r < a_rows && c < a_cols)
-                        ? block_a[(tile_m + r) * block_size + (k + c)]
-                        : 0.0f;
-          // B(k:k+16, tile_n:tile_n+16)
-          float b_val = (r < b_rows && c < b_cols)
-                        ? block_b[(k + r) * block_size + (tile_n + c)]
-                        : 0.0f;
-
-          shA[i] = __float2half_rn(a_val);
-          shB[i] = __float2half_rn(b_val);
-        }
-        __syncthreads();
-
-        // Load into WMMA fragments and multiply-accumulate
-        wmma::load_matrix_sync(a_frag, shA, 16);
-        wmma::load_matrix_sync(b_frag, shB, 16);
-        wmma::mma_sync(c_frag, a_frag, b_frag, c_frag);
-
-        __syncthreads();
-      }
-
-      // Store: use shared buffer so we can clip ragged tiles cleanly
-      wmma::store_matrix_sync(shC, c_frag, 16, wmma::mem_row_major);
-      __syncthreads();
-
-      for (int i = lane_id; i < 256; i += 32) {
-        const int r = i / 16;
-        const int c = i % 16;
-        if (tile_m + r < block_size && tile_n + c < block_size) {
-          partial_result[(tile_m + r) * block_size + (tile_n + c)] = shC[i];
-        }
-      }
-    }
-#else
-    // Fallback (no tensor cores): naive per-thread multiply for compatibility
-    int row = blockIdx.x * blockDim.x + threadIdx.x;
-    int col = blockIdx.y * blockDim.y + threadIdx.y;
-    if (row < block_size && col < block_size) {
-      float sum = 0.0f;
-      for (int kk = 0; kk < block_size; ++kk) {
-        sum += block_a[row * block_size + kk] * block_b[kk * block_size + col];
-      }
-      partial_result[row * block_size + col] = sum;
-    }
-#endif
-}
-  `;
-}
-  // NEW: OpenCL kernel
-  getOpenCLKernel() {
-    return `
-      __kernel void block_matrix_multiply(
-          const uint block_size,              // position 0 - uniforms first (matches executor)
-          const uint matrix_size,             // position 1
-          __global const float* block_a,      // position 2 - inputs second
-          __global const float* block_b,      // position 3
-          __global float* partial_result      // position 4 - outputs last
-      ) {
-          int row = get_global_id(0);
-          int col = get_global_id(1);
-
-          if (row >= block_size || col >= block_size) return;
-
-          float sum = 0.0f;
-          for (int k = 0; k < block_size; k++) {
-              sum += block_a[row * block_size + k] * block_b[k * block_size + col];
-          }
-
-          partial_result[row * block_size + col] = sum;
-      }
-    `;
-  }
-      getVulkanShader() {
-      return `#version 450
-    layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
-
-    layout(set = 0, binding = 0) uniform BlockParams {
-      uint block_size;
-      uint matrix_size;
-    } params;
-
-    layout(set = 0, binding = 1) readonly buffer BlockA {
-      float block_a[];
-    };
-
-    layout(set = 0, binding = 2) readonly buffer BlockB {
-      float block_b[];
-    };
-
-    layout(set = 0, binding = 3) writeonly buffer PartialResult {
-      float partial_result[];
-    };
-
-    void main() {
-      uint row = gl_GlobalInvocationID.x;
-      uint col = gl_GlobalInvocationID.y;
-
-      if (row >= params.block_size || col >= params.block_size) {
-        return;
-      }
-
-      float sum = 0.0;
-      for (uint k = 0; k < params.block_size; k++) {
-        float a_val = block_a[row * params.block_size + k];
-        float b_val = block_b[k * params.block_size + col];
-        sum = sum + a_val * b_val;
-      }
-
-      partial_result[row * params.block_size + col] = sum;
-    }`;
-    }
-  // Existing helper methods remain unchanged
   async readBlockFromHandle(fileHandle, matrixType, blockCoords, blockSize, matrixSize) {
     const floatSize = 4;
     const matrixAOffset = 4;
