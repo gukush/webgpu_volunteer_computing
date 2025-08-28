@@ -6,7 +6,7 @@
 #include <string>
 #include <optional>
 #include <memory>
-
+#include <unordered_map>
 
 // Vulkan executor implementing Multi-Input / Multi-Output (MIMO) interface used by the framework.
 class VulkanExecutor final : public IFrameworkExecutor {
@@ -41,7 +41,21 @@ private:
                       VkBufferUsageFlags usage,
                       VkMemoryPropertyFlags props,
                       VkBuffer& outBuf, VkDeviceMemory& outMem) const;
+    struct CompiledShader {
+                    std::vector<uint32_t> spirv;
+                    VkShaderModule shaderModule{VK_NULL_HANDLE};
+                    std::string entryPoint;
+                };
 
+    void cleanupShaderCache();
+    std::string makeCacheKey(const std::string& source,
+            const std::string& entry,
+            const json& compileOpts) const;
+    bool getOrCompileShader(const std::string& source,
+            const std::string& entry,
+            const json& compileOpts,
+            CompiledShader*& outShader);
+    std::unordered_map<std::string, CompiledShader> shaderCache_;
     struct Buffer {
         VkBuffer buf{VK_NULL_HANDLE};
         VkDeviceMemory mem{VK_NULL_HANDLE};

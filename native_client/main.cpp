@@ -13,6 +13,10 @@
 #include "common/base64.hpp"
 #include "common/websocket_client.hpp"
 
+// Timing measurements for native client
+#include <map>
+#include <string>
+
 
 // Framework-specific includes
 #if defined(HAVE_VULKAN) && (defined(CLIENT_VULKAN) || defined(CLIENT_UNIVERSAL))
@@ -35,9 +39,48 @@ std::unique_ptr<WebSocketClient> globalWebSocketClient;
 std::unique_ptr<IFrameworkExecutor> globalExecutor;
 bool shutdownRequested = false;
 
+// Timing measurements for native client
+class NativeTimingManager {
+private:
+    std::map<std::string, std::chrono::high_resolution_clock::time_point> chunkStartTimes;
+    std::map<std::string, double> chunkProcessingTimes;
+
+public:
+    void startChunkTiming(const std::string& chunkId) {
+        chunkStartTimes[chunkId] = std::chrono::high_resolution_clock::now();
+    }
+
+    void recordChunkProcessingTime(const std::string& chunkId, double processingTime) {
+        chunkProcessingTimes[chunkId] = processingTime;
+        auto it = chunkStartTimes.find(chunkId);
+        if (it != chunkStartTimes.end()) {
+            auto endTime = std::chrono::high_resolution_clock::now();
+            auto roundTripTime = std::chrono::duration<double, std::milli>(endTime - it->second).count();
+
+            std::cout << "[TIMING] Chunk " << chunkId << " timing:" << std::endl;
+            std::cout << "  - Client processing time: " << processingTime << " ms" << std::endl;
+            std::cout << "  - Round-trip time: " << roundTripTime << " ms" << std::endl;
+
+            // Clean up timing data
+            chunkStartTimes.erase(it);
+            chunkProcessingTimes.erase(chunkId);
+        }
+    }
+
+    void cleanup() {
+        chunkStartTimes.clear();
+        chunkProcessingTimes.clear();
+    }
+};
+
+static NativeTimingManager timingManager;
+
 void signalHandler(int signum) {
     std::cout << "\nReceived signal " << signum << ", shutting down..." << std::endl;
     shutdownRequested = true;
+
+    // Clean up timing data
+    timingManager.cleanup();
 
     if (globalWebSocketClient) {
         globalWebSocketClient->disconnect();
@@ -481,6 +524,9 @@ private:
             std::string strategy = chunk.value("chunkingStrategy", "");
             json metadata = chunk.value("metadata", json::object());
 
+            // Start timing for this chunk
+            timingManager.startChunkTiming(chunkId);
+
             // Convert JSON chunk to TaskData struct
             TaskData taskData = convertJsonToTaskData(chunk, true);
             taskData.parentId = parentId;
@@ -490,6 +536,9 @@ private:
             TaskResult result = executor->executeTask(taskData);
 
             if (result.success) {
+                // Record timing for this chunk
+                timingManager.recordChunkProcessingTime(chunkId, result.processingTime);
+
                 // Convert multi-output results to JSON array
                 json results = json::array();
                 if (result.hasMultipleOutputs()) {
