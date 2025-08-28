@@ -1,5 +1,4 @@
 // --- lightweight client logger (debug guard) ---
-import { NvmlBridgeBrowser } from './nvmlBridgeBrowser.js';
 (function(){
   const q = new URLSearchParams(location.search);
   const lvl = (window.LOG_LEVEL || q.get('log') || 'info').toLowerCase();
@@ -20,49 +19,6 @@ const state = {
   completedTasks: 0,
   statistics: { processingTime: 0 }
 };
-
-// NVML BRIDGE
-
-const _q = new URLSearchParams(location.search);
-const NVML_URL =
-  _q.get('nvml') ||
-  (location.protocol === 'https:' ? `wss://${location.host}/nvml` : 'ws://127.0.0.1:8765');
-const NVML_GPU = Number(_q.get('nvmlGpu') || 0);
-
-export const nvmlBridge = new NvmlBridgeBrowser({ url: NVML_URL, gpuIndex: NVML_GPU });
-nvmlBridge.start();
-
-// Optional: observe acks/summaries from the local listener
-//nvmlBridge.onMessage((msg) => {
-// console.debug('[nvml-listener<-]', msg);
-//});
-
-// Auto-instrument the most common chunk handler if present.
-// If there is different function name, add it to 'candidates' or
-// call nvmlBridge.notifyChunkStart/End/Error manually at the right places.
-(function instrumentChunkHandler(){
-const candidates = ['handleChunk', 'onChunkAssigned', 'processChunk'];
-for (const name of candidates) {
-  const fn = (typeof window !== 'undefined') ? window[name] : undefined;
-  if (typeof fn === 'function') {
-    const wrapped = async function(chunk, ...rest) {
-      const chunkId = String(chunk?.chunkId ?? chunk?.id ?? 'unknown');
-      try {
-        nvmlBridge.notifyChunkStart(chunkId);
-        const result = await fn.apply(this, [chunk, ...rest]);
-        nvmlBridge.notifyChunkEnd(chunkId);
-        return result;
-      } catch (e) {
-        nvmlBridge.notifyChunkError(chunkId);
-        throw e;
-      }
-    };
-    if (typeof window !== 'undefined') window[name] = wrapped;
-    break;
-  }
-}
-})();
-
 
 // === NEW: checksum helpers (browser) ===
 async function sha256HexFromU8(u8) {
@@ -2678,3 +2634,138 @@ style.textContent = `
 document.head.appendChild(style);
 
 init();
+
+
+
+/* === NVML listener bridge (no modules, no imports) ===========================
+   This block connects to local NVML listener and sends messages:
+   { type:"chunk_status", chunk_id, status (0|1|-1), gpu_index, pid? }
+   It also auto-wraps a common chunk handler to emit start/end/error.
+   To force a specific listener URL, add to page URL: ?nvml=wss://host/nvml&nvmlGpu=0
+   Defaults:
+     - if page is https => wss://<host>/nvml (proxy this path to ws://127.0.0.1:8765)
+     - if page is http  => ws://127.0.0.1:8765
+============================================================================= */
+(function () {
+  if (typeof window === 'undefined') return; // browser only
+
+  // --- tiny helper ----------------------------------------------------------
+  function qs(name, fallback = null) {
+    try {
+      const v = new URLSearchParams(window.location.search).get(name);
+      return v !== null ? v : fallback;
+    } catch { return fallback; }
+  }
+
+  // --- minimal bridge class (no imports) ------------------------------------
+  class NvmlBridgeBrowser {
+    constructor(opts) {
+      this.url = (opts && opts.url) || '';
+      this.gpuIndex = Number.isFinite(opts && opts.gpuIndex) ? Number(opts.gpuIndex) : 0;
+      this.quiet = !!(opts && opts.quiet);
+      this.ws = null;
+      this.connected = false;
+      this.closing = false;
+      this.retryMs = 500;
+      this.maxRetryMs = 10000;
+      this.listeners = new Set();
+    }
+    log()  { if (!this.quiet) console.log('[nvml-bridge]', ...arguments); }
+    warn() { console.warn('[nvml-bridge]', ...arguments); }
+    start() { if (this.url) this._connect(); }
+    stop()  { this.closing = true; try { this.ws && this.ws.close(); } catch (_) {} }
+    onMessage(fn){ this.listeners.add(fn); return () => this.listeners.delete(fn); }
+    notifyChunkStart(id, pid){ this._sendStatus(id, 0, pid); }
+    notifyChunkEnd(id, pid){ this._sendStatus(id, 1, pid); }
+    notifyChunkError(id, pid){ this._sendStatus(id, -1, pid); }
+    _sendStatus(chunkId, status, pid){
+      if (!this.connected || !this.ws) return;
+      const msg = {
+        type: 'chunk_status',
+        chunk_id: String(chunkId),
+        status: Number(status),
+        gpu_index: this.gpuIndex
+      };
+      if (Number.isFinite(pid)) msg.pid = Number(pid); // optional in browser
+      try { this.ws.send(JSON.stringify(msg)); }
+      catch (e) { this.warn('send failed:', e && e.message || e); }
+    }
+    _connect(){
+      if (this.closing) return;
+      try {
+        this.log('connecting to', this.url);
+        const ws = new WebSocket(this.url);
+        this.ws = ws;
+        ws.onopen = () => { this.connected = true; this.retryMs = 500; this.log('connected'); };
+        ws.onmessage = (ev) => {
+          try {
+            const m = JSON.parse(ev.data);
+            this.listeners.forEach(fn => { try { fn(m); } catch(_){} });
+          } catch(_) {}
+        };
+        ws.onclose = () => {
+          this.connected = false;
+          if (this.closing) return;
+          this.warn('disconnected');
+          this._scheduleReconnect();
+        };
+        ws.onerror = (err) => { this.warn('socket error', (err && err.message) || err); };
+      } catch (e) {
+        this.warn('connect failed:', (e && e.message) || e);
+        this._scheduleReconnect();
+      }
+    }
+    _scheduleReconnect(){
+      if (this.closing) return;
+      const ms = Math.min(this.retryMs, this.maxRetryMs);
+      this.retryMs = Math.min(this.retryMs * 2, this.maxRetryMs);
+      setTimeout(() => this._connect(), ms);
+    }
+  }
+
+  // --- choose NVML listener URL ---------------------------------------------
+  var nvmlUrl = qs('nvml', null);
+  var nvmlGpu = Number(qs('nvmlGpu', '0')) || 0;
+  if (!nvmlUrl) {
+    if (location.protocol === 'https:') {
+      // Same-origin WSS path (recommended). Reverse-proxy this to ws://127.0.0.1:8765
+      nvmlUrl = 'wss://' + location.host + '/nvml';
+    } else {
+      // Dev fallback (HTTP): direct to local listener
+      nvmlUrl = 'ws://127.0.0.1:8765';
+    }
+  }
+
+  // --- start the bridge -----------------------------------------------------
+  var __nvmlBridge = new NvmlBridgeBrowser({ url: nvmlUrl, gpuIndex: nvmlGpu });
+  __nvmlBridge.start();
+  // Optional: observe acks/summaries
+  // __nvmlBridge.onMessage(m => console.debug('[nvml<-]', m));
+
+  // --- auto-instrument a common chunk handler -------------------------------
+  (function instrument(){
+    var names = ['handleChunk', 'onChunkAssigned', 'processChunk'];
+    for (var i = 0; i < names.length; i++) {
+      var name = names[i];
+      var fn = (typeof window !== 'undefined') ? window[name] : undefined;
+      if (typeof fn === 'function') {
+        window[name] = async function wrapped(chunk) {
+          var args = Array.prototype.slice.call(arguments, 1);
+          var chunkId = String((chunk && (chunk.chunkId || chunk.id)) || 'unknown');
+          try {
+            __nvmlBridge.notifyChunkStart(chunkId);
+            var res = await fn.apply(this, [chunk].concat(args));
+            __nvmlBridge.notifyChunkEnd(chunkId);
+            return res;
+          } catch (e) {
+            __nvmlBridge.notifyChunkError(chunkId);
+            throw e;
+          }
+        };
+        break; // instrument only the first match
+      }
+    }
+  })();
+})();
+/* === end NVML listener bridge ============================================== */
+
