@@ -1,4 +1,5 @@
 // --- lightweight client logger (debug guard) ---
+import { NvmlBridgeBrowser } from './nvmlBridgeBrowser.js';
 (function(){
   const q = new URLSearchParams(location.search);
   const lvl = (window.LOG_LEVEL || q.get('log') || 'info').toLowerCase();
@@ -19,6 +20,49 @@ const state = {
   completedTasks: 0,
   statistics: { processingTime: 0 }
 };
+
+// NVML BRIDGE
+
+const _q = new URLSearchParams(location.search);
+const NVML_URL =
+  _q.get('nvml') ||
+  (location.protocol === 'https:' ? `wss://${location.host}/nvml` : 'ws://127.0.0.1:8765');
+const NVML_GPU = Number(_q.get('nvmlGpu') || 0);
+
+export const nvmlBridge = new NvmlBridgeBrowser({ url: NVML_URL, gpuIndex: NVML_GPU });
+nvmlBridge.start();
+
+// Optional: observe acks/summaries from the local listener
+//nvmlBridge.onMessage((msg) => {
+// console.debug('[nvml-listener<-]', msg);
+//});
+
+// Auto-instrument the most common chunk handler if present.
+// If there is different function name, add it to 'candidates' or
+// call nvmlBridge.notifyChunkStart/End/Error manually at the right places.
+(function instrumentChunkHandler(){
+const candidates = ['handleChunk', 'onChunkAssigned', 'processChunk'];
+for (const name of candidates) {
+  const fn = (typeof window !== 'undefined') ? window[name] : undefined;
+  if (typeof fn === 'function') {
+    const wrapped = async function(chunk, ...rest) {
+      const chunkId = String(chunk?.chunkId ?? chunk?.id ?? 'unknown');
+      try {
+        nvmlBridge.notifyChunkStart(chunkId);
+        const result = await fn.apply(this, [chunk, ...rest]);
+        nvmlBridge.notifyChunkEnd(chunkId);
+        return result;
+      } catch (e) {
+        nvmlBridge.notifyChunkError(chunkId);
+        throw e;
+      }
+    };
+    if (typeof window !== 'undefined') window[name] = wrapped;
+    break;
+  }
+}
+})();
+
 
 // === NEW: checksum helpers (browser) ===
 async function sha256HexFromU8(u8) {
@@ -2318,7 +2362,7 @@ socket.on('workload:chunk_assign', async chunk => {
   }
 
   // Handle successful execution...
-  
+
   // Record client processing time for timing analysis
   if (window.timingManager && chunk.chunkId) {
     try {
@@ -2327,7 +2371,7 @@ socket.on('workload:chunk_assign', async chunk => {
       console.warn('[TIMING] Failed to record client processing time:', e);
     }
   }
-  
+
   const eventName = chunk.enhanced ? 'workload:chunk_done_enhanced' : 'workload:chunk_done';
   const eventData = {
     parentId: chunk.parentId,
