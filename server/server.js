@@ -15,6 +15,7 @@ import url from 'url';
 // Enhanced: Import chunking system
 import { EnhancedChunkingManager } from './strategies/EnhancedChunkingManager.js';
 import { info } from './logger.js';
+import { timingManager } from './timing.js';
 const __DEBUG_ON__ = (process.env.LOG_LEVEL || '').toLowerCase() === 'debug';
 
 const streamingChunkQueues = new Map(); // workloadId -> queue of pending chunks
@@ -393,6 +394,10 @@ wss.on('connection', (ws, request) => {
 
     if (tally.ok) {
       const winner = wl.results.find(r => r.serverChecksum === tally.winningChecksum);
+      
+      // Complete timing for this workload
+      timingManager.completeTask(id);
+      
       wl.status = 'complete';
       wl.finalResults = winner.results;
       wl.finalResultBase64 = Buffer.concat(winner.results.map(r => Buffer.from(r, 'base64'))).toString('base64');
@@ -895,6 +900,15 @@ app.post('/api/workloads/advanced', async (req, res) => {
 
     const workloadId = uuidv4();
 
+    // Start timing for this workload
+    timingManager.startTask(workloadId, {
+      label: label || `Enhanced Workload ${workloadId.substring(0, 6)}`,
+      chunkingStrategy,
+      assemblyStrategy,
+      framework,
+      metadata: metadata || {}
+    });
+
     // Create enhanced workload metadata
     const enhancedWorkload = {
       id: workloadId,
@@ -1275,16 +1289,27 @@ if (streamingMode) {
         // Batch mode: create chunk store
         const store = {
           parentId: wid,
-          allChunkDefs: result.chunkDescriptors.map((cd, idx) => ({
-            ...cd,
-            status: 'queued',
-            dispatchesMade: 0,
-            submissions: [],
-            activeAssignments: new Set(),
-            assignedClients: new Set(),
-            verified_results: null,
-            chunkOrderIndex: idx
-          })),
+          allChunkDefs: result.chunkDescriptors.map((cd, idx) => {
+            // Start timing for each chunk
+            timingManager.startChunk(wid, cd.chunkId, {
+              chunkIndex: idx,
+              framework: cd.framework,
+              workgroupCount: cd.workgroupCount,
+              inputCount: cd.inputs?.length || 0,
+              outputCount: cd.outputs?.length || 0
+            });
+            
+            return {
+              ...cd,
+              status: 'queued',
+              dispatchesMade: 0,
+              submissions: [],
+              activeAssignments: new Set(),
+              assignedClients: new Set(),
+              verified_results: null,
+              chunkOrderIndex: idx
+            };
+          }),
           completedChunksData: new Map(),
           expectedChunks: result.totalChunks,
           status: 'assigning_chunks',
@@ -3029,6 +3054,10 @@ io.on('connection', socket => {
 
     if (tally.ok) {
       const winner = wl.results.find(r => r.serverChecksum === tally.winningChecksum);
+      
+      // Complete timing for this workload
+      timingManager.completeTask(id);
+      
       wl.status = 'complete';
       wl.finalResults = winner.results;
       wl.finalResultBase64 = Buffer.concat(winner.results.map(r => Buffer.from(r, 'base64'))).toString('base64');
@@ -4764,6 +4793,9 @@ setInterval(() => {
 async function handleStreamingWorkloadComplete(workloadId, result) {
   console.log(` Streaming workload ${workloadId} completed!`);
 
+  // Complete timing for this workload
+  timingManager.completeTask(workloadId);
+
   const workload = customWorkloads.get(workloadId);
   if (workload) {
     workload.status = 'complete';
@@ -4809,6 +4841,10 @@ app.post('/api/workloads/:wid/chunks/:cid/result/:idx', async (req, res) => {
   const { wid, cid, idx } = req.params;
   const wl = customWorkloads.get(wid);
   if (!wl) return res.status(404).json({ error: 'workload not found' });
+  
+  // Record chunk completion timing
+  timingManager.completeChunk(cid);
+  
   const dir = path.join(STORAGE_ROOT, wid, 'results', cid);
   await ensureDir(dir);
   const fp = path.join(dir, `out-${idx}.bin`);

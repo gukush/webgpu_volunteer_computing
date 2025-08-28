@@ -507,6 +507,14 @@ function createUniformArrayFromSchema(metadata, uniformDef) {
   return new Uint32Array(Object.values(metadata).filter(v => typeof v === 'number'));
 }
 // Enhanced: Multi-input, multi-framework execution
+
+// Add performance.now() polyfill for older browsers
+if (typeof performance === 'undefined') {
+  window.performance = {
+    now: function() { return Date.now(); }
+  };
+}
+
 /*
 async function executeEnhancedChunk(chunk) {
   (__DEBUG_ON__ ? console.log : function(){})(`[ENHANCED] Starting execution for ${chunk.chunkId} with strategy ${chunk.chunkingStrategy || 'unknown'}`);
@@ -2310,6 +2318,16 @@ socket.on('workload:chunk_assign', async chunk => {
   }
 
   // Handle successful execution...
+  
+  // Record client processing time for timing analysis
+  if (window.timingManager && chunk.chunkId) {
+    try {
+      window.timingManager.recordClientProcessingTime(chunk.chunkId, result.processingTime);
+    } catch (e) {
+      console.warn('[TIMING] Failed to record client processing time:', e);
+    }
+  }
+  
   const eventName = chunk.enhanced ? 'workload:chunk_done_enhanced' : 'workload:chunk_done';
   const eventData = {
     parentId: chunk.parentId,
