@@ -41,20 +41,6 @@ std::unique_ptr<WebSocketClient> globalWebSocketClient;
 std::unique_ptr<IFrameworkExecutor> globalExecutor;
 bool shutdownRequested = false;
 
-// ... rest of the file remains exactly the same, except this block is removed:
-
-    else if (framework == "cling") {
-    #if defined(HAVE_CLING)
-        std::cout << "Creating Cling executor..." << std::endl;
-        executor = std::make_unique<ClingExecutor>();
-    #else
-        std::cerr << "This binary was built without Cling support.\n";
-    #endif
-    }
-
-
-
-// Timing measurements for native client
 class NativeTimingManager {
 private:
     std::map<std::string, std::chrono::high_resolution_clock::time_point> chunkStartTimes;
