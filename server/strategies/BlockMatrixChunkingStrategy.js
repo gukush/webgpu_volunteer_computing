@@ -2,6 +2,8 @@
 import { BaseChunkingStrategy } from './base/BaseChunkingStrategy.js';
 import fs from 'fs/promises';
 import { info } from '../logger.js';
+import { fileURLToPath } from 'node:url';
+import path from 'node:path';
 const __DEBUG_ON__ = (process.env.LOG_LEVEL || '').toLowerCase() === 'debug';
 
 
@@ -116,7 +118,7 @@ export default class BlockMatrixChunkingStrategy extends BaseChunkingStrategy {
             }
             if (__DEBUG_ON__) console.log(`[STRATEGY DEBUG] About to create descriptor for framework: ${framework}, chunk: ${i}-${j}-k${k}`);
             // NEW: Framework-specific descriptor creation
-            const descriptor = this.createFrameworkSpecificDescriptor(
+            const descriptor = await this.createFrameworkSpecificDescriptor(
               framework, chunkIndex, i, j, k, blockA, blockB, blockSize, matrixSize, plan.parentId, blockByteSize
             );
             if (__DEBUG_ON__) console.log(`[STRATEGY DEBUG] Created descriptor keys:`, Object.keys(descriptor));
@@ -210,7 +212,7 @@ async createChunkDescriptorsStreaming(plan, dispatchCallback) {
             }
 
             // Create framework-specific descriptor
-            const descriptor = this.createFrameworkSpecificDescriptor(
+            const descriptor = await this.createFrameworkSpecificDescriptor(
               framework, chunkIndex, i, j, k, blockA, blockB, blockSize, matrixSize, plan.parentId, blockByteSize
             );
 
@@ -406,11 +408,13 @@ async createChunkDescriptorsStreaming(plan, dispatchCallback) {
     let extension;
     switch (framework) {
       case 'webgpu':
+        extension = 'wgsl';
+        break;
       case 'vulkan':
-        extension = 'wgsl'; // or .comp, .glsl, etc. for Vulkan
+        extension = 'glsl';
         break;
       case 'webgl':
-        extension = 'glsl';
+        extension = 'wgsl';
         break;
       case 'javascript':
         extension = 'js';
@@ -424,7 +428,8 @@ async createChunkDescriptorsStreaming(plan, dispatchCallback) {
       default:
         throw new Error(`Unknown extension for framework: ${framework}`);
     }
-    const kernelPath = path.join(process.cwd(), 'kernels', `${filename}.${extension}`);
+    const kernelUrl = new URL(`../kernels/block_matrix_multiply/${filename}.${extension}`, import.meta.url);
+    const kernelPath = fileURLToPath(kernelUrl);
     if (__DEBUG_ON__) console.log(`[FILE IO] Attempting to read kernel from: ${kernelPath}`);
     try {
       const content = await fs.readFile(kernelPath, 'utf8');

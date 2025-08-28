@@ -6,6 +6,7 @@
 import { BaseChunkingStrategy } from './base/BaseChunkingStrategy.js';
 import { info, warn } from '../logger.js';
 import crypto from 'crypto';
+import { timingManager } from '../timing.js';
 
 const LOG = info('ECM');
 
@@ -403,6 +404,7 @@ export default class ECMStage1ChunkingStrategy extends BaseChunkingStrategy {
     let producedCurves = 0;
 
     while (producedCurves < curvesTotal) {
+      const chunkStartTime = performance.now();
       const thisCount = Math.min(curvesPerChunk, curvesTotal - producedCurves);
 
       // Build curve seeds for this chunk
@@ -448,6 +450,10 @@ export default class ECMStage1ChunkingStrategy extends BaseChunkingStrategy {
         workgroupCount: [Math.ceil(thisCount / 128), 1, 1],
         assemblyMetadata: { curvesInChunk: thisCount }
       };
+
+      // Record chunking time
+      const chunkingTime = performance.now() - chunkStartTime;
+      timingManager.recordChunkingTime(descriptor.chunkId, chunkingTime);
 
       await dispatch(descriptor);
       emitted++;
