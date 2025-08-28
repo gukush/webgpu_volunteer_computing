@@ -1,79 +1,145 @@
-// strategies/ECMStage1AssemblyStrategy.js
-// Early-exit assembler: finishes on first non-trivial factor reported by any chunk.
+// ECMStage1AssemblyStrategy.js
+// Streaming-friendly assembler for ECM Stage 1
+// - Parses per-curve outputs (U256 result + status)
+// - If any curve reports status==2 (non-trivial factor), finalizes early with that factor
+// - Otherwise tracks progress; upon completion, returns a JSON summary
 
 import { BaseAssemblyStrategy } from './base/BaseAssemblyStrategy.js';
 import { info } from '../logger.js';
 
-const LOG = info('ECM');
+const __DEBUG_ON__ = (process.env.LOG_LEVEL || '').toLowerCase() === 'debug';
 
-function readU64LEfromB64(b64) {
-  const buf = Buffer.from(b64, 'base64');
-  if (buf.length < 16) return 0n;
-  // layout: flag (4) + fac_lo (4) + fac_hi (4) + pad(4)
-  const lo = buf.readUInt32LE(4);
-  const hi = buf.readUInt32LE(8);
-  return (BigInt(hi) << 32n) | BigInt(lo);
+// Helpers to parse outputs
+function readU32LE(buf, o) {
+  return buf[o] | (buf[o+1]<<8) | (buf[o+2]<<16) | (buf[o+3]<<24);
+}
+function limbsToBigInt(buf, byteOffset) {
+  let x = 0n;
+  for (let i = 0; i < 8; i++) {
+    const w = readU32LE(buf, byteOffset + i*4) >>> 0;
+    x |= BigInt(w) << (32n * BigInt(i));
+  }
+  return x;
+}
+function bigIntToHex(bi) {
+  let s = bi.toString(16);
+  if (s.length % 2) s = '0' + s;
+  return s;
 }
 
 export default class ECMStage1AssemblyStrategy extends BaseAssemblyStrategy {
   constructor() {
     super('ecm_stage1_assembly');
-    this.expected = 0;
-    this.seen = 0;
-    this.done = false;
-    this.n = null;
+    this.totalChunks = 0;
+    this.completed = 0;
+    this.factor = null;
+    this.curvesChecked = 0;
+    this.outStride = 48; // bytes per element (U256 + u32 status, padded to 48)
   }
 
   async initOutputStore(plan) {
-    this.expected = Number(plan.totalChunks || 0);
-    this.seen = 0;
-    this.done = false;
-    this.n = BigInt(plan.metadata.n);
+    // Nothing to persist on disk for ECM stage 1
+    this.totalChunks = plan.metadata?.totalChunks || 0;
+    this.outStride = plan.metadata?.sizes?.outStride || 48;
+    this.factor = null;
+    this.completed = 0;
+    this.curvesChecked = 0;
   }
 
-  onBlockComplete(cb) { this._progress = cb; }
-  onAssemblyComplete(cb) { this._complete = cb; }
+  // Streaming assembly entry point
+  async processChunkResult(chunkResult, chunkDescriptor) {
+    try {
+      // chunkResult contains .result (base64) or .results[0]
+      const base64 = chunkResult.result || (chunkResult.results && chunkResult.results[0]);
+      if (!base64) {
+        return { success: false, status: 'error', error: 'Missing result' };
+      }
+      const raw = Buffer.from(base64, 'base64');
+      const num = chunkDescriptor?.metadata?.num_curves || 0;
 
-  async processChunkResult(chunkResult) {
-    if (this.done) return { status: 'ignored' };
+      // Parse each element
+      let found = null;
+      for (let i = 0; i < num; i++) {
+        const off = i * this.outStride;
+        const g = limbsToBigInt(raw, off);  // 32 bytes
+        const status = readU32LE(raw, off + 32) >>> 0;
+        this.curvesChecked++;
 
-    this.seen++;
-    const outB64 = Array.isArray(chunkResult.results) ? chunkResult.results[0] : chunkResult.result;
-    const factor = readU64LEfromB64(outB64);
-    let payload;
+        if (__DEBUG_ON__) {
+          if (status !== 0) {
+            console.log(`[ECM ASM] Curve #${i} status=${status}, g=${g.toString(16)}`);
+          }
+        }
 
-    if (factor && factor > 1n && factor < this.n && (this.n % factor) === 0n) {
-      this.done = true;
-      payload = {
-        result: { n: this.n.toString(), factors: [factor.toString(), (this.n / factor).toString()], method: 'ecm_stage1', complete: true },
-        message: `ECM Stage-1 factor found: ${factor}`
+        // status: 2 => non-trivial gcd, 1 => gcd=1/no factor, 0 => raw Z returned
+        if (status === 2) {
+          found = g;
+          break;
+        }
+      }
+
+      this.completed++;
+
+      if (found && !this.factor) {
+        this.factor = found;
+        const payload = Buffer.from(JSON.stringify({
+          status: 'factor_found',
+          factor_hex: bigIntToHex(found),
+          factor_dec: found.toString(10),
+          curves_checked: this.curvesChecked
+        }), 'utf8').toString('base64');
+
+        return {
+          success: true,
+          status: 'complete',
+          finalResult: payload,
+          stats: {
+            assemblyStrategy: this.name,
+            completedChunks: this.completed,
+            totalChunks: this.totalChunks,
+            curvesChecked: this.curvesChecked
+          }
+        };
+      }
+
+      // If all chunks processed and no factor
+      if (this.completed >= this.totalChunks) {
+        const payload = Buffer.from(JSON.stringify({
+          status: 'no_factor',
+          curves_checked: this.curvesChecked
+        }), 'utf8').toString('base64');
+
+        return {
+          success: true,
+          status: 'complete',
+          finalResult: payload,
+          stats: {
+            assemblyStrategy: this.name,
+            completedChunks: this.completed,
+            totalChunks: this.totalChunks,
+            curvesChecked: this.curvesChecked
+          }
+        };
+      }
+
+      // Still in progress
+      return {
+        success: true,
+        status: 'in_progress',
+        stats: {
+          assemblyStrategy: this.name,
+          completedChunks: this.completed,
+          totalChunks: this.totalChunks,
+          curvesChecked: this.curvesChecked
+        }
       };
-      if (this._complete) await this._complete(payload);
-      return { success: true, done: true, ...payload };
+
+    } catch (e) {
+      return { success: false, status: 'error', error: e.message };
     }
-
-    if (this._progress) await this._progress({
-      completedChunks: this.seen,
-      totalChunks: this.expected,
-      progress: this.expected ? (100 * this.seen / this.expected) : 0
-    });
-
-    if (this.seen >= this.expected && !this.done) {
-      this.done = true;
-      payload = { result: { n: this.n.toString(), method: 'ecm_stage1', complete: true, found: false } };
-      if (this._complete) await this._complete(payload);
-      return { success: true, done: true, ...payload };
-    }
-
-    return { success: true, done: false };
   }
 
-  async assembleResults(chunks, plan) {
-    await this.initOutputStore(plan);
-    for (const c of chunks) {
-      const r = await this.processChunkResult({ chunkId: c.chunkId, results: Array.isArray(c.results) ? c.results : [c.result] });
-      if (r.done) return r;
-    }
-    return { success: true, result: { n: this.n.toString(), method: 'ecm_stage1', complete: true, found: false } };
+  async cleanup() {
+    // Nothing to clean
   }
 }

@@ -12,11 +12,12 @@ extern "C" __global__ void block_matrix_multiply(
           if (row >= block_size || col >= block_size) return;
 
           // Debug: Print thread info for first few threads
-          if (row == 0 && col == 0) {
-              printf("CUDA kernel: block_size=%d, matrix_size=%d\\n", block_size, matrix_size);
-              printf("CUDA kernel: gridDim=(%d,%d,%d), blockDim=(%d,%d,%d)\\n",
-                    gridDim.x, gridDim.y, gridDim.z, blockDim.x, blockDim.y, blockDim.z);
-          }
+          
+          //if (row == 0 && col == 0) {
+          //    printf("CUDA kernel: block_size=%d, matrix_size=%d\\n", block_size, matrix_size);
+          //    printf("CUDA kernel: gridDim=(%d,%d,%d), blockDim=(%d,%d,%d)\\n",
+          //          gridDim.x, gridDim.y, gridDim.z, blockDim.x, blockDim.y, blockDim.z);
+          //}
 
           float sum = 0.0f;
           for (int k = 0; k < block_size; k++) {

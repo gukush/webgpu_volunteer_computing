@@ -1,472 +1,393 @@
-// strategies/ECMStage1ChunkingStrategy.js
-// ECM Stage-1 (Montgomery curves) — WebGPU kernel, 64-bit n
-// One thread per curve; each thread runs ladder for all p^e (p ≤ B1), then gcd(Z, n).
-// If any thread finds 1 < g < n, it atomically publishes g and the chunk is "successful".
+// ECMStage1ChunkingStrategy.js
+// Strategy for ECM Stage 1 (Montgomery curves) across multiple frameworks.
+// - Generates random curves per chunk (size = chunk_size) with unique seeds
+// - Precomputes Montgomery constants for N (R^2 mod N, mont_one, n0inv32)
+// - Builds prime powers list up to B1
+// - Emits framework-specific descriptors (WGSL for WebGPU, JS kernel fallback, others pass source + buffers)
+// NOTE: This file assumes the corresponding kernels exist under server/kernels/ECMStage1/*
 
 import { BaseChunkingStrategy } from './base/BaseChunkingStrategy.js';
-import { info, warn } from '../logger.js';
-import crypto from 'crypto';
-import { timingManager } from '../timing.js';
+import fs from 'fs/promises';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+import crypto from 'node:crypto';
+import { info } from '../logger.js';
 
-const LOG = info('ECM');
+const __DEBUG_ON__ = (process.env.LOG_LEVEL || '').toLowerCase() === 'debug';
 
-function toBase64U64LE(arrBig) {
-  const buf = Buffer.allocUnsafe(arrBig.length * 8);
-  for (let i = 0; i < arrBig.length; i++) buf.writeBigUInt64LE(BigInt.asUintN(64, arrBig[i]), i * 8);
-  return buf.toString('base64');
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const KERNEL_DIR = path.resolve(__dirname, '../kernels/ECMStage1');
+
+function toHex(bi) {
+  let s = bi.toString(16);
+  if (s.length % 2) s = '0' + s;
+  return s;
 }
-function toBase64PairsU64LE(pairs) {
-  const buf = Buffer.allocUnsafe(pairs.length * 16);
-  let off = 0n;
-  for (const [a, b] of pairs) {
-    buf.writeBigUInt64LE(BigInt.asUintN(64, a), Number(off)); off += 8n;
-    buf.writeBigUInt64LE(BigInt.asUintN(64, b), Number(off)); off += 8n;
+
+function fromHex(hex) {
+  return BigInt('0x' + hex.replace(/^0x/, ''));
+}
+
+function u32(n) { return Number(n & 0xFFFFFFFFn) >>> 0; }
+
+// Pack a BigInt into 8 x u32 little-endian limbs
+function packU256LE(bi) {
+  const limbs = new Uint32Array(8);
+  let x = bi;
+  for (let i = 0; i < 8; i++) {
+    limbs[i] = u32(x);
+    x >>= 32n;
   }
-  return buf.toString('base64');
+  return limbs;
 }
 
-// Basic math helpers (BigInt; 64-bit only)
-function egcd(a, b) {
-  let old_r = a, r = b;
-  let old_s = 1n, s = 0n;
-  let old_t = 0n, t = 1n;
-  while (r !== 0n) {
-    const q = old_r / r;
-    [old_r, r] = [r, old_r - q * r];
-    [old_s, s] = [s, old_s - q * s];
-    [old_t, t] = [t, old_t - q * t];
+// Unpack 8 x u32 LE to BigInt
+function unpackU256LE(u32arr, offsetWords = 0) {
+  let x = 0n;
+  for (let i = 0; i < 8; i++) {
+    x |= BigInt(u32arr[offsetWords + i]) << (32n * BigInt(i));
   }
-  return { g: old_r, x: old_s, y: old_t };
+  return x;
 }
-function mod(a, n) { a %= n; return a < 0n ? a + n : a; }
-function modInv(a, n) {
-  const { g, x } = egcd(mod(a, n), n);
-  if (g !== 1n) return null; // no inverse
-  return mod(x, n);
-}
-function gcd(a, b) { a = a < 0n ? -a : a; b = b < 0n ? -b : b; while (b) [a,b]=[b, a%b]; return a; }
 
-function primesUpTo(limit) {
-  const L = Number(limit);
-  const sieve = new Uint8Array(L + 1);
-  const out = [];
-  for (let i = 2; i <= L; i++) {
+// Compute montgomery parameters for 256-bit (word=32 bits)
+function montParams(N) {
+  const R = 1n << 256n; // 2^256
+  const mont_one = R % N;
+  const R2 = (R * R) % N;
+
+  // n0inv32 = -N^{-1} mod 2^32, depends only on least-significant 32-bit word of N
+  const n0 = Number(N & 0xFFFFFFFFn) >>> 0;
+  if ((n0 & 1) === 0) {
+    throw new Error('N must be odd for Montgomery arithmetic (n0 even)');
+  }
+  // Compute modular inverse of n0 mod 2^32 using extended Euclid on 32-bit integers
+  let t = 0n, newT = 1n;
+  let r = 1n << 32n, newR = BigInt(n0);
+  while (newR !== 0n) {
+    const q = r / newR;
+    [t, newT] = [newT, t - q * newT];
+    [r, newR] = [newR, r - q * newR];
+  }
+  if (r !== 1n) throw new Error('n0 inverse does not exist');
+  if (t < 0n) t += 1n << 32n;
+  const inv = Number(t) >>> 0;
+  const n0inv32 = ((0x100000000 - inv) >>> 0); // -inv mod 2^32
+  return { R2, mont_one, n0inv32 };
+}
+
+// Simple deterministic RNG from seed using SHA256(counter || seed)
+function* drbg(seedStr) {
+  let counter = 0;
+  const seed = Buffer.isBuffer(seedStr) ? seedStr : Buffer.from(String(seedStr));
+  while (true) {
+    const h = crypto.createHash('sha256');
+    const cbuf = Buffer.alloc(8);
+    cbuf.writeUInt32BE(counter >>> 0, 4);
+    h.update(cbuf);
+    h.update(seed);
+    const digest = h.digest();
+    counter++;
+    yield digest; // 32 bytes
+  }
+}
+
+function gcd(a, b) {
+  a = a < 0n ? -a : a; b = b < 0n ? -b : b;
+  while (b !== 0n) { const t = b; b = a % b; a = t; }
+  return a;
+}
+
+// Sample random value in [1, N-1] with gcd(val,N)=1
+function sampleCoprime(drbgGen, N) {
+  while (true) {
+    const d = drbgGen.next().value; // 32 bytes
+    let x = BigInt('0x' + d.toString('hex'));
+    x = (x % (N - 1n)) + 1n;
+    if (gcd(x, N) === 1n) return x;
+  }
+}
+
+// Prime sieve up to B1, return prime powers list (u32)
+function primePowersUpTo(B1) {
+  const n = B1 >>> 0;
+  const sieve = new Uint8Array(n + 1);
+  const primes = [];
+  for (let i = 2; i <= n; i++) {
     if (!sieve[i]) {
-      out.push(i);
-      for (let j = i * 2; j <= L; j += i) sieve[j] = 1;
+      primes.push(i);
+      for (let j = i + i; j <= n; j += i) sieve[j] = 1;
     }
   }
-  return out;
-}
-function primePowersUpTo(B1) {
-  const ps = primesUpTo(B1);
   const list = [];
-  for (const p of ps) {
-    let e = 1n, pe = BigInt(p);
-    while (pe * BigInt(p) <= BigInt(B1)) { pe *= BigInt(p); e++; }
-    list.push({ p, e: Number(e), pe }); // we’ll multiply by pe using ladder
+  for (const p of primes) {
+    let pe = p;
+    while (pe * p <= n) pe *= p;
+    list.push(pe >>> 0);
   }
   return list;
 }
 
-/**
- * Suyama parameterization to derive (A24, x1) from σ.
- * u = σ^2 − 5, v = 4σ
- * x1 = (u/v)^2 mod n
- * A = ((v − u)^3 * (3u + v) * inv(4 u^3 v)) − 2  (mod n)
- * A24 = (A+2)/4 = ((v − u)^3 * (3u + v) * inv(16 u^3 v))  (mod n)
- * If any denominator shares gcd with n, that gcd is a factor; we skip such σ here.
- */
-function curveFromSigma64(n, sigma) {
-  const N = BigInt(n);
-  const sig = BigInt(sigma);
-  const u = mod(sig*sig - 5n, N);
-  const v = mod(4n*sig, N);
-  const three_u_plus_v = mod(3n*u + v, N);
-  const v_minus_u = mod(v - u, N);
-  const v_minus_u_cu = mod(v_minus_u * v_minus_u % N * v_minus_u, N);
-  // denom = 16*u^3*v
-  const u3 = mod(u * u % N * u, N);
-  let denom = mod(16n * u3 % N * v, N);
-  let g = gcd(denom, N);
-  if (g !== 1n) return { earlyFactor: g };
-  const inv = modInv(denom, N);
-  if (inv === null) return { skip: true }; // should be handled by g != 1 earlier
-  const A24 = mod(v_minus_u_cu * three_u_plus_v % N * inv, N);
-  // x1 = (u/v)^2
-  const g2 = gcd(v, N);
-  if (g2 !== 1n) return { earlyFactor: g2 };
-  const vInv = modInv(v, N);
-  if (!vInv) return { skip: true };
-  const x1 = mod((u * vInv) % N * ((u * vInv) % N), N);
-  return { A24, x1 };
+// Build ConstsBuffer bytes (binding 0)
+function buildConstsBuffer(N, R2, mont_one, n0inv32) {
+  const buf = new Uint32Array(28); // 8N + 8R2 + 8mont_one + 1 + 3 pad
+  buf.set(packU256LE(N), 0);
+  buf.set(packU256LE(R2), 8);
+  buf.set(packU256LE(mont_one), 16);
+  buf[24] = n0inv32 >>> 0;
+  buf[25] = 0; buf[26] = 0; buf[27] = 0;
+  return Buffer.from(buf.buffer);
 }
 
-// WGSL kernel (u64, shift-add mulmod, Montgomery ladder x-only)
-const WGSL_ECM_STAGE1 = /* wgsl */`
-struct Uniforms {
-  n: u64,
-  numCurves: u32,
-  numPrimePowers: u32,
-  _pad: u32
-}
-@group(0) @binding(0) var<uniform> U : Uniforms;
-
-// pairs of (A24, X1) per curve (Montgomery form uses A24=(A+2)/4 mod n).
-struct Curve {
-  A24: u64,
-  X1: u64
-}
-@group(0) @binding(1) var<storage, read> CURVES : array<Curve>;
-
-// prime powers p^e as u64
-@group(0) @binding(2) var<storage, read> PPS : array<u64>;
-
-// result: atomic flag + factor (u64 split in two u32)
-struct Result {
-  flag: u32,
-  fac_lo: u32,
-  fac_hi: u32
-}
-@group(0) @binding(3) var<storage, read_write> OUT : Result;
-
-fn pack_u64(x: u64) -> vec2<u32> {
-  let lo = u32(x & u64(0xffffffffu));
-  let hi = u32(x >> 32u);
-  return vec2<u32>(lo, hi);
-}
-fn unpack_u64(v: vec2<u32>) -> u64 {
-  return (u64(v.y) << 32u) | u64(v.x);
-}
-
-fn addmod(a: u64, b: u64, m: u64) -> u64 {
-  if (a >= m - b) { return a - (m - b); }
-  return a + b;
-}
-fn submod(a: u64, b: u64, m: u64) -> u64 {
-  if (a >= b) { return a - b; }
-  return m - (b - a);
-}
-fn dblmod(a: u64, m: u64) -> u64 {
-  if (a >= m - a) { return a - (m - a); }
-  return a + a;
-}
-
-// Shift-add (no 128-bit) multiplication: (a*b) mod m
-fn mulmod(a0: u64, b0: u64, m: u64) -> u64 {
-  var a = a0 % m;
-  var b = b0;
-  var res: u64 = 0u;
-  while (b != 0u) {
-    if ((b & 1u) != 0u) {
-      if (res >= m - a) { res = res - (m - a); } else { res = res + a; }
-    }
-    if (a >= m - a) { a = a - (m - a); } else { a = a + a; }
-    b = b >> 1u;
+// Build CurvesInBuffer bytes (binding 1) for an array of {A24, X1} BigInt
+function buildCurvesInBuffer(curves) {
+  const out = new Uint32Array(curves.length * 16); // 16 words per curve (A24 + X1)
+  let w = 0;
+  for (const c of curves) {
+    out.set(packU256LE(c.A24), w); w += 8;
+    out.set(packU256LE(c.X1),  w); w += 8;
   }
-  return res;
-}
-fn sqrmod(a: u64, m: u64) -> u64 {
-  return mulmod(a, a, m);
+  return Buffer.from(out.buffer);
 }
 
-fn gcd_u64(a0: u64, b0: u64) -> u64 {
-  var a = a0;
-  var b = b0;
-  if (a == 0u) { return b; }
-  if (b == 0u) { return a; }
-  loop {
-    let r = a % b;
-    if (r == 0u) { return b; }
-    a = b;
-    b = r;
-  }
+// Build primes buffer (binding 2)
+function buildPrimesBuffer(list) {
+  const arr = new Uint32Array(list.length);
+  for (let i = 0; i < list.length; i++) arr[i] = list[i] >>> 0;
+  return Buffer.from(arr.buffer);
 }
 
-// Modular inverse via extended Euclid with modularized coefficients.
-// Returns 0 if gcd(a, m) != 1.
-fn invmod(a_in: u64, m: u64) -> u64 {
-  var a = a_in % m;
-  if (a == 0u) { return 0u; }
-  var t: u64 = 0u;
-  var newt: u64 = 1u;
-  var r: u64 = m;
-  var newr: u64 = a;
-  // Standard EEA with coefficients kept modulo m
-  loop {
-    if (newr == 0u) { break; }
-    let q: u64 = r / newr;
-    // (t, newt) = (newt, t - q*newt mod m)
-    let tmp_t = newt;
-    let qn = mulmod(q, newt, m);
-    newt = submod(t, qn, m);
-    t = tmp_t;
-    // (r, newr) = (newr, r - q*newr)  (exact, no underflow)
-    let tmp_r = newr;
-    r = r - q * newr;
-    newr = tmp_r;
-  }
-  if (r != 1u) { return 0u; } // not invertible
-  return t;                   // 0..m-1
-}
+// Helper to base64-encode a Buffer
+function b64(buf) { return Buffer.from(buf).toString('base64'); }
 
-// Montgomery x-only doubling with A24 = (A+2)/4 mod n
-fn mdbl(X: u64, Z: u64, A24: u64, n: u64) -> vec2<u64> {
-  let XPZ = addmod(X, Z, n);
-  let XMZ = submod(X, Z, n);
-  let AA  = sqrmod(XPZ, n);
-  let BB  = sqrmod(XMZ, n);
-  let C   = submod(AA, BB, n);
-  let X2  = mulmod(AA, BB, n);
-  let tmp = addmod(BB, mulmod(A24, C, n), n);
-  let Z2  = mulmod(C, tmp, n);
-  return vec2<u64>(X2, Z2);
-}
-
-// Differential addition: given P=(X1,Z1), Q=(X2,Z2), and XD = X(P-Q)
-fn madd(X1: u64, Z1: u64, X2: u64, Z2: u64, XD: u64, n: u64) -> vec2<u64> {
-  let t1 = mulmod(addmod(X1, Z1, n), submod(X2, Z2, n), n);
-  let t2 = mulmod(submod(X1, Z1, n), addmod(X2, Z2, n), n);
-  let X3 = sqrmod(addmod(t1, t2, n), n);
-  let Z3 = mulmod(XD, sqrmod(submod(t1, t2, n), n), n);
-  return vec2<u64>(X3, Z3);
-}
-
-// Montgomery ladder by 64-bit k; base is affine X1 (Z=1)
-fn ladder(k: u64, X1: u64, A24: u64, n: u64) -> vec2<u64> {
-  var X2: u64 = 1u; var Z2: u64 = 0u;  // [0]P
-  var X3: u64 = X1; var Z3: u64 = 1u;  // [1]P
-  var started = false;
-  var i: i32 = 63;
-  loop {
-    if (i < 0) { break; }
-    let bit: u64 = (k >> u32(i)) & 1u;
-    if (!started) {
-      if (bit == 1u) { started = true; }
-      i = i - 1;
-      continue;
-    }
-    if (bit == 0u) {
-      let a = madd(X2, Z2, X3, Z3, X1, n);
-      let d = mdbl(X2, Z2, A24, n);
-      X3 = a.x; Z3 = a.y; X2 = d.x; Z2 = d.y;
-    } else {
-      let a = madd(X2, Z2, X3, Z3, X1, n);
-      let d = mdbl(X3, Z3, A24, n);
-      X2 = a.x; Z2 = a.y; X3 = d.x; Z3 = d.y;
-    }
-    i = i - 1;
-  }
-  return vec2<u64>(X2, Z2); // [k]P
-}
-
-@compute @workgroup_size(128)
-fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-  let idx = gid.x;
-  if (idx >= U.numCurves) { return; }
-
-  // Early stop if some other thread found a factor
-  if (OUT.flag != 0u) { return; }
-
-  let n = U.n;
-  let c = CURVES[idx];
-
-  // We'll keep the current base as *affine* X1_aff, and the last projective (X,Z).
-  var X1_aff: u64 = c.X1;
-  var X: u64 = 0u;
-  var Z: u64 = 1u;
-
-  for (var i: u32 = 0u; i < U.numPrimePowers; i = i + 1u) {
-    let pe = PPS[i];
-
-    // Multiply current base by pe
-    let XZ = ladder(pe, X1_aff, c.A24, n);
-    X = XZ.x;
-    Z = XZ.y;
-
-    // Optional early poll to bail quickly
-    if (((i & 31u) == 0u) && (OUT.flag != 0u)) { return; }
-
-    // If this isn't the last prime power, normalize to affine for the next step.
-    if (i + 1u < U.numPrimePowers) {
-      // If Z shares a factor with n, we already succeeded.
-      let g = gcd_u64(Z % n, n);
-      if (g > 1u && g < n) {
-        if (OUT.flag == 0u) {
-          OUT.flag = 1u;
-          let v = pack_u64(g);
-          OUT.fac_lo = v.x;
-          OUT.fac_hi = v.y;
-        }
-        return;
-      }
-      // Otherwise Z is invertible modulo n; convert to affine X/Z
-      let zinvy = invmod(Z % n, n);
-      // If for some reason inverse failed, try gcd again and stop.
-      if (zinvy == 0u) {
-        let g2 = gcd_u64(Z % n, n);
-        if (g2 > 1u && g2 < n) {
-                  if (OUT.flag == 0u) {
-          OUT.flag = 1u;
-            let v2 = pack_u64(g2);
-            OUT.fac_lo = v2.x;
-            OUT.fac_hi = v2.y;
-          }
-        }
-        return;
-      }
-      X1_aff = mulmod(X, zinvy, n);
-      // reset Z to 1 (affine base for the next ladder call)
-      Z = 1u;
-    }
-  }
-
-  // Final GCD using the last projective Z
-  let g = gcd_u64(Z % n, n);
-  if (g > 1u && g < n) {
-    if (OUT.flag == 0u) {
-      OUT.flag = 1u;
-      let v = pack_u64(g);
-      OUT.fac_lo = v.x;
-      OUT.fac_hi = v.y;
-    }
-  }
-}
-
-`;
-
-// --------------------------------------------
+// ---- Strategy class ----
 
 export default class ECMStage1ChunkingStrategy extends BaseChunkingStrategy {
   constructor() {
     super('ecm_stage1');
   }
 
-  validateWorkload(workload) {
-    const n = BigInt(workload?.metadata?.n ?? 0);
-    if (n <= 1n) return { valid: false, error: `Invalid 'n' (must be > 1)` };
-    if (n > 0xffff_ffff_ffff_ffffn) return { valid: false, error: `This MVP supports up to 64-bit n.` };
-    const B1 = Number(workload?.metadata?.B1 ?? 50000);
-    if (!Number.isFinite(B1) || B1 < 1000) return { valid: false, error: `B1 too small (>=1000).` };
-    const curvesPerChunk = Number(workload?.metadata?.curvesPerChunk ?? 256);
-    if (!Number.isFinite(curvesPerChunk) || curvesPerChunk < 1) return { valid: false, error: `curvesPerChunk must be >= 1` };
-    return { valid: true };
+  defineInputSchema() {
+    return {
+      inputs: [
+        { name: 'consts', type: 'storage_buffer', binding: 0, elementType: 'u32' },
+        { name: 'curves', type: 'storage_buffer', binding: 1, elementType: 'u32' },
+        { name: 'primes', type: 'storage_buffer', binding: 2, elementType: 'u32' }
+      ],
+      outputs: [
+        { name: 'curve_out', type: 'storage_buffer', binding: 3, elementType: 'u32' }
+      ],
+      uniforms: [
+        {
+          name: 'params',
+          type: 'uniform_buffer',
+          binding: 4,
+          fields: [
+            { name: 'pp_count',    type: 'u32' },
+            { name: 'num_curves',  type: 'u32' },
+            { name: 'compute_gcd', type: 'u32' }
+          ]
+        }
+      ]
+    };
   }
 
-  planExecution(workload) {
-    const n = BigInt(workload.metadata.n);
-    const B1 = Number(workload.metadata.B1 ?? 50000);
-    const curvesTotal = Number(workload.metadata.curvesTotal ?? 8192);
-    const curvesPerChunk = Number(workload.metadata.curvesPerChunk ?? 256);
-    const framework = workload.framework || 'webgpu';
+  // Phase 1: Validate inputs and construct a plan (no heavy work here)
+  planExecution(plan) {
+    const md = plan.metadata || {};
+    let N;
+    if (md.N_hex) N = fromHex(md.N_hex);
+    else if (md.N_dec) N = BigInt(md.N_dec);
+    else throw new Error('Provide N_hex or N_dec');
 
-    const totalChunks = Math.ceil(curvesTotal / curvesPerChunk);
+    if ((N & 1n) === 0n) throw new Error('N must be odd');
+    const B1 = md.B1 >>> 0;
+    if (!B1 || B1 < 5) throw new Error('B1 must be >= 5');
+    const totalCurves = Math.max(1, Number(md.total_curves|0));
+    const chunkSize = Math.max(1, Number(md.chunk_size|0));
+    const framework = md.framework || 'webgpu';
+    const compute_gcd = md.compute_gcd !== false;
 
-    return {
-      chunkingStrategy: this.name,
-      assemblyStrategy: 'ecm_stage1_assembly',
-      framework,
+    const totalChunks = Math.ceil(totalCurves / chunkSize);
+
+    // Precompute prime powers list
+    const ppList = primePowersUpTo(B1);
+
+    // Precompute montgomery constants
+    const { R2, mont_one, n0inv32 } = montParams(N);
+
+    // Stash minimal metadata for streaming/batch creation
+    const strategyMd = {
+      N_hex: toHex(N),
+      B1,
+      totalCurves,
+      chunkSize,
       totalChunks,
-      metadata: {
-        n: n.toString(), // keep BigInt; we serialize later
-        B1, curvesTotal, curvesPerChunk
+      framework,
+      compute_gcd,
+      seed: md.seed || 'ecm',
+      // Strides in bytes for buffers (match WGSL std layout assumptions)
+      sizes: {
+        consts: 112,        // 28 * 4
+        curveIn: 64,        // (A24 + X1) = 16 u32
+        outStride: 48       // (U256 + u32) padded to 48 (WGSL std)
+      },
+      pp_count: ppList.length
+    };
+    const schema = this.defineInputSchema();
+    // Don't compute curve data yet (can be large); do that in createChunkDescriptors / streaming.
+    return {
+      strategy: this.name,
+      assemblyStrategy: 'ecm_stage1_assembly',
+      schema,
+      metadata: strategyMd,
+      shared: {
+        constsB64: b64(buildConstsBuffer(N, R2, mont_one, n0inv32)),
+        primesB64: b64(buildPrimesBuffer(ppList))
       }
     };
   }
 
-  async createCommonInputs(plan) {
-    const n = BigInt(plan.metadata.n);
-    const B1 = plan.metadata.B1;
-    const pps = primePowersUpTo(B1); // array of {p, e, pe: BigInt}
-    const peVals = pps.map(x => x.pe);
-    const peBase64 = toBase64U64LE(peVals);
+  // Phase 2: Materialize chunk descriptors (batch mode)
+async createChunkDescriptors(plan) {
+  const parentId = plan.parentId;           // manager sets this
+  const md       = plan.metadata;
+  const N        = fromHex(md.N_hex);
+  const B1       = md.B1 >>> 0;
+  const totalCurves = md.totalCurves;
+  const chunkSize   = md.chunkSize;
+  const totalChunks = Math.ceil(totalCurves / chunkSize);
+  const pp_count    = md.pp_count;
+  const seed        = md.seed || 'ecm';
 
-    // The OUT buffer: flag (4 bytes) + 8 bytes factor + 4 bytes padding (16 total is fine)
-    const initOut = Buffer.alloc(16);
-    initOut.writeUInt32LE(0, 0); // flag
-    initOut.writeUInt32LE(0, 4); // fac_lo (we zero both halves)
-    initOut.writeUInt32LE(0, 8); // fac_hi
-    const outInitB64 = initOut.toString('base64');
+  const kernels = await this.loadKernels();
+  const descriptors = [];
 
-    // Uniforms are supplied by metadata in descriptor (n, counts). OUT is shared per chunk.
-    return { peBase64, numPrimePowers: peVals.length, outInitB64 };
-  }
+  const gen = drbg(`${seed}:${parentId}`);
 
-  async createChunkDescriptorsStreaming(plan, dispatch) {
-    // Shared inputs for all chunks:
-    const common = await this.createCommonInputs(plan);
+  let curveIndex = 0;
+  for (let chunkIndex = 0; chunkIndex < totalChunks; chunkIndex++) {
+    const count = Math.min(chunkSize, totalCurves - curveIndex);
+    const curves = [];
 
-    const n = BigInt(plan.metadata.n);
-    const curvesTotal = plan.metadata.curvesTotal;
-    const curvesPerChunk = plan.metadata.curvesPerChunk;
-
-    let emitted = 0;
-    let producedCurves = 0;
-
-    while (producedCurves < curvesTotal) {
-      const chunkStartTime = performance.now();
-      const thisCount = Math.min(curvesPerChunk, curvesTotal - producedCurves);
-
-      // Build curve seeds for this chunk
-      const curves = [];
-      while (curves.length < thisCount) {
-        const sigma = 6n + (BigInt.asUintN(53, BigInt(crypto.randomInt(1 << 30))) % 1_000_000_000n);
-        const c = curveFromSigma64(n, sigma);
-        if (c?.earlyFactor && c.earlyFactor !== n && c.earlyFactor !== 1n) {
-          // In principle we could short-circuit here and finish the workload without dispatching,
-          // but to keep server plumbing simple, just skip this sigma and pick another.
-          continue;
-        }
-        if (!c?.A24 || !c?.x1) continue; // bad sigma, try again
-        curves.push([c.A24, c.x1]);
-      }
-
-      const curvesB64 = toBase64PairsU64LE(curves);
-
-      const descriptor = {
-        parentId: plan.parentId,
-        chunkId: `${plan.parentId}:${emitted}`,
-        chunkIndex: emitted,
-        framework: plan.framework || 'webgpu',
-        kernel: WGSL_ECM_STAGE1,
-        entry: 'main',
-        metadata: {
-          n_lo: Number(n & 0xffff_ffffn),
-          n_hi: Number(n >> 32n),
-          numCurves: thisCount,
-          numPrimePowers: common.numPrimePowers
-        },
-        inputs: [
-          // binding(1): curves buffer
-          { name: 'curves', data: curvesB64, size: thisCount * 16 },
-          // binding(2): prime powers
-          { name: 'prime_powers', data: common.peBase64, size: common.numPrimePowers * 8 }
-        ],
-        outputs: [
-          // binding(3): single result struct (flag + u64 factor)
-          { name: 'result', data: common.outInitB64, size: 16 }
-        ],
-        // binding(0) uniforms are auto-packed from metadata by your framework
-        workgroupCount: [Math.ceil(thisCount / 128), 1, 1],
-        assemblyMetadata: { curvesInChunk: thisCount }
-      };
-
-      // Record chunking time
-      const chunkingTime = performance.now() - chunkStartTime;
-      timingManager.recordChunkingTime(descriptor.chunkId, chunkingTime);
-
-      await dispatch(descriptor);
-      emitted++;
-      producedCurves += thisCount;
+    for (let i = 0; i < count; i++) {
+      const A24 = sampleCoprime(gen, N);
+      const X1  = sampleCoprime(gen, N);
+      curves.push({ A24, X1 });
     }
 
-    return { totalChunks: emitted };
+    const curveBuf = buildCurvesInBuffer(curves);
+    const outStride = md.sizes?.outStride || 48;
+    const outBytes  = count * outStride;
+
+    // Pack uniforms as a fixed 16-byte blob (u32[4]) to match WGSL layout
+    const u = new Uint32Array([pp_count, count, md.compute_gcd ? 1 : 0, 0]);
+    const uniforms = { binding: 4, data: b64(Buffer.from(u.buffer)) };
+
+    const base = {
+      chunkId: `ecm-${chunkIndex}`,
+      chunkIndex,
+      parentId,
+      framework: plan.framework || md.framework || 'webgpu',
+
+      // Explicit bindings for inputs to match WGSL @binding(0..2)
+      inputs: [
+        { name: 'consts', data: plan.shared.constsB64, binding: 0 },
+        { name: 'curves', data: b64(curveBuf),          binding: 1 },
+        { name: 'primes', data: plan.shared.primesB64,  binding: 2 }
+      ],
+
+      // Outputs + sizes (validator + client)
+      outputs:     [{ name: 'curve_out', size: outBytes, binding: 3 }],
+      outputSizes: [outBytes],
+
+      // Stable uniforms blob (preferred over ad-hoc object packing)
+      uniforms,
+
+      // Free-form metadata if you want it
+      metadata: {
+        chunk_index: chunkIndex,
+        total_chunks: totalChunks,
+        B1,
+        pp_count,
+        num_curves: count
+      },
+
+      // One thread per curve, @workgroup_size(256) => dispatch ceil(count/256)
+      workgroupCount: [Math.ceil(count / 256), 1, 1]
+    };
+
+    // Attach the kernel per framework
+    const desc = this.createFrameworkSpecificDescriptor(base, kernels, base.framework);
+    descriptors.push(desc);
+    curveIndex += count;
   }
 
-  // Batch mode (not used in streaming by default)
-  async createChunkDescriptors(plan) {
-    const descs = [];
-    await this.createChunkDescriptorsStreaming(plan, d => descs.push(d));
-    return descs;
+  return descriptors;
+}
+
+  createFrameworkSpecificDescriptor(base, kernels, framework) {
+    const fw = (framework || 'webgpu').toLowerCase();
+
+    switch (fw) {
+      case 'webgpu':
+        return {
+          ...base,
+          wgsl: kernels.webgpu.wgsl,
+          entry: 'main'
+          //workgroup: { x: 256, y: 1, z: 1 } // kernel uses 1 thread per curve; dispatch count handled on client
+        };
+
+      case 'javascript':
+        return {
+          ...base,
+          framework: 'javascript',
+          kernel: kernels.javascript.src,
+          entry: kernels.javascript.entry || 'ecm_stage1'
+        };
+
+      case 'webgl':
+        // Provide shaders; executor will map metadata/uniforms/inputs via generic helpers
+        return {
+          ...base,
+          framework: 'webgl',
+          webglVertexShader: kernels.webgl.vertex,
+          webglFragmentShader: kernels.webgl.fragment,
+          webglShaderType: 'transform', // hint for client
+          webglNumElements: base.metadata.num_curves
+        };
+
+      case 'cuda':
+      case 'opencl':
+      case 'vulkan':
+        return {
+          ...base,
+          framework: fw,
+          kernel: kernels[fw].src,
+          entry: kernels[fw].entry || 'ecm_stage1'
+        };
+
+      default:
+        return { ...base, framework: 'webgpu', wgsl: kernels.webgpu.wgsl, entry: 'main' };
+    }
+  }
+
+  async loadKernels() {
+    const read = async (p) => {
+      try { return await fs.readFile(p, 'utf8'); }
+      catch { return null; }
+    };
+
+    const webgpu = { wgsl: await read(path.join(KERNEL_DIR, 'ecm_stage1_webgpu_compute.wgsl')) };
+    const javascript = { src: await read(path.join(KERNEL_DIR, 'ecm_stage1_javascript_kernel.js')), entry: 'ecm_stage1' };
+    const webgl = {
+      vertex: await read(path.join(KERNEL_DIR, 'ecm_stage1_webgl_vertex.glsl')),
+      fragment: await read(path.join(KERNEL_DIR, 'ecm_stage1_webgl_fragment.glsl'))
+    };
+    const opencl = { src: await read(path.join(KERNEL_DIR, 'ecm_stage1_opencl_kernel.cl')), entry: 'ecm_stage1' };
+    const cuda   = { src: await read(path.join(KERNEL_DIR, 'ecm_stage1_cuda_kernel.cu')), entry: 'ecm_stage1' };
+    const vulkan = { src: await read(path.join(KERNEL_DIR, 'ecm_stage1_vulkan_compute.glsl')), entry: 'main' };
+
+    return { webgpu, javascript, webgl, opencl, cuda, vulkan };
   }
 }
