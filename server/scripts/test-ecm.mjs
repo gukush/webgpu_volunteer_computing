@@ -222,3 +222,4 @@ console.log('2. Runtime execution errors (not syntax errors)');
 console.log('3. Browser-specific WGSL parsing differences');
 console.log('');
 console.log('Check the Chrome console for additional error details.');
+

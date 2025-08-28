@@ -3,7 +3,7 @@ server/certificates/*
 !server/certificates/.gitkeep
 
 server/custom_tasks.json
-
+.env
 remove_emojis.sh
 server/custom_chunks.json
 server/matrix_16.bin/

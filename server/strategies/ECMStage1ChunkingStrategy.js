@@ -109,18 +109,16 @@ struct Uniforms {
   numPrimePowers: u32,
   _pad: u32
 }
-
 @group(0) @binding(0) var<uniform> U : Uniforms;
 
-// pairs of (A24, X1) per curve
+// pairs of (A24, X1) per curve (Montgomery form uses A24=(A+2)/4 mod n).
 struct Curve {
   A24: u64,
   X1: u64
 }
-
 @group(0) @binding(1) var<storage, read> CURVES : array<Curve>;
 
-// prime powers pe (each is p^e, u64)
+// prime powers p^e as u64
 @group(0) @binding(2) var<storage, read> PPS : array<u64>;
 
 // result: atomic flag + factor (u64 split in two u32)
@@ -129,19 +127,18 @@ struct Result {
   fac_lo: u32,
   fac_hi: u32
 }
-
 @group(0) @binding(3) var<storage, read_write> OUT : Result;
 
 fn pack_u64(x: u64) -> vec2<u32> {
-  return vec2<u32>(u32(x & 0xffff_ffffu), u32(x >> 32u));
+  let lo = u32(x & u64(0xffffffffu));
+  let hi = u32(x >> 32u);
+  return vec2<u32>(lo, hi);
 }
-
 fn unpack_u64(v: vec2<u32>) -> u64 {
   return (u64(v.y) << 32u) | u64(v.x);
 }
 
 fn addmod(a: u64, b: u64, m: u64) -> u64 {
-  // (a + b) mod m without overflow
   if (a >= m - b) { return a - (m - b); }
   return a + b;
 }
@@ -149,23 +146,20 @@ fn submod(a: u64, b: u64, m: u64) -> u64 {
   if (a >= b) { return a - b; }
   return m - (b - a);
 }
-// (a * 2) mod m without overflow
 fn dblmod(a: u64, m: u64) -> u64 {
   if (a >= m - a) { return a - (m - a); }
   return a + a;
 }
 
-// Shift-add multiplication: (a * b) mod m with no 128-bit
+// Shift-add (no 128-bit) multiplication: (a*b) mod m
 fn mulmod(a0: u64, b0: u64, m: u64) -> u64 {
   var a = a0 % m;
   var b = b0;
   var res: u64 = 0u;
   while (b != 0u) {
     if ((b & 1u) != 0u) {
-      // res = (res + a) mod m without overflow
       if (res >= m - a) { res = res - (m - a); } else { res = res + a; }
     }
-    // a = (a * 2) mod m
     if (a >= m - a) { a = a - (m - a); } else { a = a + a; }
     b = b >> 1u;
   }
@@ -175,35 +169,60 @@ fn sqrmod(a: u64, m: u64) -> u64 {
   return mulmod(a, a, m);
 }
 
-fn gcd_u64(a: u64, b: u64) -> u64 {
-  var a_var = a;
-  var b_var = b;
-  if (a_var == 0u) { return b_var; }
-  if (b_var == 0u) { return a_var; }
-  // Euclid
+fn gcd_u64(a0: u64, b0: u64) -> u64 {
+  var a = a0;
+  var b = b0;
+  if (a == 0u) { return b; }
+  if (b == 0u) { return a; }
   loop {
-    let r = a_var % b_var;
-    if (r == 0u) { return b_var; }
-    a_var = b_var;
-    b_var = r;
+    let r = a % b;
+    if (r == 0u) { return b; }
+    a = b;
+    b = r;
   }
 }
 
-// Montgomery x-only formulas (projective) for curve: By^2 = x^3 + Ax^2 + x
-// We use A24 = (A+2)/4 mod n, which is an integer for Suyama-selected A.
+// Modular inverse via extended Euclid with modularized coefficients.
+// Returns 0 if gcd(a, m) != 1.
+fn invmod(a_in: u64, m: u64) -> u64 {
+  var a = a_in % m;
+  if (a == 0u) { return 0u; }
+  var t: u64 = 0u;
+  var newt: u64 = 1u;
+  var r: u64 = m;
+  var newr: u64 = a;
+  // Standard EEA with coefficients kept modulo m
+  loop {
+    if (newr == 0u) { break; }
+    let q: u64 = r / newr;
+    // (t, newt) = (newt, t - q*newt mod m)
+    let tmp_t = newt;
+    let qn = mulmod(q, newt, m);
+    newt = submod(t, qn, m);
+    t = tmp_t;
+    // (r, newr) = (newr, r - q*newr)  (exact, no underflow)
+    let tmp_r = newr;
+    r = r - q * newr;
+    newr = tmp_r;
+  }
+  if (r != 1u) { return 0u; } // not invertible
+  return t;                   // 0..m-1
+}
+
+// Montgomery x-only doubling with A24 = (A+2)/4 mod n
 fn mdbl(X: u64, Z: u64, A24: u64, n: u64) -> vec2<u64> {
   let XPZ = addmod(X, Z, n);
   let XMZ = submod(X, Z, n);
-  let AA = sqrmod(XPZ, n);
-  let BB = sqrmod(XMZ, n);
-  let C = submod(AA, BB, n);
-  let X2 = mulmod(AA, BB, n);
+  let AA  = sqrmod(XPZ, n);
+  let BB  = sqrmod(XMZ, n);
+  let C   = submod(AA, BB, n);
+  let X2  = mulmod(AA, BB, n);
   let tmp = addmod(BB, mulmod(A24, C, n), n);
-  let Z2 = mulmod(C, tmp, n);
+  let Z2  = mulmod(C, tmp, n);
   return vec2<u64>(X2, Z2);
 }
 
-// Differential addition: given P=(X1,Z1), Q=(X2,Z2), and diff=X(P-Q)=X_D
+// Differential addition: given P=(X1,Z1), Q=(X2,Z2), and XD = X(P-Q)
 fn madd(X1: u64, Z1: u64, X2: u64, Z2: u64, XD: u64, n: u64) -> vec2<u64> {
   let t1 = mulmod(addmod(X1, Z1, n), submod(X2, Z2, n), n);
   let t2 = mulmod(submod(X1, Z1, n), addmod(X2, Z2, n), n);
@@ -212,37 +231,32 @@ fn madd(X1: u64, Z1: u64, X2: u64, Z2: u64, XD: u64, n: u64) -> vec2<u64> {
   return vec2<u64>(X3, Z3);
 }
 
-// Scalar multiplication by small 64-bit k using Montgomery ladder
+// Montgomery ladder by 64-bit k; base is affine X1 (Z=1)
 fn ladder(k: u64, X1: u64, A24: u64, n: u64) -> vec2<u64> {
-  // (X2,Z2) = [0]P = (1,0), (X3,Z3) = [1]P = (X1,1)
-  var X2: u64 = 1u; var Z2: u64 = 0u;
-  var X3: u64 = X1; var Z3: u64 = 1u;
-
+  var X2: u64 = 1u; var Z2: u64 = 0u;  // [0]P
+  var X3: u64 = X1; var Z3: u64 = 1u;  // [1]P
   var started = false;
-  // find msb of k
   var i: i32 = 63;
   loop {
     if (i < 0) { break; }
-    let bit = (k >> u32(i)) & 1u;
+    let bit: u64 = (k >> u32(i)) & 1u;
     if (!started) {
       if (bit == 1u) { started = true; }
       i = i - 1;
       continue;
     }
     if (bit == 0u) {
-      // (X3,Z3) = add((X2,Z2),(X3,Z3)); (X2,Z2)=dbl((X2,Z2))
       let a = madd(X2, Z2, X3, Z3, X1, n);
       let d = mdbl(X2, Z2, A24, n);
       X3 = a.x; Z3 = a.y; X2 = d.x; Z2 = d.y;
     } else {
-      // (X2,Z2) = add((X2,Z2),(X3,Z3)); (X3,Z3)=dbl((X3,Z3))
       let a = madd(X2, Z2, X3, Z3, X1, n);
       let d = mdbl(X3, Z3, A24, n);
       X2 = a.x; Z2 = a.y; X3 = d.x; Z3 = d.y;
     }
     i = i - 1;
   }
-  return vec2<u64>(X2, Z2);
+  return vec2<u64>(X2, Z2); // [k]P
 }
 
 @compute @workgroup_size(128)
@@ -255,24 +269,60 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 
   let n = U.n;
   let c = CURVES[idx];
-  var X: u64 = c.X1;
-  var Z: u64 = 1u;
-  var XZ: vec2<u64>;
 
-  // Scalar multiply by each prime power pe
+  // We'll keep the current base as *affine* X1_aff, and the last projective (X,Z).
+  var X1_aff: u64 = c.X1;
+  var X: u64 = 0u;
+  var Z: u64 = 1u;
+
   for (var i: u32 = 0u; i < U.numPrimePowers; i = i + 1u) {
     let pe = PPS[i];
-    XZ = ladder(pe, X, c.A24, n);
-    X = XZ.x; Z = XZ.y;
 
-    // Optional early poll: cheap check flag to bail quickly
-    if ((i & 31u) == 0u && OUT.flag != 0u) { return; }
+    // Multiply current base by pe
+    let XZ = ladder(pe, X1_aff, c.A24, n);
+    X = XZ.x;
+    Z = XZ.y;
+
+    // Optional early poll to bail quickly
+    if (((i & 31u) == 0u) && (OUT.flag != 0u)) { return; }
+
+    // If this isn't the last prime power, normalize to affine for the next step.
+    if (i + 1u < U.numPrimePowers) {
+      // If Z shares a factor with n, we already succeeded.
+      let g = gcd_u64(Z % n, n);
+      if (g > 1u && g < n) {
+        if (OUT.flag == 0u) {
+          OUT.flag = 1u;
+          let v = pack_u64(g);
+          OUT.fac_lo = v.x;
+          OUT.fac_hi = v.y;
+        }
+        return;
+      }
+      // Otherwise Z is invertible modulo n; convert to affine X/Z
+      let zinvy = invmod(Z % n, n);
+      // If for some reason inverse failed, try gcd again and stop.
+      if (zinvy == 0u) {
+        let g2 = gcd_u64(Z % n, n);
+        if (g2 > 1u && g2 < n) {
+                  if (OUT.flag == 0u) {
+          OUT.flag = 1u;
+            let v2 = pack_u64(g2);
+            OUT.fac_lo = v2.x;
+            OUT.fac_hi = v2.y;
+          }
+        }
+        return;
+      }
+      X1_aff = mulmod(X, zinvy, n);
+      // reset Z to 1 (affine base for the next ladder call)
+      Z = 1u;
+    }
   }
 
-  // gcd(Z, n): success if 1 < g < n
+  // Final GCD using the last projective Z
   let g = gcd_u64(Z % n, n);
   if (g > 1u && g < n) {
-    // Set flag and store factor (first thread wins)
     if (OUT.flag == 0u) {
       OUT.flag = 1u;
       let v = pack_u64(g);
@@ -281,6 +331,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
   }
 }
+
 `;
 
 // --------------------------------------------
