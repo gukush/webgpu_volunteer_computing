@@ -32,9 +32,6 @@
 #if defined(HAVE_OPENCL) && (defined(CLIENT_OPENCL) || defined(CLIENT_UNIVERSAL))
   #include "opencl/opencl_executor.hpp"
 #endif
-#if defined(HAVE_CLING) && (defined(CLIENT_CLING) || defined(CLIENT_UNIVERSAL))
-  #include "cling/cling_executor.hpp"
-#endif
 
 using nlohmann::json;
 
@@ -43,6 +40,19 @@ std::unique_ptr<FrameworkClient> globalFrameworkClient;
 std::unique_ptr<WebSocketClient> globalWebSocketClient;
 std::unique_ptr<IFrameworkExecutor> globalExecutor;
 bool shutdownRequested = false;
+
+// ... rest of the file remains exactly the same, except this block is removed:
+
+    else if (framework == "cling") {
+    #if defined(HAVE_CLING)
+        std::cout << "Creating Cling executor..." << std::endl;
+        executor = std::make_unique<ClingExecutor>();
+    #else
+        std::cerr << "This binary was built without Cling support.\n";
+    #endif
+    }
+
+
 
 // Timing measurements for native client
 class NativeTimingManager {
@@ -784,14 +794,6 @@ int main(int argc, char* argv[]) {
     #else
         std::cerr << "This binary was built without OpenCL support.\n";
         return 1;
-    #endif
-    }
-    else if (framework == "cling") {
-    #if defined(HAVE_CLING)
-        std::cout << "Creating Cling executor..." << std::endl;
-        executor = std::make_unique<ClingExecutor>();
-    #else
-        std::cerr << "This binary was built without Cling support.\n";
     #endif
     }
     else {
