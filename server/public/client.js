@@ -759,6 +759,89 @@ function serializeUniforms(uniformObj, inputDef) {
   return new Uint32Array(values);
 }
 
+async function __executeWebGPUFromSpec(spec) {
+  // spec: { source, entry, workgroupCount, inputs, outputs, metadata }
+  const shader = state.device.createShaderModule({ code: spec.source });
+  const ci = await shader.getCompilationInfo();
+  if (ci.messages.some(m => m.type === 'error')) {
+    const errors = ci.messages.filter(m => m.type === 'error').map(m => m.message).join('\n');
+    throw new Error(`Shader compilation failed: ${errors}`);
+  }
+  const pipeline = state.device.createComputePipeline({
+    layout: 'auto',
+    compute: { module: shader, entryPoint: spec.entry || 'main' }
+  });
+
+  // Build buffers (follow your existing unified path semantics)
+  const entries = [];
+  let binding = 0;
+
+  // Uniforms from metadata (u32/u32 layout: block_size, matrix_size)
+  if (spec.metadata && ('block_size' in spec.metadata || 'matrix_size' in spec.metadata)) {
+    const u32s = new Uint32Array([
+      spec.metadata.block_size >>> 0,
+      spec.metadata.matrix_size >>> 0
+    ]);
+    const ubuf = state.device.createBuffer({
+      size: Math.max(16, u32s.byteLength),
+      usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST
+    });
+    state.device.queue.writeBuffer(ubuf, 0, u32s);
+    entries.push({ binding: binding++, resource: { buffer: ubuf } });
+  }
+
+  // Inputs
+  (spec.inputs || []).forEach(inp => {
+    const data = (typeof inp.data === 'string') ? Uint8Array.from(atob(inp.data), c => c.charCodeAt(0)) : new Uint8Array();
+    const buf = state.device.createBuffer({
+      size: Math.max(16, data.byteLength),
+      usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST
+    });
+    state.device.queue.writeBuffer(buf, 0, data);
+    entries.push({ binding: binding++, resource: { buffer: buf } });
+  });
+
+  // Outputs
+  const outBufs = (spec.outputs || []).map(o => state.device.createBuffer({
+    size: Math.max(16, o.size|0),
+    usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC
+  }));
+  outBufs.forEach(buf => entries.push({ binding: binding++, resource: { buffer: buf } }));
+
+  const bindGroup = state.device.createBindGroup({
+    layout: pipeline.getBindGroupLayout(0),
+    entries
+  });
+
+  const encoder = state.device.createCommandEncoder();
+  const pass = encoder.beginComputePass();
+  pass.setPipeline(pipeline);
+  pass.setBindGroup(0, bindGroup);
+  const wgc = spec.workgroupCount || [1,1,1];
+  pass.dispatchWorkgroups(wgc[0]|0, wgc[1]|0, wgc[2]|0);
+  pass.end();
+  state.device.queue.submit([encoder.finish()]);
+
+  // Read back
+  const results = [];
+  for (const o of outBufs) {
+    const rb = state.device.createBuffer({
+      size: o.size,
+      usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ
+    });
+    const e2 = state.device.createCommandEncoder();
+    e2.copyBufferToBuffer(o, 0, rb, 0, o.size);
+    state.device.queue.submit([e2.finish()]);
+    await rb.mapAsync(GPUMapMode.READ);
+    const copy = new Uint8Array(rb.getMappedRange()).slice();
+    rb.unmap();
+    results.push(btoa(String.fromCharCode(...copy)));
+  }
+  return results;
+}
+
+
+
 // Enhanced: Framework-agnostic kernel execution
 async function executeFrameworkKernel(meta) {
   const framework = meta.framework || 'webgpu';
@@ -2270,6 +2353,45 @@ socket.on('workload:chunk_assign', async chunk => {
     return;
   }
 
+    // --- Jobscript path: if a PJA is present run it and return results --------
+if (chunk.pja && chunk.pja.script) {
+  try {
+    const AsyncFn = Object.getPrototypeOf(async function(){}).constructor;
+    const rt = {
+      framework: 'webgpu',  // for now; you can auto-select later
+      features: {}, limits: {},
+      emitProgress: (stage, value) => socket.emit('workload:progress_event', {
+        parentId: chunk.parentId, chunkId: chunk.chunkId, stage, value
+      }),
+      emitPartial: (partial) => socket.emit('workload:chunk_partial', {
+        parentId: chunk.parentId, chunkId: chunk.chunkId, partial
+      }),
+      log: (...args) => console.debug('[PJA]', ...args),
+      async executeOnGPU(spec) { return await __executeWebGPUFromSpec(spec); }
+    };
+    const fn = new AsyncFn('rt','pja','ctx', chunk.pja.script);
+    const out = await fn(rt, chunk.pja, { chunk });
+    const results = Array.isArray(out?.results) ? out.results : [];
+
+    socket.emit('workload:chunk_result_enhanced', {
+      parentId: chunk.parentId,
+      chunkId: chunk.chunkId,
+      outputs: results,
+      outputSizes: (chunk.outputs || []).map(o => o.size|0),
+      streamingMetadata: chunk.streamingMetadata
+    });
+    return; // ✅ don’t fall through to legacy path
+  } catch (e) {
+    console.error('[PJA] Jobscript failed:', e);
+    socket.emit('workload:chunk_error_enhanced', {
+      parentId: chunk.parentId,
+      chunkId: chunk.chunkId,
+      message: `PJA: ${e.message}`
+    });
+    return;
+  }
+}
+
   if (!frameworkState[framework]?.supported) {
     console.warn(`[CHUNK] Framework ${framework} not supported for chunk ${chunk.chunkId}`);
     const eventName = chunk.enhanced ? 'workload:chunk_error_enhanced' : 'workload:chunk_error';
@@ -2321,6 +2443,7 @@ socket.on('workload:chunk_assign', async chunk => {
   const strategy = chunk.chunkingStrategy || 'unknown';
 
   logTaskActivity(`[${framework.toUpperCase()}] Processing chunk ${chunk.chunkId} (${strategy}, ${inputCount}→${outputCount})`);
+
 
   try {
   // Framework-specific execution routing

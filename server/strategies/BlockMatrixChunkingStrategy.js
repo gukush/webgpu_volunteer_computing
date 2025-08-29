@@ -403,6 +403,37 @@ async createChunkDescriptorsStreaming(plan, dispatchCallback) {
     }
   }
 
+  buildPJA(plan, desc) {
+  const wgsl =
+    desc.kernel || desc.wgsl || (desc.kernels?.webgpu?.source) || '';
+  const blockSize = Number(desc?.metadata?.block_size ?? 16);
+  // Your kernel uses @workgroup_size(16,16,1); dispatch is in tiles
+  const tiles = Math.ceil(blockSize / 16);
+  const workgroupCount = [tiles, tiles, 1];
+
+  return {
+    schemaVersion: '1.0',
+    taskType: 'block_matrix_multiply',
+    capabilitiesRequired: { compute: true, storageBuffers: true },
+    resourceHints: { workgroupCount },
+    kernels: wgsl ? { webgpu: { entry: desc.entry || 'main', source: wgsl } } : {},
+    script: `
+      // BlockMM PJA (single pass)
+      const spec = {
+        lang: 'webgpu',
+        source: (pja.kernels.webgpu && pja.kernels.webgpu.source) || (ctx.chunk.kernel || ctx.chunk.wgsl),
+        entry: (pja.kernels.webgpu && pja.kernels.webgpu.entry) || (ctx.chunk.entry || 'main'),
+        workgroupCount: (pja.resourceHints && pja.resourceHints.workgroupCount) || (ctx.chunk.workgroupCount || [1,1,1]),
+        inputs: ctx.chunk.inputs,
+        outputs: ctx.chunk.outputs,
+        metadata: ctx.chunk.metadata
+      };
+      const results = await rt.executeOnGPU(spec);
+      return { results };
+    `
+  };
+}
+
     async getKernelFromFile(framework, type) {
     const filename = `block_matrix_multiply_${framework}_${type}`;
     let extension;

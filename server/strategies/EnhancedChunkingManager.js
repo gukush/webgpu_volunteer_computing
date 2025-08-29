@@ -175,7 +175,8 @@ export class EnhancedChunkingManager {
         ...plan,
         inputRefs: workload.inputRefs,
         metadata: { ...plan.metadata, ...workload.metadata },
-        assemblyOptions: plan.assemblyOptions
+        assemblyOptions: plan.assemblyOptions,
+        chunkingStrategy: workload.chunkingStrategy || plan.chunkingStrategy
       };
 
       // Initialize streaming assembly if supported
@@ -222,7 +223,9 @@ export class EnhancedChunkingManager {
         } else {
           chunkDescriptors = plan.chunkDescriptors || [];
         }
-
+        chunkDescriptors = chunkDescriptors.map(d =>
+          this._maybeAttachPJA(workload, fullPlan, d, chunkingStrategy)
+        );
         const descriptorValidation = this.validateChunkDescriptors(chunkDescriptors, plan.schema);
         if (!descriptorValidation.valid) {
           return {
@@ -328,6 +331,14 @@ export class EnhancedChunkingManager {
 
       // Call external dispatch function if available
       const externalDispatch = this.dispatchCallbacks.get(workloadId);
+
+      // Attach PJA before handoff (use stored plan so we know which mapping to apply)
+      const info = this.activeWorkloads.get(workloadId);
+      const plan = info?.plan || fullPlan || null;
+      const inst = this.registry.getChunkingStrategy(
+        plan?.chunkingStrategy || workload?.chunkingStrategy || chunkDescriptor?.chunkingStrategy
+      );
+      chunkDescriptor = this._maybeAttachPJA(info || workload, plan, chunkDescriptor, inst);
       if (externalDispatch) {
         try {
           await externalDispatch(chunkDescriptor);
@@ -357,6 +368,37 @@ export class EnhancedChunkingManager {
     const ref = typeof s === 'function' ? s.prototype : s;
     return ref && typeof ref.processChunkResult === 'function';
   }
+
+  /**
+ * Attach a PJA to a chunk descriptor if an execution strategy is available.
+ * - Uses workload.executionStrategy if provided; otherwise registry default for the chunking strategy.
+ * - Falls back to strategy.buildPJA if the chunking strategy instance implements it.
+ */
+/**
+ * Ask the chunking strategy instance to attach a PJA to the descriptor.
+ * If the strategy has no buildPJA, we do nothing (legacy path).
+ */
+_maybeAttachPJA(workload, plan, descriptor, chunkingStrategyInstance) {
+  try {
+    const chunkingName =
+      plan?.chunkingStrategy ||
+      workload?.chunkingStrategy ||
+      descriptor?.chunkingStrategy;
+
+    const inst =
+      chunkingStrategyInstance ||
+      (chunkingName ? this.registry.getChunkingStrategy(chunkingName) : null);
+
+    if (inst && typeof inst.buildPJA === 'function') {
+      const pja = inst.buildPJA(plan, descriptor);
+      if (pja) descriptor.pja = pja;
+    }
+  } catch (e) {
+    console.warn(`[PJA] Failed to build PJA for chunk ${descriptor?.chunkId}: ${e?.message}`);
+  }
+  return descriptor;
+}
+
 
   /**
    * ENHANCED: Handle chunk completion with streaming assembly support

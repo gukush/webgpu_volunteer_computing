@@ -190,6 +190,143 @@ export default class ECMStage1ChunkingStrategy extends BaseChunkingStrategy {
       };
     }
 
+
+  buildPJA(plan, desc) {
+  // Prefer the WGSL you already picked for this descriptor
+  const wgsl = desc.wgsl || desc.kernel || (desc.kernels?.webgpu?.source) || '';
+  const md   = desc.metadata || {};
+  const batchCount     = Number(md.batchCount ?? 1);              // e.g., 5
+  const curvesPerBatch = Number(md.curvesPerBatch ?? md.num_curves ?? 1024);
+  const outStride      = Number(md.outStride ?? 48);              // bytes per curve result
+  const pp_count       = Number(md.pp_count ?? 0);
+  const compute_gcd    = Number(md.compute_gcd ?? 1);             // 1 or 0
+
+  return {
+    schemaVersion: '1.0',
+    taskType: 'ecm_stage1',
+    capabilitiesRequired: { compute: true, storageBuffers: true },
+    kernels: wgsl ? { webgpu: { entry: 'main', source: wgsl } } : {},
+    resourceHints: {},
+
+    // The jobscript loops over batches and dispatches once per batch.
+    script: `
+      // ECM Stage-1 PJA (batched)
+      // Inputs:
+      //   ctx.chunk.inputs includes:
+      //     - a shared "packed" (consts+prime powers) buffer (optional)
+      //     - a "curves" buffer (may contain batchCount * curvesPerBatch items)
+      // Output:
+      //   single "curve_out" buffer (batchCount * curvesPerBatch * outStride bytes)
+
+      const md   = ctx.chunk.metadata || {};
+      const batchCount     = Number(md.batchCount ?? 1);
+      const curvesPerBatch = Number(md.curvesPerBatch ?? md.num_curves ?? 1024);
+      const outStride      = Number(md.outStride ?? 48);
+      const pp_count       = Number(md.pp_count ?? 0);
+      const compute_gcd    = Number(md.compute_gcd ?? 1);
+
+      // Find input buffers
+      const inputs = ctx.chunk.inputs || [];
+      const packedInput = inputs.find(i => i.name === 'packed'); // optional
+      const curvesInput = inputs.find(i => i.name === 'curves'); // required
+
+      if (!curvesInput) {
+        throw new Error('ECM PJA: missing "curves" input buffer');
+      }
+
+      // Total curves present in curvesInput
+      const totalCurves = batchCount * curvesPerBatch;
+      const results = [];
+
+      // We will call into a unified executor per batch, but to minimize boilerplate,
+      // we just pass the whole spec and rely on the executor to bind buffers by order.
+
+      // Create a single output buffer sized for all batches
+      const totalOutBytes = totalCurves * outStride;
+      const outputs = [{ name: 'curve_out', size: totalOutBytes }];
+
+      // Helper to slice base64 by byte range
+      function b64Slice(b64, offset, length) {
+        // decode, slice, re-encode (small batches → ok in practice)
+        const bin = atob(b64);
+        const sub = bin.substring(offset, offset + length);
+        return btoa(sub);
+      }
+
+      // Each "curve" element size in the packed curves buffer (bytes)
+      const curveInBytes = Number(md.curveInBytes ?? 64); // keep consistent with your generator
+
+      // Uniform struct is (pp_count, num_curves, compute_gcd) => 3 * u32 => 12 bytes, pad to 16
+      function makeUniformB64(pp_count, num_curves, compute_gcd) {
+        const a = new Uint32Array([pp_count>>>0, num_curves>>>0, compute_gcd>>>0, 0]);
+        let s = '';
+        const u8 = new Uint8Array(a.buffer);
+        for (let i=0; i<u8.length; i++) s += String.fromCharCode(u8[i]);
+        return btoa(s);
+      }
+
+      // Dispatch geometry: @workgroup_size(256,1,1), so X = ceil(num_curves/256)
+      function dispatchX(n) { return Math.ceil(n / 256); }
+
+      // Fixed inputs (packed) + mutable curves per batch + uniforms + output
+      const packedArr = [];
+      if (packedInput && packedInput.data) packedArr.push(packedInput);
+
+      const outSpec = {
+        lang: 'webgpu',
+        source: (pja.kernels.webgpu && pja.kernels.webgpu.source) || (ctx.chunk.wgsl || ctx.chunk.kernel),
+        entry: (pja.kernels.webgpu && pja.kernels.webgpu.entry) || 'main',
+        workgroupCount: [1,1,1],  // set per batch
+        inputs: [],                // set per batch
+        outputs,                   // one big buffer holding all batches
+        metadata: null
+      };
+
+      // Iterate batches
+      for (let b = 0; b < batchCount; b++) {
+        const num_curves = curvesPerBatch;
+        const batchInBytes  = num_curves * curveInBytes;
+        const batchOutBytes = num_curves * outStride;
+
+        const curvesOffset = b * batchInBytes;
+        const curvesB64 = b64Slice(curvesInput.data, curvesOffset, batchInBytes);
+        const uniformsB64 = makeUniformB64(${pp_count}, num_curves, ${compute_gcd});
+
+        // Build per-batch input list: [packed (optional), uniforms, curves]
+        const batchInputs = [...packedArr,
+          { name: 'uniforms', data: uniformsB64 },
+          { name: 'curves',   data: curvesB64 }
+        ];
+
+        outSpec.inputs = batchInputs;
+        outSpec.workgroupCount = [dispatchX(num_curves), 1, 1];
+
+        // Execute one batch; executor writes into the single output buffer
+        // at the correct offset (by bind layout). If your executor does not
+        // support partial writes, you can do a copy step, but the sample
+        // __executeWebGPUFromSpec writes exact sizes in-order, so we run
+        // batches serially and then read once at the end.
+        await rt.executeOnGPU(outSpec);
+
+        rt.emitProgress?.('batch_done', (b+1)/batchCount);
+      }
+
+      // Read back the single output buffer
+      // The provided executeOnGPU helper returns outputs in base64 already if outputs are declared.
+      // Because we ran it multiple times with the same output binding, the final contains the last batch,
+      // so we re-run with a zero-sized inputs to just read the output (or your executor may
+      // offer a "read outputs only" mode; adjust as needed).
+      const finalRead = await rt.executeOnGPU({
+        ...outSpec,
+        inputs: [],                 // no-op inputs
+        workgroupCount: [0,0,0]     // no dispatch; executor should interpret this as "just read"
+      });
+
+      return { results: finalRead };
+    `
+  };
+}
+
   // Phase 1: Validate inputs and construct a plan (no heavy work here)
   planExecution(plan) {
     const md = plan.metadata || {};

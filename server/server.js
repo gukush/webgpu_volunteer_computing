@@ -884,7 +884,9 @@ app.post('/api/workloads/advanced', async (req, res) => {
     customAssemblyFile,
     customChunkingCode,
     customAssemblyCode,
-    streamingMode = false
+    streamingMode = false,
+    executionStrategy,
+    frameworkPrefs
   } = req.body;
 
   try {
@@ -906,7 +908,9 @@ app.post('/api/workloads/advanced', async (req, res) => {
       chunkingStrategy,
       assemblyStrategy,
       framework,
-      metadata: metadata || {}
+      metadata: metadata || {},
+      executionStrategy: executionStrategy || null,
+      frameworkPrefs: Array.isArray(frameworkPrefs) ? frameworkPrefs : null
     });
 
     // Create enhanced workload metadata
@@ -1445,6 +1449,7 @@ async function dispatchChunkToClient(client, chunkDescriptor, workloadId) {
       inputs: chunkDescriptor.inputs || [],
       outputs: chunkDescriptor.outputs || [],
       metadata: chunkDescriptor.metadata || {},
+      pja: chunkDescriptor.pja || null,
       outputSizes: chunkDescriptor.outputs ? chunkDescriptor.outputs.map(o => o.size) : [],
 
       // Assembly metadata for streaming
@@ -4068,6 +4073,7 @@ async function dispatchChunkToClientFixed(client, chunkDescriptor, workloadId) {
       inputs: chunkDescriptor.inputs || [],
       outputs: chunkDescriptor.outputs || [],
       metadata: chunkDescriptor.metadata || {},
+      pja: chunkDescriptor.pja || null,
       outputSizes: chunkDescriptor.outputs ? chunkDescriptor.outputs.map(o => o.size) : [],
 
       // Assembly metadata for streaming

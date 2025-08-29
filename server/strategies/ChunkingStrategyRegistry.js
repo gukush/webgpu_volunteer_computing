@@ -20,13 +20,6 @@ import DistributedConvolutionAssemblyStrategy from './DistributedConvolutionAsse
 import ECMStage1ChunkingStrategy from './ECMStage1ChunkingStrategy.js';
 import ECMStage1AssemblyStrategy from './ECMStage1AssemblyStrategy.js';
 
-// NEW: Transformer strategies (commented out until implemented)
-// import AttentionChunkingStrategy from './AttentionChunkingStrategy.js';
-// import AttentionAssemblyStrategy from './AttentionAssemblyStrategy.js';
-// import FeedForwardChunkingStrategy from './FeedForwardChunkingStrategy.js';
-// import FeedForwardAssemblyStrategy from './FeedForwardAssemblyStrategy.js';
-// import LayerNormChunkingStrategy from './LayerNormChunkingStrategy.js';
-// import LayerNormAssemblyStrategy from './LayerNormAssemblyStrategy.js';
 
 import vm from 'vm';
 import { fileURLToPath } from 'url';
@@ -40,6 +33,7 @@ export class ChunkingStrategyRegistry {
   constructor() {
     this.chunkingStrategies = new Map();
     this.assemblyStrategies = new Map();
+    this.executionStrategies = new Map();
     this.shaderTemplates = new Map();
     this.streamingCapabilities = new Map();
     // Initialize built-in strategies
@@ -72,6 +66,31 @@ export class ChunkingStrategyRegistry {
     const capabilities = this.analyzeAssemblyCapabilities(strategy);
     this.streamingCapabilities.set(strategy.name, capabilities);
     if (__DEBUG_ON__) console.log(`Registered assembly strategy: ${strategy.name}`, capabilities);
+  }
+
+  hasBuildPJA(name) {
+    const s = this.getChunkingStrategy(name);
+    return !!(s && typeof s.buildPJA === 'function');
+  }
+
+  registerExecutionStrategy(strategy) {
+  if (!strategy || !strategy.name || typeof strategy.buildPJA !== 'function') {
+    throw new Error('Execution strategy must have name and buildPJA(plan, descriptor)');
+  }
+  this.executionStrategies.set(strategy.name, strategy);
+  if (__DEBUG_ON__) console.log(`Registered execution strategy: ${strategy.name}`);
+  }
+
+  getExecutionStrategy(name) {
+    return this.executionStrategies.get(name) || null;
+  }
+
+  setDefaultExecutionFor(chunkingName, execName) {
+    this.defaultExecutionByChunking.set(chunkingName, execName);
+  }
+
+  getDefaultExecutionFor(chunkingName) {
+    return this.defaultExecutionByChunking.get(chunkingName) || null;
   }
 
   analyzeChunkingCapabilities(strategy) {
