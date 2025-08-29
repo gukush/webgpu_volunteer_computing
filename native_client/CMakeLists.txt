@@ -11,6 +11,9 @@ if(DEFINED ENV{VCPKG_ROOT} AND NOT DEFINED CMAKE_TOOLCHAIN_FILE)
         CACHE STRING "")
 endif()
 
+message(STATUS "CPU support enabled (always available)")
+set(HAVE_CPU ON)
+
 option(ENABLE_CUDA "Enable CUDA support" OFF)
 if (ENABLE_CUDA)
   enable_language(CUDA)
@@ -21,6 +24,8 @@ find_package(Boost REQUIRED COMPONENTS system url)
 find_package(OpenSSL REQUIRED)
 find_package(nlohmann_json CONFIG REQUIRED)
 find_package(Threads REQUIRED)
+
+
 
 # Optional: CUDA support
 option(ENABLE_CUDA "Enable CUDA support" ON)
@@ -99,6 +104,7 @@ if(HAVE_CUDA AND NOT TARGET CUDA::nvrtc)
         set(HAVE_CUDA OFF)
     endif()
 endif()
+
 
 # Optional: OpenCL support - WORKING VERSION
 option(ENABLE_OPENCL "Enable OpenCL support" ON)
@@ -306,6 +312,30 @@ if(HAVE_OPENCL)
     message(STATUS "Created target: opencl_client")
 endif()
 
+
+
+if(HAVE_CPU)
+    add_executable(cpp_client
+        main.cpp
+        ${COMMON_SOURCES}
+        cpp/cpp_executor.cpp
+    )
+
+    target_link_libraries(cpp_client PRIVATE
+        ${BASE_LIBS}
+    )
+
+    target_compile_definitions(cpp_client PRIVATE HAVE_CPU=1 CLIENT_CPU=1)
+
+    set_target_properties(cpp_client PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
+    )
+
+    message(STATUS "Created target: cpp_client")
+endif()
+
+
+
 # Vulkan Client
 if(HAVE_VULKAN)
     add_executable(vulkan_client
@@ -336,11 +366,14 @@ endif()
 
 
 # Universal client that can be built with all available frameworks
-if(HAVE_CUDA OR HAVE_OPENCL OR HAVE_VULKAN)
+if(HAVE_CPU OR HAVE_CUDA OR HAVE_OPENCL OR HAVE_VULKAN)
     set(UNIVERSAL_SOURCES ${COMMON_SOURCES})
     set(UNIVERSAL_LIBS ${BASE_LIBS})
     set(UNIVERSAL_DEFS "")
-
+    if(HAVE_CPU)
+        list(APPEND UNIVERSAL_SOURCES cpp/cpp_executor.cpp)
+        list(APPEND UNIVERSAL_DEFS HAVE_CPU=1)
+    endif()
     if(HAVE_CUDA)
         list(APPEND UNIVERSAL_SOURCES cuda/cuda_executor.cpp)
         list(APPEND UNIVERSAL_LIBS CUDA::cuda_driver CUDA::nvrtc CUDA::cudart)
@@ -384,6 +417,7 @@ endif()
 
 # Print build summary
 message(STATUS "=== Build Summary ===")
+message(STATUS "CPU Support: ${HAVE_CPU}")
 message(STATUS "CUDA Support: ${HAVE_CUDA}")
 message(STATUS "OpenCL Support: ${HAVE_OPENCL}")
 message(STATUS "Vulkan Support: ${HAVE_VULKAN}")
@@ -402,8 +436,12 @@ message(STATUS "====================")
 # Installation rules
 set(INSTALL_TARGETS "")
 
-if(HAVE_CUDA OR HAVE_OPENCL OR HAVE_VULKAN)
+if(HAVE_CPU OR HAVE_CUDA OR HAVE_OPENCL OR HAVE_VULKAN)
     list(APPEND INSTALL_TARGETS universal_client)
+endif()
+
+if(HAVE_CPU)
+    list(APPEND INSTALL_TARGETS cpp_client)
 endif()
 
 if(HAVE_CUDA)

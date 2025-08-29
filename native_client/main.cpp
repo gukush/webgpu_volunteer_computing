@@ -32,6 +32,9 @@
 #if defined(HAVE_OPENCL) && (defined(CLIENT_OPENCL) || defined(CLIENT_UNIVERSAL))
   #include "opencl/opencl_executor.hpp"
 #endif
+#if defined(HAVE_CPU) && (defined(CLIENT_CPU) || defined(CLIENT_UNIVERSAL))
+  #include "cpp/cpp_executor.hpp"
+#endif
 
 using nlohmann::json;
 
@@ -234,6 +237,7 @@ static void printUsage(const char* programName) {
     std::cout << "Usage: " << programName << " <framework> [options]\n"
               << "Frameworks: ";
 
+    std::cout << "cpp ";
 #if defined(HAVE_VULKAN)
     std::cout << "vulkan ";
 #endif
@@ -754,8 +758,11 @@ int main(int argc, char* argv[]) {
 
     // Create framework executor
     std::unique_ptr<IFrameworkExecutor> executor;
-
-    if (framework == "vulkan") {
+    if (framework == "cpp") {
+        std::cout << "Creating CPU executor..." << std::endl;
+        executor = std::make_unique<CPUExecutor>();
+    }
+    else if (framework == "vulkan") {
     #if defined(HAVE_VULKAN)
         std::cout << "Creating Vulkan executor..." << std::endl;
         executor = std::make_unique<VulkanExecutor>(deviceId);
