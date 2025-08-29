@@ -167,30 +167,28 @@ export default class ECMStage1ChunkingStrategy extends BaseChunkingStrategy {
     super('ecm_stage1');
   }
 
-  defineInputSchema() {
-    return {
-      inputs: [
-        { name: 'consts', type: 'storage_buffer', binding: 0, elementType: 'u32' },
-        { name: 'curves', type: 'storage_buffer', binding: 1, elementType: 'u32' },
-        { name: 'primes', type: 'storage_buffer', binding: 2, elementType: 'u32' }
-      ],
-      outputs: [
-        { name: 'curve_out', type: 'storage_buffer', binding: 3, elementType: 'u32' }
-      ],
-      uniforms: [
-        {
-          name: 'params',
-          type: 'uniform_buffer',
-          binding: 4,
-          fields: [
-            { name: 'pp_count',    type: 'u32' },
-            { name: 'num_curves',  type: 'u32' },
-            { name: 'compute_gcd', type: 'u32' }
-          ]
-        }
-      ]
-    };
-  }
+    defineInputSchema() {
+      return {
+        inputs: [
+          { name: 'packed', type: 'storage_buffer', binding: 1, elementType: 'u32' }, // consts+primes
+          { name: 'curves', type: 'storage_buffer', binding: 2, elementType: 'u32' },
+        ],
+        outputs: [
+          { name: 'curve_out', type: 'storage_buffer', binding: 3, elementType: 'u32' }
+        ],
+        uniforms: [
+          {
+            name: 'params', type: 'uniform_buffer', binding: 0,
+            fields: [
+              { name: 'pp_count', type: 'u32' },
+              { name: 'num_curves', type: 'u32' },
+              { name: 'compute_gcd', type: 'u32' },
+              { name: '_upad', type: 'u32' },
+            ]
+          }
+        ]
+      };
+    }
 
   // Phase 1: Validate inputs and construct a plan (no heavy work here)
   planExecution(plan) {
@@ -260,6 +258,17 @@ async createChunkDescriptors(plan) {
   const pp_count    = md.pp_count;
   const seed        = md.seed || 'ecm';
 
+  const constsB64  = plan.shared?.constsB64;
+  const primesB64  = plan.shared?.primesB64;
+  if (!constsB64 || !primesB64) {
+    throw new Error('Missing shared buffers: constsB64 or primesB64');
+  }
+  const constsBuf  = Buffer.from(constsB64, 'base64');
+  const primesBuf  = Buffer.from(primesB64, 'base64');
+  const packedB64  = Buffer.concat([constsBuf, primesBuf]).toString('base64');
+
+
+
   const kernels = await this.loadKernels();
   const descriptors = [];
 
@@ -283,26 +292,31 @@ async createChunkDescriptors(plan) {
     // Pack uniforms as a fixed 16-byte blob (u32[4]) to match WGSL layout
     const u = new Uint32Array([pp_count, count, md.compute_gcd ? 1 : 0, 0]);
     const uniforms = { binding: 4, data: b64(Buffer.from(u.buffer)) };
-
+    const uMeta = {
+      pp_count: pp_count,
+      num_curves: count,
+      compute_gcd: md.compute_gcd ? 1 : 0,
+      pad0: 0
+    };
     const base = {
       chunkId: `ecm-${chunkIndex}`,
+      id: `ecm-${chunkIndex}`,
       chunkIndex,
       parentId,
       framework: plan.framework || md.framework || 'webgpu',
 
-      // Explicit bindings for inputs to match WGSL @binding(0..2)
-      inputs: [
-        { name: 'consts', data: plan.shared.constsB64, binding: 0 },
-        { name: 'curves', data: b64(curveBuf),          binding: 1 },
-        { name: 'primes', data: plan.shared.primesB64,  binding: 2 }
-      ],
+    // Explicit bindings for inputs to match WGSL @binding(0..2)
+    inputs: [
+      { name: 'packed', data: packedB64,   binding: 1 }, // matches WGSL @group(1) @binding(1)
+      { name: 'curves', data: b64(curveBuf), binding: 2 }, // @group(2) @binding(2)
+    ],
 
       // Outputs + sizes (validator + client)
-      outputs:     [{ name: 'curve_out', size: outBytes, binding: 3 }],
+      outputs:     [{ name: 'curve_out', size: outBytes, binding: 3 }], // binding was 3
       outputSizes: [outBytes],
 
-      // Stable uniforms blob (preferred over ad-hoc object packing)
-      uniforms,
+      // (remove the old binary uniforms blob — the client uses metadata)
+      //uniforms,
 
       // Free-form metadata if you want it
       metadata: {
@@ -310,7 +324,8 @@ async createChunkDescriptors(plan) {
         total_chunks: totalChunks,
         B1,
         pp_count,
-        num_curves: count
+        num_curves: count,
+         uniforms: { pp_count, num_curves: count, compute_gcd: md.compute_gcd ? 1 : 0, pad0: 0 }, // ???
       },
 
       // One thread per curve, @workgroup_size(256) => dispatch ceil(count/256)
@@ -324,6 +339,18 @@ async createChunkDescriptors(plan) {
   }
 
   return descriptors;
+}
+
+
+async createChunkDescriptorsStreaming(plan, emit) {
+  const descs = await this.createChunkDescriptors(plan);
+  if (typeof emit === 'function') for (const d of descs) emit(d);
+  return { totalChunks: descs.length };
+}
+async streamChunkDescriptors(plan) {
+  const descs = await this.createChunkDescriptors(plan);
+  async function* gen() { for (const d of descs) yield d; }
+  return { totalChunks: descs.length, stream: gen() };
 }
 
   createFrameworkSpecificDescriptor(base, kernels, framework) {

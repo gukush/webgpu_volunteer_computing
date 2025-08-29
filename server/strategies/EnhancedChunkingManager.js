@@ -446,7 +446,8 @@ export class EnhancedChunkingManager {
           finalResult: assemblyResult.result
         };
       } else if (assemblyResult.success) {
-        console.log(` Streaming assembly progress: ${assemblyResult.progress.toFixed(1)}% for ${parentId}`);
+        const p = Number(assemblyResult.progress);
+        console.log(` Streaming assembly progress: ${Number.isFinite(p) ? p.toFixed(1) : '0.0'}% for ${parentId}`);
 
         return {
           success: true,
@@ -559,7 +560,7 @@ export class EnhancedChunkingManager {
           strategy.name === 'file_processing') {
         return true;
       }
-      
+
       // ECM strategy generates all data internally - no file upload needed
       if (strategy.name === 'ecm_stage1') {
         return false;

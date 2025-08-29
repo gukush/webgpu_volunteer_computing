@@ -9,6 +9,7 @@ import { info } from '../logger.js';
 
 const __DEBUG_ON__ = (process.env.LOG_LEVEL || '').toLowerCase() === 'debug';
 
+const _streamingProgress = new Map();
 // Helpers to parse outputs
 function readU32LE(buf, o) {
   return buf[o] | (buf[o+1]<<8) | (buf[o+2]<<16) | (buf[o+3]<<24);
@@ -27,6 +28,21 @@ function bigIntToHex(bi) {
   return s;
 }
 
+/**
+ * Helper: get numeric totalChunks from parent metadata if present, otherwise undefined.
+ * Accepts whatever parent object you have available in your strategy.
+ */
+function _getTotalChunksFromParent(parent) {
+  if (!parent) return undefined;
+  // Common places where total chunk count might live:
+  return parent.totalChunks
+      || parent.metadata?.totalChunks
+      || parent.metadata?.streamTotalChunks
+      || parent.plan?.totalChunks
+      || undefined;
+}
+
+
 export default class ECMStage1AssemblyStrategy extends BaseAssemblyStrategy {
   constructor() {
     super('ecm_stage1_assembly');
@@ -35,6 +51,8 @@ export default class ECMStage1AssemblyStrategy extends BaseAssemblyStrategy {
     this.factor = null;
     this.curvesChecked = 0;
     this.outStride = 48; // bytes per element (U256 + u32 status, padded to 48)
+    // ADD: Streaming callbacks infrastructure
+    this.streamingCallbacks = new Map();
   }
 
   async initOutputStore(plan) {
@@ -44,6 +62,19 @@ export default class ECMStage1AssemblyStrategy extends BaseAssemblyStrategy {
     this.factor = null;
     this.completed = 0;
     this.curvesChecked = 0;
+  }
+
+  // ADD: Streaming callback registration methods
+  onBlockComplete(callback) {
+    if (typeof callback === 'function') {
+      this.streamingCallbacks.set('block_complete', callback);
+    }
+  }
+
+  onAssemblyComplete(callback) {
+    if (typeof callback === 'function') {
+      this.streamingCallbacks.set('assembly_complete', callback);
+    }
   }
 
   // Streaming assembly entry point
@@ -80,6 +111,18 @@ export default class ECMStage1AssemblyStrategy extends BaseAssemblyStrategy {
 
       this.completed++;
 
+      // ADD: Fire progress callback after each chunk
+      const progressCallback = this.streamingCallbacks.get('block_complete');
+      if (progressCallback && this.totalChunks > 0) {
+        const progress = (this.completed / this.totalChunks) * 100;
+        await progressCallback({
+          completedBlocks: this.completed,
+          totalBlocks: this.totalChunks,
+          progress: progress,
+          curvesChecked: this.curvesChecked
+        });
+      }
+
       if (found && !this.factor) {
         this.factor = found;
         const payload = Buffer.from(JSON.stringify({
@@ -88,6 +131,16 @@ export default class ECMStage1AssemblyStrategy extends BaseAssemblyStrategy {
           factor_dec: found.toString(10),
           curves_checked: this.curvesChecked
         }), 'utf8').toString('base64');
+
+        // ADD: Fire completion callback for early termination
+        const completeCallback = this.streamingCallbacks.get('assembly_complete');
+        if (completeCallback) {
+          await completeCallback({
+            result: payload,
+            status: 'factor_found',
+            curvesChecked: this.curvesChecked
+          });
+        }
 
         return {
           success: true,
@@ -108,6 +161,16 @@ export default class ECMStage1AssemblyStrategy extends BaseAssemblyStrategy {
           status: 'no_factor',
           curves_checked: this.curvesChecked
         }), 'utf8').toString('base64');
+
+        // ADD: Fire completion callback for normal completion
+        const completeCallback = this.streamingCallbacks.get('assembly_complete');
+        if (completeCallback) {
+          await completeCallback({
+            result: payload,
+            status: 'no_factor',
+            curvesChecked: this.curvesChecked
+          });
+        }
 
         return {
           success: true,
@@ -140,6 +203,7 @@ export default class ECMStage1AssemblyStrategy extends BaseAssemblyStrategy {
   }
 
   async cleanup() {
-    // Nothing to clean
+    // ADD: Clear streaming callbacks
+    this.streamingCallbacks.clear();
   }
 }

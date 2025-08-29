@@ -394,10 +394,10 @@ wss.on('connection', (ws, request) => {
 
     if (tally.ok) {
       const winner = wl.results.find(r => r.serverChecksum === tally.winningChecksum);
-      
+
       // Complete timing for this workload
       timingManager.completeTask(id);
-      
+
       wl.status = 'complete';
       wl.finalResults = winner.results;
       wl.finalResultBase64 = Buffer.concat(winner.results.map(r => Buffer.from(r, 'base64'))).toString('base64');
@@ -1298,7 +1298,7 @@ if (streamingMode) {
               inputCount: cd.inputs?.length || 0,
               outputCount: cd.outputs?.length || 0
             });
-            
+
             return {
               ...cd,
               status: 'queued',
@@ -1408,7 +1408,10 @@ async function dispatchChunkToClient(client, chunkDescriptor, workloadId) {
   if (__DEBUG_ON__) console.log(`[CHUNK DISPATCH] Framework: ${chunkDescriptor.framework}`);
   try {
     client.isBusyWithCustomChunk = true;
-
+    //import crypto from 'crypto';
+    const sc = chunkDescriptor.wgsl || chunkDescriptor.kernel;
+    const scHash = sc ? crypto.createHash('sha256').update(sc).digest('hex').slice(0,8) : '—';
+    console.log(`[DISPATCH] ${chunkDescriptor.chunkId} wgsl? ${!!sc} len=${sc?.length ?? 0} hash=${scHash}`);
     // Create unified task data for the client (same as before but with better logging)
     const taskData = {
       parentId: chunkDescriptor.parentId,
@@ -1489,108 +1492,6 @@ async function dispatchChunkToClient(client, chunkDescriptor, workloadId) {
     client.isBusyWithCustomChunk = false;
     console.error(` [DISPATCH] Failed to dispatch to client ${client.id}:`, error);
     throw error;
-  }
-}
-
-function assignCustomChunkToAvailableClientsEnhanced() {
-  const availableClients = Array.from(matrixState.clients.entries()).filter(([clientId, client]) =>
-    client.connected &&
-    client.gpuInfo &&
-    !client.isBusyWithCustomChunk &&
-    !client.isBusyWithMatrixTask &&
-    (client.socket || client.emit)
-  );
-
-  for (const [clientId, client] of availableClients) {
-    // NEW: First check for streaming workloads
-    let assigned = false;
-
-    for (const parent of customWorkloads.values()) {
-      if (parent.streamingMode && parent.status === 'streaming_chunks') {
-        // For streaming workloads, chunks are dispatched via the callback system
-        // This loop mainly handles any queued chunks that couldn't be dispatched immediately
-        continue;
-      }
-
-      // Handle regular batch workloads (existing logic)
-      if (!parent.isChunkParent || !['assigning_chunks', 'processing_chunks'].includes(parent.status)) continue;
-
-      // Check if client supports the framework
-      if (!client.supportedFrameworks || !client.supportedFrameworks.includes(parent.framework)) {
-        continue;
-      }
-
-      const store = customWorkloadChunks.get(parent.id);
-      if (!store) continue;
-
-      for (const cd of store.allChunkDefs) {
-        if (
-          cd.status !== 'completed' &&
-          !cd.verified_results &&
-          cd.dispatchesMade < ADMIN_K_PARAMETER &&
-          !cd.assignedClients.has(clientId)
-        ) {
-          cd.dispatchesMade++;
-          cd.activeAssignments.add(clientId);
-          cd.assignedClients.add(clientId);
-          cd.status = 'active';
-          cd.assignedTo = clientId;
-          cd.assignedAt = Date.now();
-          client.isBusyWithCustomChunk = true;
-
-          // Create task data (existing logic)
-          const taskData = {
-            parentId: cd.parentId,
-            chunkId: cd.chunkId,
-            chunkOrderIndex: cd.chunkOrderIndex,
-            framework: parent.framework,
-            enhanced: parent.enhanced,
-            streaming: false,  // Mark as batch chunk
-
-            kernel: cd.kernel || parent.metadata?.customShader,
-            wgsl: cd.wgsl || cd.kernel || parent.metadata?.customShader,
-            entry: cd.entry || 'main',
-            workgroupCount: cd.workgroupCount || [1, 1, 1],
-
-            // Framework-specific properties (existing)
-            webglShaderType: cd.webglShaderType,
-            webglVertexShader: cd.webglVertexShader,
-            webglFragmentShader: cd.webglFragmentShader,
-            webglVaryings: cd.webglVaryings,
-            webglNumElements: cd.webglNumElements,
-            webglInputSpec: cd.webglInputSpec,
-
-            blockDim: cd.blockDim,
-            gridDim: cd.gridDim,
-            globalWorkSize: cd.globalWorkSize,
-            localWorkSize: cd.localWorkSize,
-            shaderType: cd.shaderType,
-
-            inputs: cd.inputs || [],
-            outputs: cd.outputs || [],
-            metadata: cd.metadata || {},
-            outputSizes: cd.outputs ? cd.outputs.map(o => o.size) : [cd.outputSize],
-            outputSize: cd.outputs ? cd.outputs[0]?.size : cd.outputSize,
-
-            chunkingStrategy: parent.chunkingStrategy,
-            assemblyStrategy: parent.assemblyStrategy
-          };
-
-          // Dispatch to client
-          if (client.socket) {
-            client.socket.emit('workload:chunk_assign', taskData);
-          } else if (client.emit) {
-            client.emit('workload:chunk_assign', taskData);
-          }
-
-          console.log(` Assigned batch chunk ${cd.chunkId} to ${client.clientType || 'browser'} client ${clientId}`);
-          assigned = true;
-          break;
-        }
-      }
-
-      if (assigned) break;
-    }
   }
 }
 
@@ -2234,207 +2135,6 @@ function generateInputSchema(inputs) {
   return schema;
 }
 
-// Enhanced chunk assignment with proper schema
-function assignCustomChunkToAvailableClients() {
-  const availableClients = Array.from(matrixState.clients.entries()).filter(([clientId, client]) =>
-    client.connected &&
-    client.gpuInfo &&
-    !client.isBusyWithCustomChunk &&
-    !client.isBusyWithMatrixTask &&
-    (client.socket || client.emit) // Support both Socket.IO and native WebSocket clients
-  );
-
-  for (const [clientId, client] of availableClients) {
-    for (const parent of customWorkloads.values()) {
-      if (!parent.isChunkParent || !['assigning_chunks', 'processing_chunks'].includes(parent.status)) continue;
-
-      // Check if client supports the framework
-      if (!client.supportedFrameworks || !client.supportedFrameworks.includes(parent.framework)) {
-        continue;
-      }
-
-      const store = customWorkloadChunks.get(parent.id);
-      if (!store) continue;
-
-      for (const cd of store.allChunkDefs) {
-        if (
-          cd.status !== 'completed' &&
-          !cd.verified_results &&
-          cd.dispatchesMade < ADMIN_K_PARAMETER &&
-          !cd.assignedClients.has(clientId)
-        ) {
-          cd.dispatchesMade++;
-          cd.activeAssignments.add(clientId);
-          cd.assignedClients.add(clientId);
-          cd.status = 'active';
-          cd.assignedTo = clientId;
-          cd.assignedAt = Date.now();
-          client.isBusyWithCustomChunk = true;
-
-          // Debug: Log what we're about to send
-          console.log(`[CHUNK DEBUG] Chunk ${cd.chunkId} structure:`, {
-            hasInputs: !!cd.inputs,
-            inputsLength: cd.inputs ? cd.inputs.length : 0,
-            hasOutputs: !!cd.outputs,
-            outputsLength: cd.outputs ? cd.outputs.length : 0,
-            hasSchema: !!cd.schema,
-            hasMetadata: !!cd.metadata,
-            clientType: client.clientType || 'unknown'
-          });
-
-          // Create unified task data that the client expects
-          const taskData = {
-            // Basic chunk info
-            parentId: cd.parentId,
-            chunkId: cd.chunkId,
-            chunkOrderIndex: cd.chunkOrderIndex,
-            framework: parent.framework,
-            enhanced: parent.enhanced,
-
-            // Shader code (WebGPU)
-            kernel: cd.kernel || parent.metadata?.customShader,
-            wgsl: cd.wgsl || cd.kernel || parent.metadata?.customShader,
-            entry: cd.entry || 'main',
-            workgroupCount: cd.workgroupCount || [1, 1, 1],
-
-            // WebGL-specific properties (copy from chunk descriptor)
-            webglShaderType: cd.webglShaderType,
-            webglVertexShader: cd.webglVertexShader,
-            webglFragmentShader: cd.webglFragmentShader,
-            webglVaryings: cd.webglVaryings,
-            webglNumElements: cd.webglNumElements,
-            webglInputSpec: cd.webglInputSpec,
-
-            // CUDA-specific properties
-            blockDim: cd.blockDim,
-            gridDim: cd.gridDim,
-            cudaKernel: cd.cudaKernel,
-
-            // OpenCL-specific properties
-            globalWorkSize: cd.globalWorkSize,
-            localWorkSize: cd.localWorkSize,
-            openclKernel: cd.openclKernel,
-
-            // Vulkan-specific properties
-            vulkanShader: cd.vulkanShader,
-            computeShader: cd.computeShader,
-            specializationConstants: cd.specializationConstants,
-            pushConstants: cd.pushConstants,
-
-            // Data and outputs
-            inputs: cd.inputs || [],           // Array of {name, data} objects
-            outputs: cd.outputs || [],         // Array of {name, size} objects
-            metadata: cd.metadata || {},       // Strategy-specific uniforms data
-            schema: cd.schema,                 // Binding schema
-
-            // Legacy compatibility
-            outputSizes: cd.outputs ? cd.outputs.map(o => o.size) : [cd.outputSize],
-            outputSize: cd.outputs ? cd.outputs[0]?.size : cd.outputSize,
-
-            // Debug info
-            chunkingStrategy: parent.chunkingStrategy,
-            assemblyStrategy: parent.assemblyStrategy
-          };
-
-          // Debug: Log the complete task data being sent
-          console.log(`[CHUNK DEBUG] Sending chunk ${cd.chunkId} to ${clientId} (${client.clientType || 'browser'}):`, {
-            inputs: taskData.inputs?.length,
-            outputs: taskData.outputs?.length,
-            hasKernel: !!taskData.kernel,
-            hasSchema: !!taskData.schema,
-            workgroupCount: taskData.workgroupCount,
-            framework: parent.framework
-          });
-
-          if (__DEBUG_ON__) console.log(`[SERVER DEBUG] Sending chunk ${cd.chunkId} to ${clientId}:`);
-          if (__DEBUG_ON__) console.log(`[SERVER DEBUG] Framework: ${parent.framework}`);
-          if (__DEBUG_ON__) console.log(`[SERVER DEBUG] Client type: ${client.clientType || 'browser'}`);
-          if (__DEBUG_ON__) console.log(`[SERVER DEBUG] TaskData keys:`, Object.keys(taskData));
-
-          // Framework-specific debug logging
-          if (parent.framework === 'webgl') {
-            if (__DEBUG_ON__) console.log(`[SERVER DEBUG] Has webglVertexShader:`, !!taskData.webglVertexShader);
-            if (__DEBUG_ON__) console.log(`[SERVER DEBUG] Has webglFragmentShader:`, !!taskData.webglFragmentShader);
-            if (taskData.webglVertexShader) {
-              if (__DEBUG_ON__) console.log(`[SERVER DEBUG] WebGL vertex shader length:`, taskData.webglVertexShader.length);
-              if (__DEBUG_ON__) console.log(`[SERVER DEBUG] WebGL vertex shader preview:`, taskData.webglVertexShader.substring(0, 100) + '...');
-            }
-          } else if (parent.framework === 'vulkan') {
-            if (__DEBUG_ON__) console.log(`[SERVER DEBUG] Has vulkanShader:`, !!taskData.vulkanShader);
-            if (__DEBUG_ON__) console.log(`[SERVER DEBUG] Has computeShader:`, !!taskData.computeShader);
-          } else if (parent.framework === 'cuda') {
-            if (__DEBUG_ON__) console.log(`[SERVER DEBUG] Has cudaKernel:`, !!taskData.cudaKernel);
-            if (__DEBUG_ON__) console.log(`[SERVER DEBUG] blockDim:`, taskData.blockDim);
-            if (__DEBUG_ON__) console.log(`[SERVER DEBUG] gridDim:`, taskData.gridDim);
-          } else if (parent.framework === 'opencl') {
-            if (__DEBUG_ON__) console.log(`[SERVER DEBUG] Has openclKernel:`, !!taskData.openclKernel);
-            if (__DEBUG_ON__) console.log(`[SERVER DEBUG] globalWorkSize:`, taskData.globalWorkSize);
-          }
-
-          if (__DEBUG_ON__) console.log(`[SERVER DEBUG] Has kernel:`, !!taskData.kernel);
-
-          // Send chunk assignment based on client type
-          if (client.socket) {
-            // Socket.IO client (browser)
-            if (__DEBUG_ON__) console.log(`[DISPATCH] Sending to Socket.IO client ${clientId}`);
-            client.socket.emit('workload:chunk_assign', taskData);
-          } else if (client.emit) {
-            // Native WebSocket client (C++/native)
-            if (__DEBUG_ON__) console.log(`[DISPATCH] Sending to native WebSocket client ${clientId}`);
-            client.emit('workload:chunk_assign', taskData);
-          } else {
-            // Fallback: try both methods (shouldn't happen with updated filter)
-            console.warn(`[DISPATCH] Client ${clientId} has no emit method, attempting fallback`);
-            if (typeof client.send === 'function') {
-              // Try direct WebSocket send with JSON message format
-              const message = JSON.stringify({
-                type: 'workload:chunk_assign',
-                data: taskData
-              });
-              client.send(message);
-            } else {
-              console.error(`[DISPATCH] No viable dispatch method for client ${clientId}`);
-              // Revert chunk assignment state
-              cd.dispatchesMade--;
-              cd.activeAssignments.delete(clientId);
-              cd.assignedClients.delete(clientId);
-              cd.status = 'queued';
-              cd.assignedTo = null;
-              cd.assignedAt = null;
-              client.isBusyWithCustomChunk = false;
-              continue;
-            }
-          }
-
-          const inputCount = taskData.inputs?.length || 0;
-          const outputCount = taskData.outputs?.length || 0;
-          const clientTypeStr = client.clientType || 'browser';
-
-          console.log(` Assigned ${parent.framework} chunk ${cd.chunkId} to ${clientTypeStr} client ${clientId} (${inputCount} inputs, ${outputCount} outputs)`);
-
-          // Emit assignment event for monitoring
-          try {
-            io.emit('chunk:assigned', {
-              chunkId: cd.chunkId,
-              parentId: cd.parentId,
-              clientId: clientId,
-              clientType: clientTypeStr,
-              framework: parent.framework,
-              timestamp: Date.now()
-            });
-          } catch (emitError) {
-            console.warn(`[DISPATCH] Failed to emit assignment event:`, emitError.message);
-          }
-
-          break;
-        }
-      }
-
-      if (client.isBusyWithCustomChunk) break;
-    }
-  }
-}
-
 // Enhanced function to dispatch to both client types with framework filtering
 function dispatchToAllClients(eventName, eventData, frameworkFilter = null) {
   let socketIoCount = 0;
@@ -2728,42 +2428,6 @@ function addProcessingTime(workload, timeData) {
   workload.processingTimes.push(timeData);
 }
 
-// Fixed checkTaskTimeouts function
-function checkTaskTimeouts() {
-  const now = Date.now();
-
-  for (const [assignId, inst] of matrixState.activeTasks.entries()) {
-    if (now - inst.startTime > MATRIX_TASK_TIMEOUT) {
-      console.log(`Matrix assignment ${assignId} timed out.`);
-      const cl = matrixState.clients.get(inst.assignedTo);
-      if (cl) cl.isBusyWithMatrixTask = false;
-      matrixState.activeTasks.delete(assignId);
-    }
-  }
-
-  customWorkloadChunks.forEach(store => {
-    store.allChunkDefs.forEach(cd => {
-      if (cd.activeAssignments.size > 0 && cd.assignedAt && (now - cd.assignedAt > CUSTOM_CHUNK_TIMEOUT) && cd.assignedTo) {
-        const timedOutClient = cd.assignedTo;
-        console.log(`Chunk ${cd.chunkId} for ${cd.parentId} timed out on ${timedOutClient}`);
-        const cl = matrixState.clients.get(timedOutClient);
-        if (cl) cl.isBusyWithCustomChunk = false;
-        cd.activeAssignments.delete(timedOutClient);
-        cd.assignedTo = null;
-        cd.assignedAt = null;
-
-        // FIXED: Use helper function to safely add processing time
-        const parent = customWorkloads.get(cd.parentId);
-        addProcessingTime(parent, {
-          chunkId: cd.chunkId,
-          error: 'timeout',
-          assignedTo: timedOutClient,
-          timedOutAt: now
-        });
-      }
-    });
-  });
-}
 
 function checkTaskTimeoutsFixed() {
   const now = Date.now();
@@ -3054,10 +2718,10 @@ io.on('connection', socket => {
 
     if (tally.ok) {
       const winner = wl.results.find(r => r.serverChecksum === tally.winningChecksum);
-      
+
       // Complete timing for this workload
       timingManager.completeTask(id);
-      
+
       wl.status = 'complete';
       wl.finalResults = winner.results;
       wl.finalResultBase64 = Buffer.concat(winner.results.map(r => Buffer.from(r, 'base64'))).toString('base64');
@@ -3662,17 +3326,6 @@ function broadcastClientList() {
   io.emit('clients:update', { clients: list });
 }
 
-function assignTasksToAvailableClients() {
-  if (!matrixState.isRunning) return;
-  for (const [cid, client] of matrixState.clients.entries()) {
-    if (client.connected && client.gpuInfo && !client.isBusyWithMatrixTask && !client.isBusyWithCustomChunk && !client.isBusyWithNonChunkedWGSL) {
-      const task = assignMatrixTask(cid);
-      if (task) {
-        client.socket.emit('task:assign', task);
-      }
-    }
-  }
-}
 
 server.listen(PORT, () => {
   loadCustomWorkloads();
@@ -4079,7 +3732,7 @@ async function queueStreamingChunk(workloadId, chunkDescriptor) {
 
   // Add to queue with enhanced metadata
   queue.push({
-    descriptor: chunkDescriptor,
+    descriptor: JSON.parse(JSON.stringify(chunkDescriptor)),
     queuedAt: Date.now(),
     attempts: 0,
     workloadId,
@@ -4377,6 +4030,10 @@ async function dispatchChunkToClientFixed(client, chunkDescriptor, workloadId) {
   if (__DEBUG_ON__) console.log(`[CHUNK DISPATCH] Framework: ${chunkDescriptor.framework}`);
 
   try {
+    const parent = customWorkloads.get(workloadId);
+    const shaderText = chunkDescriptor.wgsl
+                  || chunkDescriptor.kernel
+                  || parent?.metadata?.customShader;
     // Create unified task data
     const taskData = {
       parentId: chunkDescriptor.parentId,
@@ -4387,8 +4044,9 @@ async function dispatchChunkToClientFixed(client, chunkDescriptor, workloadId) {
       streaming: true,
 
       // Shader code and execution parameters
-      kernel: chunkDescriptor.kernel,
-      wgsl: chunkDescriptor.kernel,
+      kernel: chunkDescriptor.kernel || parent?.metadata?.customShader,
+      wgsl: shaderText,
+      shaderChecksum: shaderText ? sha256Hex(shaderText) : undefined,
       entry: chunkDescriptor.entry || 'main',
       workgroupCount: chunkDescriptor.workgroupCount || [1, 1, 1],
 
@@ -4841,10 +4499,10 @@ app.post('/api/workloads/:wid/chunks/:cid/result/:idx', async (req, res) => {
   const { wid, cid, idx } = req.params;
   const wl = customWorkloads.get(wid);
   if (!wl) return res.status(404).json({ error: 'workload not found' });
-  
+
   // Record chunk completion timing
   timingManager.completeChunk(cid);
-  
+
   const dir = path.join(STORAGE_ROOT, wid, 'results', cid);
   await ensureDir(dir);
   const fp = path.join(dir, `out-${idx}.bin`);

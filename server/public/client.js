@@ -20,7 +20,19 @@ const state = {
   statistics: { processingTime: 0 }
 };
 
-// === NEW: checksum helpers (browser) ===
+const shaderModuleCache = new Map();    // key -> GPUShaderModule
+const computePipelineCache = new Map(); // key -> GPUComputePipeline
+
+
+function fnv1a(str) { // tiny sync hash fallback
+  let h = 0x811c9dc5;
+  for (let i = 0; i < str.length; i++) {
+    h ^= str.charCodeAt(i);
+    h = (h >>> 0) * 0x01000193;
+  }
+  return (h >>> 0).toString(16);
+}
+
 async function sha256HexFromU8(u8) {
   const view = u8.buffer.slice(u8.byteOffset, u8.byteOffset + u8.byteLength);
   const digest = await crypto.subtle.digest('SHA-256', view);
@@ -1024,13 +1036,28 @@ async function executeWebGPUCompute(chunk) {
     // Create shader module from strategy-provided WGSL
     (__DEBUG_ON__ ? console.log : function(){})(`[WebGPU] Creating shader module...`);
     const shaderCode = chunk.kernel || chunk.wgsl;
+    const shaderChecksum = chunk.shaderChecksum || (shaderCode ? fnv1a(shaderCode) : undefined);
     if (!shaderCode) {
-      throw new Error('No WGSL shader code provided by strategy');
+      if (shaderChecksum && shaderModuleCache.has(shaderChecksum)) {
+        // ok, we can proceed with cached module
+      } else {
+        throw new Error('No WGSL shader code provided by strategy');
+      }
     }
 
-    const shader = state.device.createShaderModule({
-      code: shaderCode
-    });
+
+    let shader;
+    if (shaderChecksum && shaderModuleCache.has(shaderChecksum)) {
+      shader = shaderModuleCache.get(shaderChecksum);
+    } else {
+      shader = state.device.createShaderModule({ code: shaderCode });
+      const ci = await shader.getCompilationInfo();
+      if (ci.messages.some(m => m.type === 'error')) {
+        const errs = ci.messages.filter(m => m.type === 'error').map(m => m.message).join('\n');
+        throw new Error(`Shader compilation failed: ${errs}`);
+      }
+      if (shaderChecksum) shaderModuleCache.set(shaderChecksum, shader);
+    }
 
     // Check compilation
     const ci = await shader.getCompilationInfo();
@@ -1040,13 +1067,18 @@ async function executeWebGPUCompute(chunk) {
     }
 
     // Create compute pipeline
-    const pipeline = state.device.createComputePipeline({
-      layout: 'auto',
-      compute: {
-        module: shader,
-        entryPoint: chunk.entry || 'main'
-      }
-    });
+    const entry = chunk.entry || 'main';
+    const layoutKey = 'auto'; // or derive from your explicit bindings if you have them
+    const pipeKey = `${shaderChecksum || fnv1a(shaderCode)}|${entry}|${layoutKey}`;
+
+    let pipeline = computePipelineCache.get(pipeKey);
+    if (!pipeline) {
+      pipeline = state.device.createComputePipeline({
+        layout: 'auto',
+        compute: { module: shader, entryPoint: entry }
+      });
+      computePipelineCache.set(pipeKey, pipeline);
+    }
 
     let bindingIndex = 0;
 
@@ -1750,6 +1782,16 @@ async function initWebGPU() {
     state.adapterInfo = chosen.info;
     state.device = await chosen.adapter.requestDevice();
     state.webgpuSupported = true;
+
+    if (state.device && typeof state.device.lost?.then === 'function') {
+    state.device.lost.then(() => {
+      shaderModuleCache.clear();
+      computePipelineCache.clear();
+      console.warn('[WebGPU] device lost — shader/pipeline caches cleared');
+    }).catch((e) => {
+      console.warn('[WebGPU] device.lost promise rejected:', e);
+    });
+  }
 
     // Update framework state
     frameworkState.webgpu = {
@@ -2634,8 +2676,6 @@ style.textContent = `
 document.head.appendChild(style);
 
 init();
-
-
 
 
 

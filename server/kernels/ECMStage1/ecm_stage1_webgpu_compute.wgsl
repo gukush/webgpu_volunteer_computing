@@ -61,12 +61,15 @@ struct Params {
   _upad:       u32,
 };
 
+struct Packed {
+  consts: Consts,    // Constants (N, R2, mont_one, n0inv32)
+  primes: array<u32>, // Prime powers list (runtime-sized array)
+};
 
-@group(0) @binding(0) var<storage, read>        consts: Consts;
-@group(0) @binding(1) var<storage, read>        curves: array<CurveIn>;
-@group(0) @binding(2) var<storage, read>        primes: array<u32>;
-@group(0) @binding(3) var<storage, read_write>  outBuf: array<CurveOut>;
-@group(0) @binding(4) var<uniform>              params: Params;
+@group(0) @binding(0) var<uniform>              params: Params;         // uniforms
+@group(0) @binding(1) var<storage, read>        packed: Packed;         // consts+primes
+@group(0) @binding(2) var<storage, read>        curves: array<CurveIn>; // inputs
+@group(0) @binding(3) var<storage, read_write>  outBuf: array<CurveOut>; // output
 
 // --------- helpers: 32x32->64 via 16-bit split ---------
 fn mul32x32_64(a: u32, b: u32) -> vec2<u32> {
@@ -349,7 +352,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   let idx = gid.x;
   if (idx >= params.num_curves) { return; }
 
-  let C = consts; // local alias
+  let C = packed.consts; // local alias
   let inC = curves[idx];
 
   var A24m = to_mont(inC.A24, C);
@@ -359,7 +362,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   var R = P;
 
   for (var i=0u; i<params.pp_count; i++) {
-    let s = primes[i];
+    let s = packed.primes[i];
     if (s <= 1u) { continue; }
     let T = ladder(R, s, A24m, C);
     R = T;
